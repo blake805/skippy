@@ -7,6 +7,11 @@ __pycache__/
 *.bin
 *.wav
 
+# Traces, certs & local artifacts
+mlx-trace.json
+.gradio/
+*.pem
+
 # Logs & OS files
 *.log
 .DS_Store
