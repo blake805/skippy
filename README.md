@@ -43,14 +43,13 @@ A background **heartbeat** wakes Skippy every 5 minutes to work on the goal ledg
 ### File map
 
 | File | Purpose |
-| --- | --- |
+| --- | --- | --- |
 | `skippy_factory.py` | Main FastAPI server: multi-agent pipeline, websocket hub, heartbeat |
 | `tools.py` | Tool implementations (search, memory, Tormach, GitHub, RAG, skills, goals) |
+| `tool_schemas.py` | OpenAI-format function schemas for native tool calling |
 | `prompts.py` | System prompts per mode (Shop / Software / CNC / Developer / Whiteboard) |
+| `test_pipeline_client.py` | Websocket client for smoke-testing the factory pipeline |
 | `skills/` | Reusable Python skills Skippy has written and QA-approved |
-| `skippy_api.py` | Legacy single-agent ReAct websocket server (superseded by the factory) |
-| `skippy.py` | Legacy standalone voice loop (VAD → Whisper → LLM → Kokoro) |
-| `skippy_web.py` / `skippy_ui.py` | Gradio UIs (multi-agent assembly line / image generation) |
 
 ## Setup
 
