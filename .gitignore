@@ -1,5 +1,6 @@
 # Environments
 venv/
+venv_smoke/
 __pycache__/
 
 # Large Media & AI Models

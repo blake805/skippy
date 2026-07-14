@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import shlex
 import httpx
 import asyncio
 import logging
@@ -20,6 +21,7 @@ from kokoro_onnx import Kokoro
 # --- IMPORT MODULARIZED LOGIC ---
 from prompts import PROMPTS
 import tools
+from tool_schemas import get_architect_tools, get_engineer_tools, QA_TEST_TOOL, QA_VERDICT_TOOL
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -30,8 +32,8 @@ LOCAL_70B_URL = "http://127.0.0.1:8080/v1/chat/completions"
 LOCAL_405B_URL = "http://127.0.0.1:8081/v1/chat/completions"
 LOCAL_COMPRESSOR_URL = "http://127.0.0.1:8082/v1/chat/completions" # <-- NEW COMPRESSOR NODE
 
-MODEL_70B_NAME = "mlx-community/Llama-3.3-70B-Instruct-4bit"
-MODEL_405B_NAME = "mlx-community/Meta-Llama-3.1-405B-4bit"
+MODEL_70B_NAME = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+MODEL_405B_NAME = "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit"
 MODEL_COMPRESSOR_NAME = "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit" # <-- NEW COMPRESSOR MODEL
 
 # --- CONNECT NAS MEMORY ---
@@ -51,69 +53,111 @@ whisper_model = whisper.load_model("base")
 logger.info("Loading Kokoro Voice Engine...")
 kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
 
-# --- JSON EXTRACTION ---
-def extract_json_block(text: str) -> Optional[str]:
-    """Finds the first balanced, valid top-level {...} block in the text.
+# --- LEAKED TOOL CALL RECOVERY ---
+def parse_leaked_tool_calls(content: str):
+    """Recovers Qwen3-Coder XML-style tool calls that leaked into plain content.
 
-    Replaces the old regex approach: non-greedy `\\{.*?\\}` truncated at the
-    first '}' (breaking nested JSON like patch_file), and greedy `\\{.*\\}`
-    swallowed everything between the first '{' and last '}'. This scanner
-    tracks brace depth while respecting string literals and escapes, and
-    validates each candidate with json.loads before returning it.
+    The model occasionally omits the opening <tool_call> frame token, so the
+    server's state machine never enters tool-parsing mode and the raw
+    <function=name><parameter=key>value</parameter></function> text lands in
+    `content`. This parses those blocks into (tool_calls, cleaned_content).
     """
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[start:i + 1]
-                        try:
-                            json.loads(candidate)
-                            return candidate
-                        except json.JSONDecodeError:
-                            break
-        start = text.find("{", start + 1)
-    return None
+    calls = []
+    for m in re.finditer(r'<function=([\w.-]+)>(.*?)</function>', content, re.DOTALL):
+        name = m.group(1)
+        args = {}
+        for pm in re.finditer(r'<parameter=([\w.-]+)>\n?(.*?)\n?</parameter>', m.group(2), re.DOTALL):
+            value = pm.group(2).strip()
+            # Structured values (arrays, objects, numbers, booleans) arrive as
+            # JSON text; plain strings like "APPROVE" stay strings.
+            try:
+                args[pm.group(1)] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                args[pm.group(1)] = value
+        calls.append({"id": str(uuid.uuid4()), "name": name, "arguments": args})
+    if calls:
+        content = re.sub(r'<function=[\w.-]+>.*?</function>', '', content, flags=re.DOTALL)
+        content = content.replace("<tool_call>", "").replace("</tool_call>", "").strip()
+    return calls, content
 
 # --- ASYNC HELPERS ---
-async def query_model_async(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None) -> str:
+async def query_model_message(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None, tool_schemas: list = None, max_tokens: int = 4096, repetition_penalty: float = None) -> dict:
+    # repetition_penalty ~1.05 stops the degenerate sentence-repetition loops
+    # prose roles (Architect/QA/Summarizer) fall into at low temps, but it MUST
+    # NOT be applied to the Engineer: penalizing repeated tokens corrupts code
+    # (e.g. regexes lose their closing parentheses).
+    """Queries an MLX server and returns the full assistant message dict.
+
+    With `tool_schemas` set, the model can respond with native structured
+    `tool_calls` (parsed server-side by mlx_lm) instead of JSON-in-text.
+    Returns {"content": str, "tool_calls": [{"id", "name", "arguments"(dict)}]}.
+    """
     payload = {
         "model": model_name,
         "messages": messages,
         "temperature": temp,
-        "max_tokens": 4096 
+        "max_tokens": max_tokens
     }
     if stop_sequences:
         payload["stop"] = stop_sequences
+    if tool_schemas:
+        payload["tools"] = tool_schemas
+    if repetition_penalty:
+        payload["repetition_penalty"] = repetition_penalty
+        # The server's default penalty window is 20 tokens — too short to catch
+        # the sentence-length loops these models produce. Widen it.
+        payload["repetition_context_size"] = 512
     async with httpx.AsyncClient() as client:
         for attempt in range(3):
             try:
                 response = await client.post(url, json=payload, timeout=600.0)
                 if response.status_code == 200:
-                    return response.json()["choices"][0]["message"]["content"].strip()
+                    message = response.json()["choices"][0]["message"]
+                    tool_calls = []
+                    for tc in message.get("tool_calls") or []:
+                        func = tc.get("function", {})
+                        raw_args = func.get("arguments", "{}")
+                        try:
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                        except json.JSONDecodeError:
+                            args = {"_malformed_arguments": raw_args}
+                        tool_calls.append({
+                            "id": tc.get("id", str(uuid.uuid4())),
+                            "name": func.get("name", ""),
+                            "arguments": args,
+                        })
+                    content = (message.get("content") or "").strip()
+                    if tool_schemas and "<function=" in content:
+                        leaked_calls, content = parse_leaked_tool_calls(content)
+                        tool_calls.extend(leaked_calls)
+                    return {"content": content, "tool_calls": tool_calls}
             except Exception:
                 pass
             await asyncio.sleep(2.0 * (2 ** attempt))
-        return f"System Error: Failed to connect to MLX Server at {url}."
+        return {"content": f"System Error: Failed to connect to MLX Server at {url}.", "tool_calls": []}
 
-async def execute_python_code(code: str) -> str:
+async def query_model_async(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None) -> str:
+    """Text-only convenience wrapper (triage, compressor, summarizer)."""
+    message = await query_model_message(messages, temp=temp, url=url, model_name=model_name, stop_sequences=stop_sequences)
+    return message["content"]
+
+def assistant_turn(message: dict) -> dict:
+    """Rebuilds an assistant message (with tool_calls) for the conversation history."""
+    turn = {"role": "assistant"}
+    if message["content"]:
+        turn["content"] = message["content"]
+    if message["tool_calls"]:
+        turn["tool_calls"] = [
+            {
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+            }
+            for tc in message["tool_calls"]
+        ]
+    return turn
+
+async def execute_python_code(code: str, cli_args: list = None) -> str:
     if re.search(r'\bfunction\s+\w+\s*\(|\bvar\s+\w+\s*=', code) or code.strip().startswith("//"):
         return "SKIPPED EXECUTION: Code appears to be JavaScript/CPS/C++. Proceeding with static analysis only."
     try:
@@ -125,7 +169,7 @@ async def execute_python_code(code: str) -> str:
         with open(temp_path, 'w', encoding='utf-8') as f:
             f.write(code)
 
-        process = await asyncio.create_subprocess_exec("python3", temp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec("python3", temp_path, *(cli_args or []), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -145,6 +189,11 @@ async def execute_python_code(code: str) -> str:
         if errors and process.returncode == 2 and "the following arguments are required:" in errors.lower():
             return f"SUCCESSFUL DRY-RUN: Script successfully initialized argparse and rejected empty arguments. (This is expected for CLI tools).\nArgparse Output:\n{errors}"
 
+        # Report the exit code honestly: a script that prints an error and
+        # sys.exit(1)s used to be reported as "SUCCESSFUL OUTPUT", which
+        # tricked QA into approving broken code.
+        if process.returncode != 0:
+            return f"SCRIPT FAILED (exit code {process.returncode}).\nSTDERR:\n{errors}\nSTDOUT:\n{output}"
         if errors: return f"TRACEBACK / ERRORS:\n{errors}\n\nOUTPUT:\n{output}"
         elif output: return f"SUCCESSFUL OUTPUT:\n{output}"
         else: return "SUCCESS: Code ran without errors."
@@ -388,6 +437,96 @@ class SkippyPipeline:
                 except Exception:
                     pass
 
+    async def dispatch_architect_tool(self, tool_name: str, args: dict) -> str:
+        """Executes one Architect tool call and returns its result string."""
+        if tool_name == "get_system_time":
+            return tools.get_system_time()
+        elif tool_name == "web_search":
+            return await tools.web_search(args.get("query", ""))
+        elif tool_name == "read_website":
+            return await tools.read_website(args.get("url", ""))
+        elif tool_name == "search_memory":
+            return await tools.search_memory(args.get("query", ""), memory_collection)
+        elif tool_name == "save_memory":
+            return await tools.save_memory(args.get("fact", ""), memory_collection)
+        elif tool_name == "send_to_tormach":
+            return await tools.send_to_tormach(args.get("local_file_path", ""))
+        elif tool_name == "check_device_status":
+            return str(await tools.check_device_status(args.get("ip_address", "")))
+        elif tool_name == "run_shop_skill":
+            return await tools.run_shop_skill(args.get("skill_name", ""), args.get("arguments", ""))
+        elif tool_name == "manage_goals":
+            return tools.manage_goals(
+                action=args.get("action", ""),
+                task=args.get("task"),
+                task_id=args.get("task_id")
+            )
+        elif tool_name == "vscode_get_active_file":
+            await self.send_log(f"\n*(Architect is reaching out to VS Code...)*\n")
+            response = await self.manager.execute_tool_on_client(
+                "vscode", 
+                {"action": "get_active_file"}, 
+                timeout=5.0
+            )
+            return str(response.get("content", response))
+        elif tool_name == "tormach_ssh":
+            command = args.get("command", "")
+            explanation = args.get("explanation", "Executing SSH command on Tormach PathPilot.")
+            
+            await self.send_log(f"\n⚠️ [Architect] Requested Tormach SSH: {command}\nWaiting for human authorization...\n")
+            if self.ws:
+                await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
+                auth_reply = await self.ws.receive_text()
+                auth_data = json.loads(auth_reply)
+                if auth_data.get("status") == "APPROVE":
+                    await self.send_log(f"✅ Authorization GRANTED. Connecting to PathPilot...\n")
+                    return await tools.execute_tormach_ssh(command)
+                else:
+                    await self.send_log(f"❌ Authorization DENIED by human.\n")
+                    return "USER DENIED SSH EXECUTION. Find a workaround."
+            else:
+                return "HEADLESS ERROR: Cannot request SSH authorization without UI client attached."
+        elif tool_name == "github_manager":
+            await self.send_log(f"\n*(Architect is interacting with GitHub: {args.get('action')}...)*\n")
+            return await tools.execute_github_manager(
+                repo=args.get("repo", ""),
+                action=args.get("action", ""),
+                title=args.get("title"),
+                body=args.get("body")
+            )
+        elif tool_name == "read_directory_structure":
+            target_path = args.get("path", "")
+            depth = int(args.get("max_depth", 2))
+            await self.send_log(f"\n*(Architect is mapping directory: {target_path}...)*\n")
+            return await tools.read_directory_structure(target_path, max_depth=depth)
+        elif tool_name == "ingest_codebase_to_rag":
+            target_path = args.get("path", "")
+            await self.send_log(f"\n*(Architect is chunking and embedding {target_path} into ChromaDB...)*\n")
+            return await tools.ingest_codebase_to_rag(target_path, code_collection)
+        elif tool_name == "search_codebase":
+            # --- COMPRESSOR INTERCEPT FOR SEARCH ---
+            search_query = args.get("query", "")
+            await self.send_log(f"\n*(Architect is searching code memory for: {search_query}...)*\n")
+            
+            raw_tool_result = await tools.search_codebase(search_query, code_collection)
+            
+            await self.send_log(f"*(Compressing search results via 32B Node to protect Architect's context window...)*\n")
+            compressor_prompt = f"""You are a data extraction node. 
+The Architect needs to know: '{search_query}'. 
+Here is the raw codebase data pulled from ChromaDB: 
+{raw_tool_result}
+
+Extract ONLY the specific math, logic, formulas, variable mappings, or architecture required to answer the query. Do not use conversational filler. Keep it incredibly dense and under 400 words."""
+            
+            compressed_result = await query_model_async(
+                [{"role": "user", "content": compressor_prompt}], 
+                temp=0.1, 
+                url=LOCAL_COMPRESSOR_URL, 
+                model_name=MODEL_COMPRESSOR_NAME
+            )
+            return f"COMPRESSED MEMORY RESULT:\n{compressed_result}"
+        return f"ERROR: Unknown tool '{tool_name}'."
+
     async def phase_1_research(self, enriched_input: str):
         arch_messages = [{"role": "system", "content": PROMPTS.get(self.mode, PROMPTS["Shop"])["architect"]}]
         for msg in self.chat_history[-10:]:
@@ -397,124 +536,140 @@ class SkippyPipeline:
             
         arch_messages.append({"role": "user", "content": enriched_input})
         
+        architect_tools = get_architect_tools(self.mode)
+        last_tool_signature = None
+        repeat_count = 0
+
         for _ in range(8):
             await self.send_log("\n[Architect] Analyzing and researching...\n")
-            arch_response = await query_model_async(
+            message = await query_model_message(
                 arch_messages, 
                 temp=0.2, 
                 url=LOCAL_70B_URL, 
                 model_name=MODEL_70B_NAME,
-                stop_sequences=["TOOL RESULT:", "Observation:"]
+                tool_schemas=architect_tools,
+                repetition_penalty=1.05
             )
             
-            json_block = extract_json_block(arch_response)
-            if json_block:
-                try:
-                    tool_data = json.loads(json_block)
-                    tool_name = tool_data.get("name")
-                    await self.send_log(f"*(Architect is using {tool_name}...)*\n")
-                    
-                    if tool_name == "direct_reply":
-                        reply_msg = tool_data.get("message", "I have your answer.")
-                        await self.send_log("\n[Architect] Direct conversation detected.\n")
-                        await self.send_chat(reply_msg)
-                        if self.ws: await speak_text(reply_msg, self.ws, self.use_tts)
-                        self.is_direct_reply = True
+            if not message["tool_calls"]:
+                # Plain text with no tool call: the sanctioned handoff is the
+                # wake_engineer tool, so bare text is normally a conversational
+                # answer. Only treat it as a blueprint if it reads like work
+                # instructions (mentions the Engineer/blueprint or promises
+                # implementation), so casual questions don't trigger Phase 2.
+                content = message["content"]
+                blueprint_like = re.search(
+                    r"blueprint|the engineer|i(?:'ll| will)(?: now)? (?:create|write|build|make|generate|implement)|let me (?:create|write|build)",
+                    content, re.IGNORECASE
+                )
+                if blueprint_like:
+                    self.blueprint = content
+                else:
+                    await self.send_log("\n[Architect] Direct conversation detected (plain-text answer).\n")
+                    await self.send_chat(content)
+                    if self.ws: await speak_text(content, self.ws, self.use_tts)
+                    self.is_direct_reply = True
+                break
+
+            # Dedupe identical calls within the batch and cap the batch size:
+            # degenerate sampling can emit the same web_search dozens of times
+            # in one turn, which would hammer the tools for minutes.
+            unique_calls = []
+            seen_signatures = set()
+            for tc in message["tool_calls"]:
+                sig = json.dumps({"name": tc["name"], "arguments": tc["arguments"]}, sort_keys=True)
+                if sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    unique_calls.append(tc)
+            dropped = len(message["tool_calls"]) - len(unique_calls)
+            if len(unique_calls) > 5:
+                dropped += len(unique_calls) - 5
+                unique_calls = unique_calls[:5]
+            if dropped:
+                await self.send_log(f"⚠️ *Dropped {dropped} duplicate/excess tool calls from the Architect's batch.*\n")
+            message["tool_calls"] = unique_calls
+
+            # Loop breaker: an identical batch of tool calls means the model is
+            # stuck (e.g. re-running a skill that doesn't exist). Nudge once,
+            # then force a blueprint from the raw request.
+            tool_signature = json.dumps(
+                [{"name": tc["name"], "arguments": tc["arguments"]} for tc in message["tool_calls"]],
+                sort_keys=True
+            )
+            if tool_signature == last_tool_signature:
+                repeat_count += 1
+            else:
+                last_tool_signature = tool_signature
+                repeat_count = 0
+            if repeat_count == 1:
+                await self.send_log("⚠️ *Architect repeated the same tool call. Nudging it to change strategy...*\n")
+                arch_messages.append(assistant_turn(message))
+                for tc in message["tool_calls"]:
+                    arch_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "SYSTEM: You just repeated the EXACT same tool call and it did not work the first time. Do NOT call it again. Either use a DIFFERENT tool, use direct_reply, or call wake_engineer with your blueprint now."})
+                continue
+            elif repeat_count >= 2:
+                await self.send_log("⚠️ *Architect is stuck in a tool loop. Forcing handoff to the Engineer with the raw request.*\n")
+                self.blueprint = f"ARCHITECT STALLED. Implement the user's request directly:\n{enriched_input}"
+                break
+
+            arch_messages.append(assistant_turn(message))
+            terminal = False
+
+            for tc in message["tool_calls"]:
+                tool_name, args = tc["name"], tc["arguments"]
+                await self.send_log(f"*(Architect is using {tool_name}...)*\n")
+
+                if tool_name == "wake_engineer":
+                    blueprint = args.get("blueprint", "")
+                    if blueprint.strip():
+                        self.blueprint = blueprint
+                        await self.send_log("\n[Architect] Handing blueprint to the Engineer.\n")
+                        terminal = True
                         break
-                        
-                    tool_result = "No data found."
-                    if tool_name == "get_system_time": tool_result = tools.get_system_time()
-                    elif tool_name == "web_search": tool_result = await tools.web_search(tool_data.get("query", ""))
-                    elif tool_name == "read_website": tool_result = await tools.read_website(tool_data.get("url", ""))
-                    elif tool_name == "search_memory": tool_result = await tools.search_memory(tool_data.get("query", ""), memory_collection)
-                    elif tool_name == "save_memory": tool_result = await tools.save_memory(tool_data.get("fact", ""), memory_collection)
-                    elif tool_name == "send_to_tormach": tool_result = await tools.send_to_tormach(tool_data.get("local_file_path", ""))
-                    elif tool_name == "check_device_status": tool_result = str(await tools.check_device_status(tool_data.get("ip_address", "")))
-                    elif tool_name == "run_shop_skill": tool_result = await tools.run_shop_skill(tool_data.get("skill_name", ""), tool_data.get("arguments", ""))
-                    elif tool_name == "manage_goals":
-                        tool_result = tools.manage_goals(
-                            action=tool_data.get("action", ""),
-                            task=tool_data.get("task"),
-                            task_id=tool_data.get("task_id")
-                        )
-                    elif tool_name == "vscode_get_active_file":
-                        await self.send_log(f"\n*(Architect is reaching out to VS Code...)*\n")
-                        response = await self.manager.execute_tool_on_client(
-                            "vscode", 
-                            {"action": "get_active_file"}, 
-                            timeout=5.0
-                        )
-                        tool_result = str(response.get("content", response))
-                    elif tool_name == "tormach_ssh":
-                        command = tool_data.get("command", "")
-                        explanation = tool_data.get("explanation", "Executing SSH command on Tormach PathPilot.")
-                        
-                        await self.send_log(f"\n⚠️ [Architect] Requested Tormach SSH: {command}\nWaiting for human authorization...\n")
-                        if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
-                                await self.send_log(f"✅ Authorization GRANTED. Connecting to PathPilot...\n")
-                                tool_result = await tools.execute_tormach_ssh(command)
-                            else:
-                                await self.send_log(f"❌ Authorization DENIED by human.\n")
-                                tool_result = "USER DENIED SSH EXECUTION. Find a workaround."
-                        else:
-                            tool_result = "HEADLESS ERROR: Cannot request SSH authorization without UI client attached."
-                    elif tool_name == "github_manager":
-                        await self.send_log(f"\n*(Architect is interacting with GitHub: {tool_data.get('action')}...)*\n")
-                        tool_result = await tools.execute_github_manager(
-                            repo=tool_data.get("repo", ""),
-                            action=tool_data.get("action", ""),
-                            title=tool_data.get("title"),
-                            body=tool_data.get("body")
-                        )
-                    elif tool_name == "read_directory_structure":
-                        target_path = tool_data.get("path", "")
-                        depth = int(tool_data.get("max_depth", 2))
-                        await self.send_log(f"\n*(Architect is mapping directory: {target_path}...)*\n")
-                        tool_result = await tools.read_directory_structure(target_path, max_depth=depth)
-                    elif tool_name == "ingest_codebase_to_rag":
-                        target_path = tool_data.get("path", "")
-                        await self.send_log(f"\n*(Architect is chunking and embedding {target_path} into ChromaDB...)*\n")
-                        tool_result = await tools.ingest_codebase_to_rag(target_path, code_collection)
-
-                    # --- COMPRESSOR INTERCEPT FOR SEARCH ---
-                    elif tool_name == "search_codebase":
-                        search_query = tool_data.get("query", "")
-                        await self.send_log(f"\n*(Architect is searching code memory for: {search_query}...)*\n")
-                        
-                        raw_tool_result = await tools.search_codebase(search_query, code_collection)
-                        
-                        await self.send_log(f"*(Compressing search results via 32B Node to protect Architect's context window...)*\n")
-                        compressor_prompt = f"""You are a data extraction node. 
-The Architect needs to know: '{search_query}'. 
-Here is the raw codebase data pulled from ChromaDB: 
-{raw_tool_result}
-
-Extract ONLY the specific math, logic, formulas, variable mappings, or architecture required to answer the query. Do not use conversational filler. Keep it incredibly dense and under 400 words."""
-                        
-                        compressed_result = await query_model_async(
-                            [{"role": "user", "content": compressor_prompt}], 
-                            temp=0.1, 
-                            url=LOCAL_COMPRESSOR_URL, 
-                            model_name=MODEL_COMPRESSOR_NAME
-                        )
-                        tool_result = f"COMPRESSED MEMORY RESULT:\n{compressed_result}"
-                        
-                    arch_messages.append({"role": "assistant", "content": arch_response})
-                    arch_messages.append({"role": "user", "content": f"TOOL RESULT:\n{tool_result}\nIf you need more info, use another tool. If you can answer directly without code, use direct_reply. Otherwise, provide the final blueprint."})
+                    arch_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "SYSTEM: Your wake_engineer call had an empty 'blueprint' field. Re-send it with the full plain-English instructions for the Engineer."})
                     continue
-                except json.JSONDecodeError:
-                    pass
-            
-            self.blueprint = arch_response
-            break
-        else:
-            self.blueprint = "RESEARCH LIMIT REACHED. Proceeding with gathered context:\n" + arch_response
 
-        await self.send_log(f"\n----- ARCHITECT BLUEPRINT GENERATED -----\n{self.blueprint}\n----------------------------------------\n")
+                if tool_name == "direct_reply":
+                    reply_msg = args.get("message", "I have your answer.")
+
+                    # Guard against "promissory" direct replies ("I'll now create
+                    # a blueprint...") which would end the pipeline before the
+                    # Engineer ever runs. Nudge once, then force the handoff.
+                    promissory = re.search(
+                        r"blueprint|the engineer|i(?:'ll| will)(?: now)? (?:create|write|build|make|generate)|let me (?:create|write|build)",
+                        reply_msg, re.IGNORECASE
+                    )
+                    if promissory:
+                        if not getattr(self, "_direct_reply_nudged", False):
+                            self._direct_reply_nudged = True
+                            await self.send_log("⚠️ *Architect tried to end the pipeline while promising future work. Nudging it to hand off to the Engineer...*\n")
+                            arch_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "SYSTEM: You used direct_reply to PROMISE work instead of doing it. direct_reply ends the pipeline immediately — no Engineer will run. Call wake_engineer NOW with the full blueprint."})
+                            continue
+                        await self.send_log("⚠️ *Architect repeated a promissory direct_reply. Treating its message as the blueprint and waking the Engineer.*\n")
+                        self.blueprint = reply_msg
+                        terminal = True
+                        break
+
+                    await self.send_log("\n[Architect] Direct conversation detected.\n")
+                    await self.send_chat(reply_msg)
+                    if self.ws: await speak_text(reply_msg, self.ws, self.use_tts)
+                    self.is_direct_reply = True
+                    terminal = True
+                    break
+
+                try:
+                    tool_result = await self.dispatch_architect_tool(tool_name, args)
+                except Exception as e:
+                    tool_result = f"TOOL ERROR ({tool_name}): {str(e)}"
+                arch_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(tool_result)})
+
+            if terminal:
+                break
+        else:
+            self.blueprint = "RESEARCH LIMIT REACHED. Proceeding with gathered context. Original request:\n" + enriched_input
+
+        if not self.is_direct_reply:
+            await self.send_log(f"\n----- ARCHITECT BLUEPRINT GENERATED -----\n{self.blueprint}\n----------------------------------------\n")
 
     async def phase_2_engineer_and_qa(self, enriched_input: str):
         await self.send_log("\n[Triage Cop] Evaluating task complexity for routing...\n")
@@ -545,6 +700,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             {"role": "user", "content": f"Blueprint:\n{self.blueprint}{dev_context}"}
         ]
         
+        engineer_tools = get_engineer_tools(self.mode)
         qa_feedback = "" 
         code_to_test = ""
         
@@ -555,64 +711,65 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             current_eng_messages = base_eng_messages.copy()
             if qa_feedback: current_eng_messages.append({"role": "user", "content": qa_feedback})
             
-            engineer_response = await query_model_async(current_eng_messages, temp=0.1, url=eng_url, model_name=eng_model)
+            eng_message = await query_model_message(current_eng_messages, temp=0.1, url=eng_url, model_name=eng_model, tool_schemas=engineer_tools)
+            engineer_response = eng_message["content"]
             await self.send_log(f"----- ENGINEER RESPONSE -----\n{engineer_response}\n-----------------------------\n")
             
             code_to_test = ""
-            json_block = extract_json_block(engineer_response)
+            eng_tool_call = eng_message["tool_calls"][0] if eng_message["tool_calls"] else None
             
-            if json_block:
-                try:
-                    tool_data = json.loads(json_block)
+            if eng_tool_call:
+                tool_name, args = eng_tool_call["name"], eng_tool_call["arguments"]
+
+                if tool_name == "request_terminal_execution":
+                    command = args.get("command", "")
+                    explanation = args.get("explanation", "")
                     
-                    if tool_data.get("name") == "request_terminal_execution":
-                        command = tool_data.get("command", "")
-                        explanation = tool_data.get("explanation", "")
-                        
-                        await self.send_log(f"\n⚠️ [Engineer] Requested God Mode: {command}\nWaiting for human authorization...\n")
-                        if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
-                                await self.send_log(f"✅ Authorization GRANTED. Executing: {command}...\n")
-                                cmd_output = await run_bash_command_stream(command, self.ws)
-                                await self.send_log(f"----- EXECUTION FINISHED -----\n")
-                                qa_feedback = f"COMMAND EXECUTED. Output:\n{cmd_output}\nProceed with coding."
-                            else:
-                                await self.send_log(f"❌ Authorization DENIED by human.\n")
-                                qa_feedback = "USER DENIED COMMAND EXECUTED. Find a workaround."
+                    await self.send_log(f"\n⚠️ [Engineer] Requested God Mode: {command}\nWaiting for human authorization...\n")
+                    if self.ws:
+                        await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
+                        auth_reply = await self.ws.receive_text()
+                        auth_data = json.loads(auth_reply)
+                        if auth_data.get("status") == "APPROVE":
+                            await self.send_log(f"✅ Authorization GRANTED. Executing: {command}...\n")
+                            cmd_output = await run_bash_command_stream(command, self.ws)
+                            await self.send_log(f"----- EXECUTION FINISHED -----\n")
+                            qa_feedback = f"COMMAND EXECUTED. Output:\n{cmd_output}\nProceed with coding."
                         else:
-                            qa_feedback = "HEADLESS ERROR: Cannot request god mode without UI attached."
+                            await self.send_log(f"❌ Authorization DENIED by human.\n")
+                            qa_feedback = "USER DENIED COMMAND EXECUTED. Find a workaround."
+                    else:
+                        qa_feedback = "HEADLESS ERROR: Cannot request god mode without UI attached."
+                    continue 
+                    
+                elif tool_name == "patch_file":
+                    patches = args.get("patches", [])
+                    with open(__file__, 'r', encoding='utf-8') as f:
+                        patched_code = f.read()
+                        
+                    patch_success = True
+                    patch_errors = ""
+                    
+                    for idx, p in enumerate(patches):
+                        st = p.get("search_text", "")
+                        rt = p.get("replace_text", "")
+                        if st and st not in patched_code:
+                            patch_success = False
+                            patch_errors += f"\n- Patch {idx+1} Failed: Exact `search_text` not found. Check indentation."
+                        elif st:
+                            patched_code = patched_code.replace(st, rt)
+                            
+                    if not patch_success:
+                        qa_feedback = f"PATCHING FAILED:{patch_errors}\nEnsure your search_text perfectly matches the source code exactly."
+                        await self.send_log(f"❌ Patching Failed:{patch_errors}\n")
                         continue 
                         
-                    elif tool_data.get("name") == "patch_file":
-                        patches = tool_data.get("patches", [])
-                        with open(__file__, 'r', encoding='utf-8') as f:
-                            patched_code = f.read()
-                            
-                        patch_success = True
-                        patch_errors = ""
-                        
-                        for idx, p in enumerate(patches):
-                            st = p.get("search_text", "")
-                            rt = p.get("replace_text", "")
-                            if st and st not in patched_code:
-                                patch_success = False
-                                patch_errors += f"\n- Patch {idx+1} Failed: Exact `search_text` not found. Check indentation."
-                            elif st:
-                                patched_code = patched_code.replace(st, rt)
-                                
-                        if not patch_success:
-                            qa_feedback = f"PATCHING FAILED:{patch_errors}\nEnsure your search_text perfectly matches the source code exactly."
-                            await self.send_log(f"❌ Patching Failed:{patch_errors}\n")
-                            continue 
-                            
-                        code_to_test = patched_code
-                        await self.send_log("✅ Code Patch applied successfully to virtual sandbox.\n")
-                        
-                except json.JSONDecodeError: 
-                    pass
+                    code_to_test = patched_code
+                    await self.send_log("✅ Code Patch applied successfully to virtual sandbox.\n")
+
+                else:
+                    qa_feedback = f"You called an unknown tool '{tool_name}'. You have no file-writing tools — output the complete code in a markdown block instead."
+                    continue
 
             if not code_to_test:
                 code_match = re.findall(r'`{3}(?:python|javascript|cpp)?\n(.*?)`{3}', engineer_response, re.DOTALL)
@@ -624,7 +781,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                     code_to_test = engineer_response
 
             if not code_to_test.strip():
-                qa_feedback = "You failed to output any valid code or patch JSON."
+                qa_feedback = "You failed to output any valid code or patch call."
                 continue
 
             await self.send_log("\n[Execution Engine] Spinning up secure sandbox to test Engineer's draft...\n")
@@ -634,25 +791,79 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             
             qa_prompt_injection = f"Code to review:\n{code_to_test}\n\nLive Terminal Execution Output:\n{self.execution_result}\n\nArchitect's Blueprint (Script Requirements):\n{self.blueprint}"
             
-            qa_review = await query_model_async([
+            qa_messages = [
                 {"role": "system", "content": PROMPTS.get(self.mode, PROMPTS["Shop"]).get("qa", "")},
                 {"role": "user", "content": qa_prompt_injection}
-            ], temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
-            
-            await self.send_log(f"----- QA VERDICT REPORT -----\n{qa_review}\n-----------------------------\n")
+            ]
+            qa_review = ""
+            qa_data = {}
+            # QA may run the script with real arguments (limited budget) before it
+            # must submit a verdict; once the budget is spent the verdict tool is
+            # the only one offered, so it cannot test forever.
+            test_rounds_left = 2
+            qa_tests_failed = False
+            for qa_try in range(6):
+                testing_allowed = test_rounds_left > 0
+                qa_tools = [QA_TEST_TOOL, QA_VERDICT_TOOL] if testing_allowed else [QA_VERDICT_TOOL]
+                qa_message = await query_model_message(qa_messages, temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME, tool_schemas=qa_tools, repetition_penalty=1.05)
+                qa_review = qa_message["content"] or qa_review
+                
+                verdict_call = None
+                test_calls = []
+                for tc in qa_message["tool_calls"]:
+                    if tc["name"] == "submit_verdict":
+                        verdict_call = tc
+                    elif tc["name"] == "run_script_test":
+                        test_calls.append(tc)
 
-            is_fail = qa_review.strip().startswith("FAIL") or "FAIL:" in qa_review
+                if test_calls and testing_allowed:
+                    test_rounds_left -= 1
+                    qa_messages.append(assistant_turn(qa_message))
+                    for tc in test_calls:
+                        raw_args = tc["arguments"].get("arguments", "")
+                        try:
+                            cli_args = shlex.split(raw_args)
+                        except ValueError:
+                            cli_args = raw_args.split()
+                        await self.send_log(f"*(QA is testing the script with args: {raw_args})*\n")
+                        test_output = await execute_python_code(code_to_test, cli_args=cli_args)
+                        if test_output.startswith(("SCRIPT FAILED", "TRACEBACK")):
+                            qa_tests_failed = True
+                        qa_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": test_output})
+                    if test_rounds_left <= 0:
+                        qa_messages.append({"role": "user", "content": "SYSTEM: Your test budget is exhausted. Based on the outputs above, call submit_verdict NOW. If the outputs were correct, APPROVE; otherwise FAIL with feedback."})
+                    elif verdict_call:
+                        # Verdict stacked with tests in one turn: ignore it and
+                        # make QA re-judge with the fresh test results in hand.
+                        qa_messages.append({"role": "user", "content": "SYSTEM: Review the test output above, then call submit_verdict."})
+                    continue
+
+                if verdict_call:
+                    qa_data = verdict_call["arguments"]
+                    # Deterministic backstop: QA cannot approve code whose own
+                    # test runs failed, no matter how it rationalizes them.
+                    if qa_data.get("status") == "APPROVE" and qa_tests_failed:
+                        await self.send_log("⚠️ *QA tried to APPROVE code that failed its own test runs. Overriding to FAIL.*\n")
+                        qa_data = {"status": "FAIL", "feedback": "Backend override: your own run_script_test calls returned failures (non-zero exit / traceback). The code does not work on the blueprint's example inputs. Fix the parsing/logic so the tested inputs succeed."}
+                    break
+
+                # QA responded in prose without a verdict — demand it.
+                qa_messages.append({"role": "assistant", "content": qa_message["content"]})
+                qa_messages.append({"role": "user", "content": "SYSTEM: You did not call submit_verdict. Call it NOW with your verdict (APPROVE/FAIL/DEPLOY) based on the review and test outputs above. Do not write anything else."})
+
+            await self.send_log(f"----- QA VERDICT REPORT -----\n{qa_review}\nVerdict: {json.dumps(qa_data) if qa_data else '(no verdict tool call)'}\n-----------------------------\n")
+
+            status = qa_data.get("status", "")
+            # No verdict call or explicit FAIL both count as a rejection.
+            is_fail = (not qa_data) or status == "FAIL"
             
-            if not is_fail and ("APPROVE" in qa_review or "DEPLOY" in qa_review) and "{" in qa_review:
+            if not is_fail:
                 try:
-                    json_match = re.search(r'\{\s*"status"\s*:\s*"(?:APPROVE|DEPLOY)".*?\}\s*$', qa_review, re.DOTALL)
-                    if not json_match: raise ValueError("Could not isolate the JSON block at the end of the response.")
-                    
-                    qa_data = json.loads(json_match.group(0))
-                    status = qa_data.get("status")
-                    
                     if status == "APPROVE":
                         save_path = qa_data.get("save_path", "~/Desktop/skippy_output.py")
+                        # Overwrite the stale no-args probe result so the
+                        # summarizer reports the real outcome.
+                        self.execution_result = f"QA tested the script with real inputs and APPROVED it. Saved to {save_path}."
                         
                         if save_path.startswith("skills/") or "skills" in save_path:
                             safe_name = os.path.basename(save_path)
@@ -721,7 +932,12 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                     await self.send_log(f"\n[Write Error] Exception raised during payload routing: {str(e)}\n")
                     break
             else:
-                qa_feedback = f"QA FAILED ON PREVIOUS ATTEMPT. Terminal Output was:\n{self.execution_result}\nQA Feedback:\n{qa_review}\nEngineer, fix these issues."
+                critique = qa_data.get("feedback") or qa_review or "QA did not submit a verdict — treat the draft as rejected and improve it."
+                # Cap the critique so a degenerate QA response can't flood the
+                # Engineer's context on the next attempt.
+                if len(critique) > 2000:
+                    critique = critique[:2000] + "\n[...QA feedback truncated...]"
+                qa_feedback = f"QA FAILED ON PREVIOUS ATTEMPT. Terminal Output was:\n{self.execution_result}\nQA Feedback:\n{critique}\nEngineer, fix these issues."
                 await self.send_log(f"\n🔄 *QA rejected code iteration {attempt + 1}. Routing critique back to development engine...*\n")
 
     async def phase_3_summarize(self):
@@ -732,7 +948,10 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             {"role": "user", "content": f"Task: {self.user_input}\nBlueprint: {self.blueprint}\nOutcome: {status_text}\nQA Feedback/Results: {self.execution_result}\nWrite the conversational summary."}
         ]
         
-        final_summary = await query_model_async(summary_messages, temp=0.4, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+        # Repetition penalty + tighter token cap prevent the degenerate
+        # repeated-sentence loops the summarizer occasionally falls into.
+        summary_message = await query_model_message(summary_messages, temp=0.4, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME, max_tokens=1024, repetition_penalty=1.1)
+        final_summary = summary_message["content"]
         await self.send_chat(final_summary)
         if self.ws: await speak_text(final_summary, self.ws, self.use_tts)
 

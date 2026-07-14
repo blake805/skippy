@@ -11,11 +11,21 @@ All inference is local via MLX-served OpenAI-compatible endpoints:
 
 | Node | Port | Model | Role |
 | --- | --- | --- | --- |
-| Fast worker | 8080 | Llama-3.3-70B-Instruct-4bit | Architect, triage, QA, summarizer |
-| Kraken | 8081 | Llama-3.1-405B-4bit | Complex engineering tasks |
+| Fast worker | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Architect, triage, QA, summarizer |
+| Kraken | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | Complex engineering tasks |
 | Compressor | 8082 | Qwen2.5-Coder-32B-4bit | Compresses RAG results to protect context |
 
+Serve the two main nodes with:
+
+```bash
+mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --port 8080 --host 127.0.0.1
+mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --port 8081 --host 127.0.0.1
+```
+
 ### The pipeline (`skippy_factory.py` — current production server)
+
+All agent/tool interaction uses native OpenAI-style function calling (schemas in
+`tool_schemas.py`), parsed server-side by `mlx_lm.server` — no JSON-in-text protocols.
 
 1. **Phase 0 — Smart Injector**: file paths mentioned in the prompt are read and injected
    into context (with smart truncation for G-code/logs).
