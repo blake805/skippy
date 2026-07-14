@@ -51,6 +51,47 @@ whisper_model = whisper.load_model("base")
 logger.info("Loading Kokoro Voice Engine...")
 kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
 
+# --- JSON EXTRACTION ---
+def extract_json_block(text: str) -> Optional[str]:
+    """Finds the first balanced, valid top-level {...} block in the text.
+
+    Replaces the old regex approach: non-greedy `\\{.*?\\}` truncated at the
+    first '}' (breaking nested JSON like patch_file), and greedy `\\{.*\\}`
+    swallowed everything between the first '{' and last '}'. This scanner
+    tracks brace depth while respecting string literals and escapes, and
+    validates each candidate with json.loads before returning it.
+    """
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except json.JSONDecodeError:
+                            break
+        start = text.find("{", start + 1)
+    return None
+
 # --- ASYNC HELPERS ---
 async def query_model_async(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None) -> str:
     payload = {
@@ -366,10 +407,10 @@ class SkippyPipeline:
                 stop_sequences=["TOOL RESULT:", "Observation:"]
             )
             
-            json_match = re.search(r'\{.*?\}', arch_response, re.DOTALL)
-            if json_match:
+            json_block = extract_json_block(arch_response)
+            if json_block:
                 try:
-                    tool_data = json.loads(json_match.group(0))
+                    tool_data = json.loads(json_block)
                     tool_name = tool_data.get("name")
                     await self.send_log(f"*(Architect is using {tool_name}...)*\n")
                     
@@ -518,11 +559,11 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             await self.send_log(f"----- ENGINEER RESPONSE -----\n{engineer_response}\n-----------------------------\n")
             
             code_to_test = ""
-            json_match = re.search(r'\{.*\}', engineer_response, re.DOTALL)
+            json_block = extract_json_block(engineer_response)
             
-            if json_match:
+            if json_block:
                 try:
-                    tool_data = json.loads(json_match.group(0))
+                    tool_data = json.loads(json_block)
                     
                     if tool_data.get("name") == "request_terminal_execution":
                         command = tool_data.get("command", "")
@@ -757,10 +798,17 @@ async def ping():
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    input_path = f"incoming_{file.filename}"
-    with open(input_path, "wb") as buffer: buffer.write(await file.read())
-    result = whisper_model.transcribe(input_path, fp16=False)
-    os.remove(input_path) 
+    # Temp file avoids path issues from client-supplied filenames, and running
+    # Whisper in a worker thread keeps the event loop (websockets, heartbeat)
+    # responsive during transcription.
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await file.read())
+        input_path = tmp.name
+    try:
+        result = await asyncio.to_thread(whisper_model.transcribe, input_path, fp16=False)
+    finally:
+        os.remove(input_path)
     return {"text": result["text"].strip()}
 
 if __name__ == "__main__":
