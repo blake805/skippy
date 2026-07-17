@@ -16,3 +16,8 @@ mlx-trace.json
 # Logs & OS files
 *.log
 .DS_Store
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
