@@ -11,21 +11,10 @@ chromadb
 openai-whisper
 kokoro-onnx
 soundfile
-sounddevice
 
 # Tools
 ddgs
 paramiko
 
-# Image generation (skippy.py / skippy_web.py)
-torch
-diffusers
-transformers
-accelerate
-
-# UIs
-gradio
-
 # Misc
 numpy
-requests
