@@ -5,7 +5,7 @@ import datetime
 import subprocess
 import urllib.request
 from typing import Any
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 import uuid
 import paramiko
 
@@ -18,6 +18,18 @@ os.makedirs(SKILLS_DIR, exist_ok=True)
 # 🤖 SYNTHETIC AUTONOMY TOOLS (Goal Ledger & Sandbox)
 # ==========================================
 GOALS_FILE = os.path.join(os.path.dirname(__file__), "skippy_goals.json")
+
+# --- TORMACH PATHPILOT CONNECTION SETTINGS ---
+# Credentials come from the environment so they never end up in git.
+# Set these in your shell profile (e.g. ~/.zshrc):
+#   export TORMACH_IP="192.168.1.219"
+#   export TORMACH_USER="operator"
+#   export TORMACH_SSH_KEY="~/.ssh/tormach_ed25519"   (preferred: key auth)
+#   export TORMACH_PASSWORD="..."                      (fallback: password auth)
+TORMACH_IP = os.environ.get("TORMACH_IP", "192.168.1.219")
+TORMACH_USER = os.environ.get("TORMACH_USER", "operator")
+TORMACH_SSH_KEY = os.environ.get("TORMACH_SSH_KEY", "")
+TORMACH_PASSWORD = os.environ.get("TORMACH_PASSWORD", "")
 
 def manage_goals(action: str, task: str = None, task_id: int = None) -> str:
     """Manages Skippy's internal persistent goal ledger."""
@@ -110,6 +122,121 @@ def sandbox_test(script_path: str) -> str:
         return f"SYSTEM ERROR: Failed to execute sandbox environment: {str(e)}"
 
 # ==========================================
+# 🎨 IMAGE GENERATION (ComfyUI + Pony Realism)
+# ==========================================
+# ComfyUI runs as a separate server (~/ComfyUI, port 8188) and doubles as the
+# standalone image GUI at http://127.0.0.1:8188. These tools drive it over its
+# HTTP API so the Architect can generate/edit images mid-conversation.
+COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
+IMAGE_MODEL = "ponyRealism_V23ULTRA.safetensors"
+IMAGE_OUTPUT_DIR = os.path.expanduser("~/ComfyUI/output")
+
+# Pony-family checkpoints need these quality tags to produce their best output.
+_PONY_POSITIVE_PREFIX = "score_9, score_8_up, score_7_up, photo, hyperrealistic, "
+_PONY_NEGATIVE_PREFIX = "score_6, score_5, score_4, cartoon, anime, drawing, sketch, blurry, lowres, watermark, text, "
+
+
+def _comfy_request(path: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"{COMFYUI_URL}{path}", data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+async def _comfy_run_workflow(workflow: dict, timeout_s: int = 600) -> str:
+    """Queues a ComfyUI workflow and returns the absolute path of the first output image."""
+    resp = await asyncio.to_thread(_comfy_request, "/prompt", {"prompt": workflow})
+    prompt_id = resp.get("prompt_id")
+    if not prompt_id:
+        return f"ERROR: ComfyUI rejected the workflow: {resp}"
+
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(3)
+        history = await asyncio.to_thread(_comfy_request, f"/history/{prompt_id}")
+        if prompt_id in history:
+            entry = history[prompt_id]
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                return f"ERROR: ComfyUI workflow failed: {json.dumps(status)[:500]}"
+            for node_output in entry.get("outputs", {}).values():
+                for img in node_output.get("images", []):
+                    sub = img.get("subfolder", "")
+                    return os.path.join(IMAGE_OUTPUT_DIR, sub, img["filename"])
+            return "ERROR: Workflow finished but produced no images."
+    return f"ERROR: Image generation timed out after {timeout_s}s."
+
+
+def _sampler_graph(positive: str, negative: str, latent_node: str, denoise: float, seed: int, steps: int = 28, cfg: float = 6.0) -> dict:
+    if seed < 0:
+        seed = uuid.uuid4().int % (2**32)
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": IMAGE_MODEL}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": _PONY_POSITIVE_PREFIX + positive}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": _PONY_NEGATIVE_PREFIX + negative}},
+        "5": {"class_type": "KSampler", "inputs": {
+            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+            "latent_image": [latent_node, 0], "seed": seed, "steps": steps, "cfg": cfg,
+            "sampler_name": "dpmpp_2m_sde", "scheduler": "karras", "denoise": denoise,
+        }},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "skippy"}},
+    }
+
+
+async def generate_image(prompt: str, negative_prompt: str = "", width: int = 1024, height: int = 1024, seed: int = -1) -> str:
+    """Generates a hyperrealistic image from a text prompt via ComfyUI/Pony Realism."""
+    try:
+        workflow = _sampler_graph(prompt, negative_prompt, latent_node="4", denoise=1.0, seed=seed)
+        workflow["4"] = {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+        result = await _comfy_run_workflow(workflow)
+        if result.startswith("ERROR"):
+            return result
+        return f"SUCCESS: Image generated and saved to {result}. Tell the user this exact path."
+    except Exception as e:
+        return f"IMAGE ERROR: {str(e)} (is the ComfyUI server running on {COMFYUI_URL}?)"
+
+
+async def edit_image(image_path: str, prompt: str, strength: float = 0.55, negative_prompt: str = "", seed: int = -1) -> str:
+    """Edits an existing image (img2img) guided by a text prompt. strength 0.2=subtle, 0.9=heavy."""
+    try:
+        expanded = os.path.expanduser(image_path)
+        if not os.path.exists(expanded):
+            return f"ERROR: Image not found: {expanded}"
+
+        # Upload the source image to ComfyUI's input folder via multipart form.
+        boundary = uuid.uuid4().hex
+        with open(expanded, "rb") as f:
+            file_data = f.read()
+        filename = os.path.basename(expanded)
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            f"{COMFYUI_URL}/upload/image", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        upload_resp = await asyncio.to_thread(lambda: urllib.request.urlopen(req, timeout=60))
+        upload = json.loads(upload_resp.read())
+        uploaded_name = upload.get("name", filename)
+
+        strength = min(max(float(strength), 0.05), 1.0)
+        workflow = _sampler_graph(prompt, negative_prompt, latent_node="9", denoise=strength, seed=seed)
+        workflow["8"] = {"class_type": "LoadImage", "inputs": {"image": uploaded_name}}
+        workflow["9"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["8", 0], "vae": ["1", 2]}}
+        result = await _comfy_run_workflow(workflow)
+        if result.startswith("ERROR"):
+            return result
+        return f"SUCCESS: Edited image saved to {result}. Tell the user this exact path."
+    except Exception as e:
+        return f"IMAGE ERROR: {str(e)} (is the ComfyUI server running on {COMFYUI_URL}?)"
+
+
+# ==========================================
 # 🛠️ STANDARD SHOP TOOLS
 # ==========================================
 
@@ -125,7 +252,7 @@ async def web_search(query: str) -> str:
 
 async def read_website(url: str) -> str:
     try:
-        req = urllib.request.Request(f"[https://r.jina.ai/](https://r.jina.ai/){url}", headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(f"https://r.jina.ai/{url}", headers={'User-Agent': 'Mozilla/5.0'})
         response = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
         return response.read().decode('utf-8')[:5000] 
     except Exception as e: 
@@ -151,8 +278,13 @@ async def save_memory(fact: str, collection: Any) -> str:
 async def send_to_tormach(local_file_path: str) -> str:
     try:
         expanded_path = os.path.expanduser(local_file_path)
-        cmd = f"scp {expanded_path} operator@192.168.1.219:~/gcode/"
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        # exec with an argument list (not a shell string) so paths with spaces
+        # or quotes can't break out of the command
+        scp_args = ["scp"]
+        if TORMACH_SSH_KEY:
+            scp_args += ["-i", os.path.expanduser(TORMACH_SSH_KEY)]
+        scp_args += [expanded_path, f"{TORMACH_USER}@{TORMACH_IP}:~/gcode/"]
+        process = await asyncio.create_subprocess_exec(*scp_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await process.communicate()
         if process.returncode == 0: 
             return f"SUCCESS: Transferred {expanded_path} to Tormach PathPilot."
@@ -204,9 +336,10 @@ async def run_shop_skill(skill_name: str, arguments: str = "") -> str:
         return f"ERROR: Skill '{skill_name}' does not exist. Available skills: {available}"
         
     try:
-        cmd = f"python3 {filepath} {arguments}".strip()
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        import shlex
+        args = ["python3", filepath] + (shlex.split(arguments) if arguments else [])
+        process = await asyncio.create_subprocess_exec(
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -230,23 +363,28 @@ async def run_shop_skill(skill_name: str, arguments: str = "") -> str:
 
 async def execute_tormach_ssh(command: str) -> str:
     """Securely executes a command on the Tormach PathPilot controller via SSH."""
-    
-    tormach_ip = "192.168.1.219"  
-    tormach_user = "operator"
-    tormach_password = "Mason0613!" # Switched to password authentication
-    
+
+    if not TORMACH_SSH_KEY and not TORMACH_PASSWORD:
+        return ("--- SSH CONFIG ERROR ---\n"
+                "No Tormach credentials configured. Set TORMACH_SSH_KEY (preferred) "
+                "or TORMACH_PASSWORD in the environment before starting Skippy.")
+
     def _run_ssh():
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        # Connect using password auth
-        ssh.connect(
-            hostname=tormach_ip, 
-            username=tormach_user, 
-            password=tormach_password,
-            timeout=10.0
-        )
-        
+
+        connect_kwargs = {
+            "hostname": TORMACH_IP,
+            "username": TORMACH_USER,
+            "timeout": 10.0,
+        }
+        if TORMACH_SSH_KEY:
+            connect_kwargs["key_filename"] = os.path.expanduser(TORMACH_SSH_KEY)
+        else:
+            connect_kwargs["password"] = TORMACH_PASSWORD
+
+        ssh.connect(**connect_kwargs)
+
         stdin, stdout, stderr = ssh.exec_command(command)
         out = stdout.read().decode('utf-8').strip()
         err = stderr.read().decode('utf-8').strip()
@@ -278,8 +416,9 @@ async def execute_github_manager(repo: str, action: str, title: str = None, body
     # Use absolute path for Apple Silicon Homebrew installations
     GH_PATH = "/opt/homebrew/bin/gh"
     
-    # Pre-flight check
-    auth_check = await asyncio.create_subprocess_shell(f"{GH_PATH} auth status", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    # Pre-flight check (exec with arg lists everywhere so LLM-generated titles
+    # or repo names containing quotes can't inject shell commands)
+    auth_check = await asyncio.create_subprocess_exec(GH_PATH, "auth", "status", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, stderr = await auth_check.communicate()
     
     if auth_check.returncode != 0:
@@ -295,8 +434,7 @@ async def execute_github_manager(repo: str, action: str, title: str = None, body
         if os.path.exists(target_dir):
             return json.dumps({"status": "success", "message": "Repo already exists.", "path": target_dir})
             
-        cmd = f"{GH_PATH} repo clone {repo} {target_dir}"
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(GH_PATH, "repo", "clone", repo, target_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         _, stderr = await process.communicate()
         
         if process.returncode == 0:
@@ -304,8 +442,7 @@ async def execute_github_manager(repo: str, action: str, title: str = None, body
         return json.dumps({"error": "Clone failed.", "details": stderr.decode().strip()})
 
     elif action == "list_issues":
-        cmd = f"{GH_PATH} issue list --repo {repo} --json number,title,state,url"
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(GH_PATH, "issue", "list", "--repo", repo, "--json", "number,title,state,url", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await process.communicate()
         if process.returncode == 0:
             return stdout.decode().strip()
@@ -313,10 +450,10 @@ async def execute_github_manager(repo: str, action: str, title: str = None, body
 
     elif action == "create_issue":
         if not title: return json.dumps({"error": "Missing 'title' for issue."})
-        cmd = f"{GH_PATH} issue create --repo {repo} --title '{title}'"
-        if body: cmd += f" --body '{body}'"
+        args = [GH_PATH, "issue", "create", "--repo", repo, "--title", title]
+        if body: args += ["--body", body]
         
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await process.communicate()
         if process.returncode == 0:
             return json.dumps({"status": "success", "url": stdout.decode().strip()})
@@ -337,8 +474,7 @@ async def read_directory_structure(path: str, max_depth: int = 2) -> str:
     # Use absolute path for Homebrew on Apple Silicon
     TREE_PATH = "/opt/homebrew/bin/tree"
         
-    cmd = f"{TREE_PATH} -L {max_depth} {expanded_path}"
-    process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(TREE_PATH, "-L", str(max_depth), expanded_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await process.communicate()
     
     if process.returncode == 0:

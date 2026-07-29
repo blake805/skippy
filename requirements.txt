@@ -1,0 +1,20 @@
+# Core server
+fastapi
+uvicorn
+httpx
+websockets
+
+# LLM memory / RAG
+chromadb
+
+# Voice pipeline
+openai-whisper
+kokoro-onnx
+soundfile
+
+# Tools
+ddgs
+paramiko
+
+# Misc
+numpy

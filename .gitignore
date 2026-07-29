@@ -1,5 +1,6 @@
 # Environments
 venv/
+venv_smoke/
 __pycache__/
 
 # Large Media & AI Models
@@ -7,6 +8,19 @@ __pycache__/
 *.bin
 *.wav
 
+# Traces, certs & local artifacts
+mlx-trace.json
+.gradio/
+*.pem
+
 # Logs & OS files
 *.log
 .DS_Store
+
+# User uploads (binary attachments from clients)
+uploads/
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
