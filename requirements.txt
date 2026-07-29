@@ -1,0 +1,40 @@
+# Core server
+fastapi
+uvicorn
+httpx
+websockets
+python-multipart
+
+# LLM memory / RAG
+chromadb
+
+# Voice pipeline (loaded lazily; only needed for /transcribe and TTS)
+openai-whisper
+kokoro-onnx
+soundfile
+sounddevice
+
+# Tools
+ddgs
+duckduckgo-search
+paramiko
+
+# Image generation (skippy.py / skippy_web.py)
+torch
+diffusers
+transformers
+accelerate
+
+# UIs
+gradio
+
+# Misc
+numpy
+requests
+
+# Local inference (Apple Silicon only; skip on Linux/CI)
+# mlx-lm
+
+# Dev / test
+pytest
+pytest-asyncio

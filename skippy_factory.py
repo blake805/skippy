@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import httpx
 import asyncio
 import logging
 import tempfile
@@ -9,68 +8,105 @@ import subprocess
 import base64
 import io
 import uuid
-import soundfile as sf
 from typing import Dict, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
-import chromadb
-import whisper
-from kokoro_onnx import Kokoro
 
 # --- IMPORT MODULARIZED LOGIC ---
 from prompts import PROMPTS
 import tools
+import skippy_llm
+import skippy_paths
+from skippy_llm import MODELS
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("skippy_factory")
 
-# --- TRI-SERVER ROUTING ---
-LOCAL_70B_URL = "http://127.0.0.1:8080/v1/chat/completions"
-LOCAL_405B_URL = "http://127.0.0.1:8081/v1/chat/completions"
-LOCAL_COMPRESSOR_URL = "http://127.0.0.1:8082/v1/chat/completions" # <-- NEW COMPRESSOR NODE
+# --- TRI-SERVER ROUTING (roles live in skippy_llm.py) ---
+LOCAL_70B_URL = MODELS["fast"].url                      # fast router / triage / QA
+LOCAL_405B_URL = MODELS["heavy"].url                    # heavy coding brain
+LOCAL_COMPRESSOR_URL = MODELS["compressor"].url         # RAG / tool-dump compressor
 
-MODEL_70B_NAME = "mlx-community/Llama-3.3-70B-Instruct-4bit"
-MODEL_405B_NAME = "mlx-community/Meta-Llama-3.1-405B-4bit"
-MODEL_COMPRESSOR_NAME = "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit" # <-- NEW COMPRESSOR MODEL
+MODEL_70B_NAME = MODELS["fast"].model
+MODEL_405B_NAME = MODELS["heavy"].model
+MODEL_COMPRESSOR_NAME = MODELS["compressor"].model
 
 # --- CONNECT NAS MEMORY ---
-NAS_MEMORY_PATH = "/Volumes/skippy_memory/chroma_db"
-os.makedirs(NAS_MEMORY_PATH, exist_ok=True)
-chroma_client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
-memory_collection = chroma_client.get_or_create_collection(name="skippy_longterm")
-code_collection = chroma_client.get_or_create_collection(name="skippy_code_projects")
+NAS_MEMORY_PATH = skippy_paths.chroma_path()
+_chroma_state: dict = {}
+
+def get_chroma():
+    """Lazily open the Chroma store so importing this module never needs the NAS."""
+    if "client" not in _chroma_state:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
+        _chroma_state["client"] = client
+        _chroma_state["memory"] = client.get_or_create_collection(name="skippy_longterm")
+        _chroma_state["code"] = client.get_or_create_collection(name="skippy_code_projects")
+    return _chroma_state
+
+class _LazyCollection:
+    """Stand-in that resolves to a real Chroma collection on first attribute access.
+
+    Keeps the historic `memory_collection` / `code_collection` module globals usable
+    by `tools.py` without paying the Chroma import cost at startup.
+    """
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def _target(self):
+        return get_chroma()[self._key]
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+memory_collection = _LazyCollection("memory")
+code_collection = _LazyCollection("code")
 
 # --- DYNAMIC SKILLS DIRECTORY ---
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
 os.makedirs(SKILLS_DIR, exist_ok=True)
 
-# --- INITIALIZE VOICE ENGINES ---
-logger.info("Loading Whisper Speech Engine...")
-whisper_model = whisper.load_model("base")
-logger.info("Loading Kokoro Voice Engine...")
-kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+# --- VOICE ENGINES (lazy; loaded on first transcription / TTS request) ---
+_voice_state: dict = {}
+
+def get_whisper():
+    if "whisper" not in _voice_state:
+        import whisper
+
+        logger.info("Loading Whisper Speech Engine...")
+        _voice_state["whisper"] = whisper.load_model("base")
+    return _voice_state["whisper"]
+
+def get_kokoro():
+    if "kokoro" not in _voice_state:
+        from kokoro_onnx import Kokoro
+
+        logger.info("Loading Kokoro Voice Engine...")
+        _voice_state["kokoro"] = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+    return _voice_state["kokoro"]
 
 # --- ASYNC HELPERS ---
-async def query_model_async(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None) -> str:
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temp,
-        "max_tokens": 4096 
-    }
-    if stop_sequences:
-        payload["stop"] = stop_sequences
-    async with httpx.AsyncClient() as client:
-        for attempt in range(3):
-            try:
-                response = await client.post(url, json=payload, timeout=600.0)
-                if response.status_code == 200:
-                    return response.json()["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
-            await asyncio.sleep(2.0 * (2 ** attempt))
-        return f"System Error: Failed to connect to MLX Server at {url}."
+async def query_model_async(messages: list, temp: float = 0.2, url: str = None, model_name: str = None, stop_sequences: list = None) -> str:
+    """Back-compat shim over `skippy_llm.query_model`.
+
+    Existing call sites address endpoints by URL; resolve that back to a role so the
+    request picks up the role's `max_tokens` instead of a flat 4096 cap.
+    """
+    target_url = url or MODELS["fast"].url
+    resolved = skippy_llm.endpoint_for_url(target_url)
+    if resolved is None:
+        logger.warning("No registered role for %s; falling back to 'fast' limits.", target_url)
+        resolved = MODELS["fast"]
+    return await skippy_llm.query_model(
+        messages,
+        role=resolved.role,
+        temp=temp,
+        stop=stop_sequences,
+    )
 
 async def execute_python_code(code: str) -> str:
     if re.search(r'\bfunction\s+\w+\s*\(|\bvar\s+\w+\s*=', code) or code.strip().startswith("//"):
@@ -149,32 +185,56 @@ class ConnectionManager:
             del self.active_connections[client_id]
             logger.info(f"Client Disconnected: {client_id}")
 
-    async def execute_tool_on_client(self, target_client: str, payload: dict, timeout=10.0) -> dict:
-        if target_client not in self.active_connections:
+    async def execute_tool_on_client(self, target_client: str, payload: dict, timeout: float = 10.0) -> dict:
+        websocket = self.active_connections.get(target_client)
+        if websocket is None:
             return {"error": f"Client '{target_client}' is offline."}
-        
+
         task_id = str(uuid.uuid4())
         payload["task_id"] = task_id
-        
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self.pending_responses[task_id] = future
-        
-        await self.active_connections[target_client].send_json(payload)
-        
+
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
+            await websocket.send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            del self.pending_responses[task_id]
             return {"error": f"Timeout: '{target_client}' did not respond within {timeout} seconds."}
+        except Exception as exc:
+            return {"error": f"Transport failure talking to '{target_client}': {exc}"}
+        finally:
+            self.pending_responses.pop(task_id, None)
+
+    async def request_on_socket(self, websocket: WebSocket, payload: dict, timeout: float = 300.0) -> dict:
+        """Ask a specific socket a question and await the reply through the hub.
+
+        The endpoint loop owns the only `receive_text()` call on a socket, so anything
+        that needs an answer mid-task has to round-trip through `pending_responses`
+        rather than reading the socket itself.
+        """
+        task_id = str(uuid.uuid4())
+        payload["task_id"] = task_id
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending_responses[task_id] = future
+
+        try:
+            await websocket.send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"status": "TIMEOUT", "error": f"No reply within {timeout} seconds."}
+        except Exception as exc:
+            return {"status": "ERROR", "error": f"Transport failure: {exc}"}
+        finally:
+            self.pending_responses.pop(task_id, None)
 
     def resolve_response(self, task_id: str, data: dict):
-        if task_id in self.pending_responses:
-            future = self.pending_responses[task_id]
-            if not future.done():
-                future.set_result(data)
-            del self.pending_responses[task_id]
+        future = self.pending_responses.pop(task_id, None)
+        if future is not None and not future.done():
+            future.set_result(data)
 
 hub = ConnectionManager()
 
@@ -187,7 +247,9 @@ async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
     sentences = re.split(r'(?<=[.!?]) +', clean_text)
     
     def generate_tts(t):
-        samples, sample_rate = kokoro.create(t, voice="am_michael", speed=1.25, lang="en-us")
+        import soundfile as sf
+
+        samples, sample_rate = get_kokoro().create(t, voice="am_michael", speed=1.25, lang="en-us")
         wav_io = io.BytesIO()
         sf.write(wav_io, samples, sample_rate, format='WAV')
         return base64.b64encode(wav_io.getvalue()).decode('utf-8')
@@ -759,7 +821,7 @@ async def ping():
 async def transcribe_audio(file: UploadFile = File(...)):
     input_path = f"incoming_{file.filename}"
     with open(input_path, "wb") as buffer: buffer.write(await file.read())
-    result = whisper_model.transcribe(input_path, fp16=False)
+    result = get_whisper().transcribe(input_path, fp16=False)
     os.remove(input_path) 
     return {"text": result["text"].strip()}
 
