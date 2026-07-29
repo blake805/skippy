@@ -1,9 +1,15 @@
-# Skippy — Local Shop AI
+# Skippy — Local Coding & Reverse-Engineering Agent
 
-Skippy is a fully-local, multi-agent AI assistant running on a Mac Studio (M3 Ultra, 512GB
-unified memory). It serves as a senior coding architect/engineer and the day-to-day brain
-for a machine shop (CNC, laser, 3D printing), with voice I/O, long-term memory, and
-human-approved access to shop machines.
+Skippy is a fully-local coding agent running on a Mac Studio (M3 Ultra, 512GB unified
+memory). The goal is Cursor-class capability — multi-file features in real repositories,
+project memory that survives across sessions, work spanning several repos at once, and a
+reverse-engineering mode — with no cloud LLM in the runtime path.
+
+> **Status: mid-refactor.** The shop assembly line that used to live here is archived at
+> tag `shop-v1` and has been removed from `main`. The agent runtime that replaces it is
+> not installed yet, so the websocket endpoint currently accepts connections and replies
+> that the runtime is missing. See [ADR 0006](docs/adr/0006-single-runtime-coding-agent.md)
+> for why the archive happened first.
 
 ## Architecture
 
@@ -11,45 +17,34 @@ All inference is local via MLX-served OpenAI-compatible endpoints:
 
 | Node | Port | Model | Role |
 | --- | --- | --- | --- |
-| Fast worker | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Architect, triage, QA, summarizer |
-| Kraken | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | Complex engineering tasks |
-| Compressor | 8082 | Qwen2.5-Coder-32B-4bit | Compresses RAG results to protect context |
+| Fast | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Cheap turns, triage, summarization |
+| Heavy | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | Multi-file edits, RE analysis |
+| Compressor | 8082 | Qwen2.5-Coder-32B-Instruct-4bit | Compresses retrieval results to protect context |
 
-Serve the two main nodes with:
+Serve them with `HF_HUB_OFFLINE=1` set. Without it `mlx_lm.server` calls the Hugging Face
+API to check each model's revision, which both reaches the network at runtime and takes
+the server down with a 401 when the call fails:
 
 ```bash
-mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --port 8080 --host 127.0.0.1
-mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --port 8081 --host 127.0.0.1
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --port 8080 --host 127.0.0.1
 ```
 
-### The pipeline (`skippy_factory.py` — current production server)
+The `SkippyServer` menu-bar app boots all three plus the backend for you.
 
-All agent/tool interaction uses native OpenAI-style function calling (schemas in
-`tool_schemas.py`), parsed server-side by `mlx_lm.server` — no JSON-in-text protocols.
-
-1. **Phase 0 — Smart Injector**: file paths mentioned in the prompt are read and injected
-   into context (with smart truncation for G-code/logs).
-2. **Phase 1 — Architect**: ReAct tool loop (web search, memory, RAG, GitHub, Tormach SSH,
-   goal ledger, ...) that produces a plain-English blueprint or a direct reply.
-3. **Phase 2 — Engineer + QA**: a triage step routes the blueprint to the 70B or 405B
-   engineer; drafts are executed in a subprocess sandbox and reviewed by a QA agent, up to
-   4 iterations. Approved skills are saved to `skills/`; self-upgrades ("Developer" mode)
-   require explicit human authorization over the websocket before deployment.
-4. **Phase 3 — Summarizer**: conversational wrap-up, optionally spoken via Kokoro TTS.
-
-A background **heartbeat** wakes Skippy every 5 minutes to work on the goal ledger
-(`skippy_goals.json`) autonomously.
+Tool interaction uses native OpenAI-style function calling — schemas in `tool_schemas.py`,
+parsed server-side by `mlx_lm.server`. `parse_leaked_tool_calls` in `skippy_factory.py`
+recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 
 ### File map
 
 | File | Purpose |
-| --- | --- | --- |
-| `skippy_factory.py` | Main FastAPI server: multi-agent pipeline, websocket hub, heartbeat |
-| `tools.py` | Tool implementations (search, memory, Tormach, GitHub, RAG, skills, goals) |
+| --- | --- |
+| `skippy_factory.py` | FastAPI server: model routing, websocket hub, voice, transcription |
+| `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
 | `tool_schemas.py` | OpenAI-format function schemas for native tool calling |
-| `prompts.py` | System prompts per mode (Shop / Software / CNC / Developer / Whiteboard) |
-| `test_pipeline_client.py` | Websocket client for smoke-testing the factory pipeline |
-| `skills/` | Reusable Python skills Skippy has written and QA-approved |
+| `apps/SkippyServer/` | macOS app that boots the model servers and backend |
+| `apps/SkippyClient/` | macOS/iOS chat client |
 
 ## Setup
 
@@ -59,35 +54,20 @@ pip install -r requirements.txt
 ```
 
 Download the Kokoro voice files (`kokoro-v1.0.int8.onnx`, `voices-v1.0.bin`) into the repo
-root, start your MLX servers on ports 8080/8081/8082, then:
+root, start the MLX servers on ports 8080/8081/8082, then:
 
 ```bash
 python3 skippy_factory.py
 ```
 
-### Required environment variables
-
-Machine credentials are **never** stored in the repo. Add to `~/.zshrc`:
-
-```bash
-export TORMACH_IP="192.168.1.219"
-export TORMACH_USER="operator"
-export TORMACH_SSH_KEY="~/.ssh/tormach_ed25519"   # preferred: key auth
-# export TORMACH_PASSWORD="..."                    # fallback: password auth
-```
-
-To set up key auth on the PathPilot controller:
-
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/tormach_ed25519 -N ""
-ssh-copy-id -i ~/.ssh/tormach_ed25519.pub operator@192.168.1.219
-```
+Long-term memory lives in ChromaDB at `/Volumes/skippy_memory/chroma_db`, so the NAS must
+be mounted before the backend starts.
 
 ## Security notes
 
-- Destructive tools (terminal, Tormach SSH, self-deployment) require explicit human
-  approval through the UI websocket before execution.
-- The factory binds to `0.0.0.0` for LAN clients (MacBook UI, VS Code bridge). Do not
-  port-forward it past the LAN; there is no authentication layer yet.
-- Web content (search results, fetched pages) is untrusted input to the agent loop —
-  keep the human-approval gates in place.
+- The backend binds to `0.0.0.0` for LAN clients and **has no authentication layer**. Do
+  not port-forward it or expose it to a network you don't control. Remote access is
+  planned via Tailscale plus a bearer token on the websocket handshake; until that lands,
+  LAN only.
+- Web content (search results, fetched pages) and any decompiled or third-party source is
+  untrusted input to the agent loop. Keep human-approval gates on destructive tools.
