@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import httpx
 import asyncio
 import logging
 import tempfile
@@ -9,68 +8,118 @@ import subprocess
 import base64
 import io
 import uuid
-import soundfile as sf
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
-import chromadb
-import whisper
-from kokoro_onnx import Kokoro
 
 # --- IMPORT MODULARIZED LOGIC ---
 from prompts import PROMPTS
 import tools
+import skippy_agent
+import skippy_cursor
+import skippy_llm
+import skippy_paths
+import skippy_sessions
+from skippy_llm import MODELS
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("skippy_factory")
 
-# --- TRI-SERVER ROUTING ---
-LOCAL_70B_URL = "http://127.0.0.1:8080/v1/chat/completions"
-LOCAL_405B_URL = "http://127.0.0.1:8081/v1/chat/completions"
-LOCAL_COMPRESSOR_URL = "http://127.0.0.1:8082/v1/chat/completions" # <-- NEW COMPRESSOR NODE
+# --- TRI-SERVER ROUTING (roles live in skippy_llm.py) ---
+LOCAL_70B_URL = MODELS["fast"].url                      # fast router / triage / QA
+LOCAL_405B_URL = MODELS["heavy"].url                    # heavy coding brain
+LOCAL_COMPRESSOR_URL = MODELS["compressor"].url         # RAG / tool-dump compressor
 
-MODEL_70B_NAME = "mlx-community/Llama-3.3-70B-Instruct-4bit"
-MODEL_405B_NAME = "mlx-community/Meta-Llama-3.1-405B-4bit"
-MODEL_COMPRESSOR_NAME = "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit" # <-- NEW COMPRESSOR MODEL
+MODEL_70B_NAME = MODELS["fast"].model
+MODEL_405B_NAME = MODELS["heavy"].model
+MODEL_COMPRESSOR_NAME = MODELS["compressor"].model
 
 # --- CONNECT NAS MEMORY ---
-NAS_MEMORY_PATH = "/Volumes/skippy_memory/chroma_db"
-os.makedirs(NAS_MEMORY_PATH, exist_ok=True)
-chroma_client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
-memory_collection = chroma_client.get_or_create_collection(name="skippy_longterm")
-code_collection = chroma_client.get_or_create_collection(name="skippy_code_projects")
+NAS_MEMORY_PATH = skippy_paths.chroma_path()
+_chroma_state: dict = {}
+
+def get_chroma():
+    """Lazily open the Chroma store so importing this module never needs the NAS."""
+    if "client" not in _chroma_state:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
+        _chroma_state["client"] = client
+        _chroma_state["memory"] = client.get_or_create_collection(name="skippy_longterm")
+        _chroma_state["code"] = client.get_or_create_collection(name="skippy_code_projects")
+    return _chroma_state
+
+class _LazyCollection:
+    """Stand-in that resolves to a real Chroma collection on first attribute access.
+
+    Keeps the historic `memory_collection` / `code_collection` module globals usable
+    by `tools.py` without paying the Chroma import cost at startup.
+    """
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def _target(self):
+        return get_chroma()[self._key]
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+memory_collection = _LazyCollection("memory")
+code_collection = _LazyCollection("code")
+
+# Per-project sessions + Chroma collections scoped to a project_id, for the agent
+# lane. The shop lane keeps using the two global collections above.
+session_store = skippy_sessions.SessionStore()
 
 # --- DYNAMIC SKILLS DIRECTORY ---
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
 os.makedirs(SKILLS_DIR, exist_ok=True)
 
-# --- INITIALIZE VOICE ENGINES ---
-logger.info("Loading Whisper Speech Engine...")
-whisper_model = whisper.load_model("base")
-logger.info("Loading Kokoro Voice Engine...")
-kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+# --- VOICE ENGINES (lazy; loaded on first transcription / TTS request) ---
+_voice_state: dict = {}
+
+def get_whisper():
+    if "whisper" not in _voice_state:
+        import whisper
+
+        logger.info("Loading Whisper Speech Engine...")
+        _voice_state["whisper"] = whisper.load_model("base")
+    return _voice_state["whisper"]
+
+def get_kokoro():
+    if "kokoro" not in _voice_state:
+        from kokoro_onnx import Kokoro
+
+        logger.info("Loading Kokoro Voice Engine...")
+        _voice_state["kokoro"] = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+    return _voice_state["kokoro"]
 
 # --- ASYNC HELPERS ---
-async def query_model_async(messages: list, temp: float = 0.2, url: str = LOCAL_70B_URL, model_name: str = MODEL_70B_NAME, stop_sequences: list = None) -> str:
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temp,
-        "max_tokens": 4096 
-    }
-    if stop_sequences:
-        payload["stop"] = stop_sequences
-    async with httpx.AsyncClient() as client:
-        for attempt in range(3):
-            try:
-                response = await client.post(url, json=payload, timeout=600.0)
-                if response.status_code == 200:
-                    return response.json()["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
-            await asyncio.sleep(2.0 * (2 ** attempt))
-        return f"System Error: Failed to connect to MLX Server at {url}."
+async def query_model_async(
+    messages: list,
+    temp: float = 0.2,
+    url: str = None,
+    model_name: str = None,
+    stop_sequences: list = None,
+    role: str = None,
+) -> str:
+    """Query a model by role, so the request picks up that role's `max_tokens`.
+
+    `url`/`model_name` are kept for callers outside this module that still address
+    endpoints directly; they are resolved back to a role when possible. Prefer
+    `role=` -- a URL lookup cannot survive the registry being reconfigured.
+    """
+    if role is None:
+        target_url = url or MODELS["fast"].url
+        resolved = skippy_llm.endpoint_for_url(target_url)
+        if resolved is None:
+            logger.warning("No registered role for %s; falling back to 'fast'.", target_url)
+            role = "fast"
+        else:
+            role = resolved.role
+    return await skippy_llm.query_model(messages, role=role, temp=temp, stop=stop_sequences)
 
 async def execute_python_code(code: str) -> str:
     if re.search(r'\bfunction\s+\w+\s*\(|\bvar\s+\w+\s*=', code) or code.strip().startswith("//"):
@@ -134,10 +183,26 @@ async def run_bash_command_stream(command: str, websocket: WebSocket) -> str:
         return f"SYSTEM ERROR: {str(e)}"
 
 # --- MULTI-CLIENT CONNECTION MANAGER ---
+class PendingRequest(NamedTuple):
+    """Bookkeeping for one in-flight request awaiting a reply through the hub.
+
+    `websocket` is the socket the question went out on, and `kind` says whether
+    it is a human approval (`"approval"`) or a machine RPC (`"rpc"`). Both exist
+    only so the legacy approval bridge in `_serve_socket` can answer two
+    questions about a reply that arrives without a `task_id`: which pending
+    futures live on this socket, and which of those are approvals. RPC futures
+    must never be matched by the bridge — Cursor replies always carry `task_id`.
+    """
+
+    future: asyncio.Future
+    websocket: Optional[WebSocket]
+    kind: str
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        self.pending_responses: Dict[str, asyncio.Future] = {}
+        self.pending_responses: Dict[str, PendingRequest] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -149,34 +214,78 @@ class ConnectionManager:
             del self.active_connections[client_id]
             logger.info(f"Client Disconnected: {client_id}")
 
-    async def execute_tool_on_client(self, target_client: str, payload: dict, timeout=10.0) -> dict:
-        if target_client not in self.active_connections:
+    async def execute_tool_on_client(self, target_client: str, payload: dict, timeout: float = 10.0) -> dict:
+        websocket = self.active_connections.get(target_client)
+        if websocket is None:
             return {"error": f"Client '{target_client}' is offline."}
-        
+
         task_id = str(uuid.uuid4())
         payload["task_id"] = task_id
-        
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self.pending_responses[task_id] = future
-        
-        await self.active_connections[target_client].send_json(payload)
-        
+        self.pending_responses[task_id] = PendingRequest(future, websocket, "rpc")
+
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
+            await websocket.send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            del self.pending_responses[task_id]
             return {"error": f"Timeout: '{target_client}' did not respond within {timeout} seconds."}
+        except Exception as exc:
+            return {"error": f"Transport failure talking to '{target_client}': {exc}"}
+        finally:
+            self.pending_responses.pop(task_id, None)
+
+    async def request_on_socket(self, websocket: WebSocket, payload: dict, timeout: float = 300.0) -> dict:
+        """Ask a specific socket a question and await the reply through the hub.
+
+        The endpoint loop owns the only `receive_text()` call on a socket, so anything
+        that needs an answer mid-task has to round-trip through `pending_responses`
+        rather than reading the socket itself.
+        """
+        task_id = str(uuid.uuid4())
+        payload["task_id"] = task_id
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending_responses[task_id] = PendingRequest(future, websocket, "approval")
+
+        try:
+            await websocket.send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"status": "TIMEOUT", "error": f"No reply within {timeout} seconds."}
+        except Exception as exc:
+            return {"status": "ERROR", "error": f"Transport failure: {exc}"}
+        finally:
+            self.pending_responses.pop(task_id, None)
 
     def resolve_response(self, task_id: str, data: dict):
-        if task_id in self.pending_responses:
-            future = self.pending_responses[task_id]
-            if not future.done():
-                future.set_result(data)
-            del self.pending_responses[task_id]
+        pending = self.pending_responses.pop(task_id, None)
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(data)
+
+    def pending_approvals_on(self, websocket: WebSocket) -> list:
+        """The `task_id`s of human-approval requests awaiting a reply on this socket.
+
+        RPC futures are excluded by construction: Cursor replies always carry a
+        `task_id`, so the legacy bridge must never consider them.
+        """
+        return [
+            task_id
+            for task_id, pending in self.pending_responses.items()
+            if pending.kind == "approval" and pending.websocket is websocket
+        ]
 
 hub = ConnectionManager()
+
+# A human has to walk over and look at the request before answering, so the window
+# is deliberately long. A client that does not echo `task_id` back never resolves
+# and will burn the whole timeout — see docs/adr/0005-approval-routing.md.
+HUMAN_APPROVAL_TIMEOUT = 600.0
+
+# RPC channel to the Cursor extension (client_id=cursor). Inert until it connects.
+cursor_bridge = skippy_cursor.CursorBridge(hub)
 
 # --- TTS HELPER ---
 async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
@@ -187,7 +296,9 @@ async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
     sentences = re.split(r'(?<=[.!?]) +', clean_text)
     
     def generate_tts(t):
-        samples, sample_rate = kokoro.create(t, voice="am_michael", speed=1.25, lang="en-us")
+        import soundfile as sf
+
+        samples, sample_rate = get_kokoro().create(t, voice="am_michael", speed=1.25, lang="en-us")
         wav_io = io.BytesIO()
         sf.write(wav_io, samples, sample_rate, format='WAV')
         return base64.b64encode(wav_io.getvalue()).decode('utf-8')
@@ -232,6 +343,19 @@ class SkippyPipeline:
             await self.ws.send_json({"type": "chat", "content": msg})
         except Exception:
             pass
+
+    async def await_authorization(self, payload: dict, timeout: float = HUMAN_APPROVAL_TIMEOUT) -> bool:
+        """Send a human-approval request and await the answer through the hub.
+
+        `_serve_socket` owns the only `receive_text()` call on this socket, so the
+        reply has to come back through `pending_responses` keyed by `task_id`
+        rather than being read here. Anything that is not an explicit APPROVE —
+        a denial, a timeout, a dead socket — fails closed.
+        """
+        reply = await self.manager.request_on_socket(self.ws, payload, timeout=timeout)
+        if reply.get("status") == "TIMEOUT":
+            await self.send_log(f"⌛ No answer within {timeout:.0f}s. Treating as DENIED.\n")
+        return reply.get("status") == "APPROVE"
 
     def smart_truncate(self, filepath: str, content: str, max_chars: int = 15000) -> str:
         if len(content) <= max_chars:
@@ -361,8 +485,7 @@ class SkippyPipeline:
             arch_response = await query_model_async(
                 arch_messages, 
                 temp=0.2, 
-                url=LOCAL_70B_URL, 
-                model_name=MODEL_70B_NAME,
+                role="fast",
                 stop_sequences=["TOOL RESULT:", "Observation:"]
             )
             
@@ -410,10 +533,10 @@ class SkippyPipeline:
                         
                         await self.send_log(f"\n⚠️ [Architect] Requested Tormach SSH: {command}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
+                            authorized = await self.await_authorization(
+                                {"type": "terminal_auth", "command": command, "explanation": explanation}
+                            )
+                            if authorized:
                                 await self.send_log(f"✅ Authorization GRANTED. Connecting to PathPilot...\n")
                                 tool_result = await tools.execute_tormach_ssh(command)
                             else:
@@ -446,7 +569,7 @@ class SkippyPipeline:
                         
                         raw_tool_result = await tools.search_codebase(search_query, code_collection)
                         
-                        await self.send_log(f"*(Compressing search results via 32B Node to protect Architect's context window...)*\n")
+                        await self.send_log("*(Compressing search results via the compressor node to protect Architect's context window...)*\n")
                         compressor_prompt = f"""You are a data extraction node. 
 The Architect needs to know: '{search_query}'. 
 Here is the raw codebase data pulled from ChromaDB: 
@@ -457,8 +580,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         compressed_result = await query_model_async(
                             [{"role": "user", "content": compressor_prompt}], 
                             temp=0.1, 
-                            url=LOCAL_COMPRESSOR_URL, 
-                            model_name=MODEL_COMPRESSOR_NAME
+                            role="compressor",
                         )
                         tool_result = f"COMPRESSED MEMORY RESULT:\n{compressed_result}"
                         
@@ -479,16 +601,15 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
         await self.send_log("\n[Triage Cop] Evaluating task complexity for routing...\n")
         if self.mode == "Developer":
             is_complex = True
-            await self.send_log("*(Developer Mode detected. Bypassing triage and routing to 405B Kraken...)*\n")
+            await self.send_log("*(Developer Mode detected. Bypassing triage and routing to the heavy model...)*\n")
         else:
             triage_prompt = f"Review this blueprint:\n{self.blueprint}\nIf this requires complex architectural changes, large Python scripts, or generating G-code/firmware, output ONLY the word: COMPLEX. If it is a simple short script, basic calculation, or a single bash command, output ONLY the word: SIMPLE."
-            triage_verdict = await query_model_async([{"role": "user", "content": triage_prompt}], temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+            triage_verdict = await query_model_async([{"role": "user", "content": triage_prompt}], temp=0.1, role="fast")
             is_complex = "COMPLEX" in triage_verdict.upper()
-            if is_complex: await self.send_log("*(Triage Cop classified task as COMPLEX. Routing to 405B Kraken...)*\n")
-            else: await self.send_log("*(Triage Cop classified task as SIMPLE. Routing to 70B Fast Worker...)*\n")
+            if is_complex: await self.send_log("*(Triage Cop classified task as COMPLEX. Routing to the heavy model...)*\n")
+            else: await self.send_log("*(Triage Cop classified task as SIMPLE. Routing to the fast model...)*\n")
 
-        eng_url = LOCAL_405B_URL if is_complex else LOCAL_70B_URL
-        eng_model = MODEL_405B_NAME if is_complex else MODEL_70B_NAME
+        eng_role = "heavy" if is_complex else "fast"
         
         dev_context = ""
         if self.mode == "Developer":
@@ -508,13 +629,13 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
         code_to_test = ""
         
         for attempt in range(4):
-            engine_name = "405B Model" if is_complex else "70B Model"
+            engine_name = MODELS[eng_role].model
             await self.send_log(f"\n[Engineer] Coding session started on {engine_name}. Attempt {attempt + 1}/4...\n")
             
             current_eng_messages = base_eng_messages.copy()
             if qa_feedback: current_eng_messages.append({"role": "user", "content": qa_feedback})
             
-            engineer_response = await query_model_async(current_eng_messages, temp=0.1, url=eng_url, model_name=eng_model)
+            engineer_response = await query_model_async(current_eng_messages, temp=0.1, role=eng_role)
             await self.send_log(f"----- ENGINEER RESPONSE -----\n{engineer_response}\n-----------------------------\n")
             
             code_to_test = ""
@@ -530,10 +651,10 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         
                         await self.send_log(f"\n⚠️ [Engineer] Requested God Mode: {command}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
+                            authorized = await self.await_authorization(
+                                {"type": "terminal_auth", "command": command, "explanation": explanation}
+                            )
+                            if authorized:
                                 await self.send_log(f"✅ Authorization GRANTED. Executing: {command}...\n")
                                 cmd_output = await run_bash_command_stream(command, self.ws)
                                 await self.send_log(f"----- EXECUTION FINISHED -----\n")
@@ -596,7 +717,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             qa_review = await query_model_async([
                 {"role": "system", "content": PROMPTS.get(self.mode, PROMPTS["Shop"]).get("qa", "")},
                 {"role": "user", "content": qa_prompt_injection}
-            ], temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+            ], temp=0.1, role="fast")
             
             await self.send_log(f"----- QA VERDICT REPORT -----\n{qa_review}\n-----------------------------\n")
 
@@ -644,16 +765,14 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         
                         await self.send_log(f"\n⚠️ [QA Lead] Requested DEPLOYMENT to {target_file}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({
+                            authorized = await self.await_authorization({
                                 "type": "deployment_auth",
                                 "target_file": target_file,
                                 "summary": summary,
                                 "content": code_to_test
                             })
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            
-                            if auth_data.get("status") == "APPROVE":
+
+                            if authorized:
                                 await self.send_log(f"✅ Deployment AUTHORIZED. Overwriting {target_file}...\n")
                                 expanded_path = os.path.expanduser(target_file)
                                 if not "/" in expanded_path: expanded_path = os.path.join(os.getcwd(), expanded_path)
@@ -691,17 +810,81 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             {"role": "user", "content": f"Task: {self.user_input}\nBlueprint: {self.blueprint}\nOutcome: {status_text}\nQA Feedback/Results: {self.execution_result}\nWrite the conversational summary."}
         ]
         
-        final_summary = await query_model_async(summary_messages, temp=0.4, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+        final_summary = await query_model_async(summary_messages, temp=0.4, role="fast")
         await self.send_chat(final_summary)
         if self.ws: await speak_text(final_summary, self.ws, self.use_tts)
 
 # --- THE AUTONOMOUS HEARTBEAT LOOP ---
+GOALS_FILE = os.path.join(os.path.dirname(__file__), "skippy_goals.json")
+
+
+def claim_pending_project_tasks() -> list:
+    """Pull ledger tasks that name a `project_id` and hand them to the agent.
+
+    Tasks without a `project_id` are left entirely alone, so the shop's ledger
+    behaviour is unchanged. Claimed tasks flip to `in_progress` here so the next
+    tick does not dispatch them a second time.
+    """
+    if not os.path.exists(GOALS_FILE):
+        return []
+    try:
+        with open(GOALS_FILE, "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    claimed = []
+    changed = False
+    for task in data.get("tasks", []):
+        if task.get("project_id") and task.get("status") == "pending":
+            task["status"] = "in_progress"
+            claimed.append(dict(task))
+            changed = True
+
+    if changed:
+        try:
+            with open(GOALS_FILE, "w") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError as exc:
+            logger.error(f"Could not claim project tasks in the ledger: {exc}")
+            return []
+    return claimed
+
+
 async def skippy_heartbeat():
     """Background task that wakes Skippy up every 5 minutes."""
     while True:
         await asyncio.sleep(300) 
         
         current_time = tools.get_system_time()
+
+        # Project work goes to the coding agent, which can actually resume a
+        # multi-file task; a blank Shop tick cannot.
+        try:
+            for task in claim_pending_project_tasks():
+                logger.info(
+                    "Heartbeat dispatching project task %s to the agent (project=%s)",
+                    task.get("id"),
+                    task.get("project_id"),
+                )
+                asyncio.create_task(
+                    skippy_agent.run_agent_task(
+                        None,
+                        {
+                            "mode": task.get("mode", "Agent"),
+                            "text": task.get("task", ""),
+                            "project_id": task["project_id"],
+                            "session_id": task.get("session_id"),
+                            "workspace_roots": task.get("workspace_roots"),
+                        },
+                        hub,
+                        session_store=session_store,
+                        cursor_bridge=cursor_bridge,
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Heartbeat project dispatch failure: {str(e)}")
+
         system_injection = (
             f"[SYSTEM TICK] - Timestamp: {current_time}. "
             "Wake up. Use 'manage_goals' (action: 'view') to check your ledger. "
@@ -728,28 +911,137 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Skippy Assembly Line API (Ultimate Routing Edition)", lifespan=lifespan)
 
-# --- MULTI-CLIENT WEBSOCKET ENDPOINT ---
-@app.websocket("/ws/factory")
-async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
+# --- MULTI-CLIENT WEBSOCKET ENDPOINTS ---
+# Modes that belong to the coding agent rather than the shop assembly line.
+AGENT_MODES = {"Agent", "RE"}
+
+# Clients that exist purely to answer RPCs. A stray message from one of these must
+# never spawn a Shop pipeline.
+RPC_ONLY_CLIENTS = {"cursor", "vscode"}
+
+
+def strict_auth_task_id() -> bool:
+    """SKIPPY_STRICT_AUTH_TASK_ID=1 disables the legacy approval bridge.
+
+    Flip it once the SwiftUI app echoes `task_id`; the bridge gets deleted when
+    this becomes the default. Read per-message so a running server honours it
+    without a restart being wasted on a stale value.
+    """
+    return os.environ.get("SKIPPY_STRICT_AUTH_TASK_ID", "").strip() == "1"
+
+
+async def _serve_socket(websocket: WebSocket, client_id: str, default_mode: str):
     await hub.connect(websocket, client_id)
-    
+
     try:
         while True:
             raw_input = await websocket.receive_text()
             try:
                 data = json.loads(raw_input)
             except json.JSONDecodeError:
-                data = {"mode": "Shop", "text": raw_input, "history": [], "use_tts": False}
-                
+                data = {"mode": default_mode, "text": raw_input, "history": [], "use_tts": False}
+
+            # Replies to anything the server asked for: RPC results and auth decisions.
             if "task_id" in data:
                 hub.resolve_response(data["task_id"], data)
                 continue
-                
+
+            # DEPRECATION BRIDGE for SwiftUI clients that predate ADR 0005 and do
+            # not echo `task_id` yet. A reply-shaped message (it carries "status")
+            # is matched to a pending approval only when exactly one approval is
+            # waiting on this very socket; RPC futures are never candidates. With
+            # zero or several candidates we refuse to guess and fall through to
+            # the old behaviour (the message becomes a new task and the waiting
+            # gate burns its timeout and denies). Delete this block once the app
+            # echoes task_id and SKIPPY_STRICT_AUTH_TASK_ID=1 is the default.
+            if "status" in data:
+                if strict_auth_task_id():
+                    logger.warning(
+                        "SKIPPY_STRICT_AUTH_TASK_ID=1: refusing a reply without task_id "
+                        "from '%s'. The client must echo the request's task_id "
+                        "(docs/swiftui_client_contract.md).",
+                        client_id,
+                    )
+                    continue
+                approvals = hub.pending_approvals_on(websocket)
+                if len(approvals) == 1:
+                    logger.warning(
+                        "Legacy approval bridge: matched a reply without task_id from "
+                        "'%s' to pending approval %s. Update the SwiftUI client to "
+                        "echo task_id (docs/swiftui_client_contract.md).",
+                        client_id,
+                        approvals[0],
+                    )
+                    hub.resolve_response(approvals[0], data)
+                    continue
+                if len(approvals) == 0:
+                    logger.warning(
+                        "Legacy approval bridge: a reply without task_id arrived from "
+                        "'%s' but no approval is pending on this socket; dispatching "
+                        "it as a new task, as before.",
+                        client_id,
+                    )
+                else:
+                    logger.warning(
+                        "Legacy approval bridge: a reply without task_id arrived from "
+                        "'%s' but %d approvals are pending on this socket; refusing "
+                        "to guess between them. Dispatching it as a new task, as "
+                        "before, and the unanswered gates will time out closed.",
+                        client_id,
+                        len(approvals),
+                    )
+                # Fall through to normal dispatch.
+
+            message_type = data.get("type")
+
+            if message_type == "agent_cancel":
+                session_id = data.get("session_id", "")
+                found = skippy_agent.cancel_session(session_id)
+                await websocket.send_json(
+                    {"type": "agent_cancelled", "session_id": session_id, "found": found}
+                )
+                continue
+
+            if message_type in ("hello", "ping", "register"):
+                await websocket.send_json({"type": "hello_ack", "client_id": client_id})
+                continue
+
+            if client_id in RPC_ONLY_CLIENTS and not data.get("text"):
+                logger.info("Ignoring non-task message from RPC client '%s': %s", client_id, message_type)
+                continue
+
+            mode = data.get("mode") or default_mode
+            if mode in AGENT_MODES:
+                data.setdefault("mode", mode)
+                asyncio.create_task(
+                    skippy_agent.run_agent_task(
+                        websocket,
+                        data,
+                        hub,
+                        session_store=session_store,
+                        speak=speak_text,
+                        cursor_bridge=cursor_bridge,
+                    )
+                )
+                continue
+
             pipeline = SkippyPipeline(websocket, data, hub)
             asyncio.create_task(pipeline.run())
 
     except WebSocketDisconnect:
         hub.disconnect(client_id)
+
+
+@app.websocket("/ws/factory")
+async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
+    """Shop lane by default; `mode: "Agent"` routes the same socket to SkippyAgent."""
+    await _serve_socket(websocket, client_id, default_mode="Shop")
+
+
+@app.websocket("/ws/agent")
+async def agent_endpoint(websocket: WebSocket, client_id: str = "agent"):
+    """Coding-agent lane. Identical handler, different default mode."""
+    await _serve_socket(websocket, client_id, default_mode="Agent")
 
 @app.get("/ping")
 async def ping():
@@ -759,7 +1051,7 @@ async def ping():
 async def transcribe_audio(file: UploadFile = File(...)):
     input_path = f"incoming_{file.filename}"
     with open(input_path, "wb") as buffer: buffer.write(await file.read())
-    result = whisper_model.transcribe(input_path, fp16=False)
+    result = get_whisper().transcribe(input_path, fp16=False)
     os.remove(input_path) 
     return {"text": result["text"].strip()}
 

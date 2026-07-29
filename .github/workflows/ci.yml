@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  SKIPPY_MEMORY_ROOT: ${{ github.workspace }}/.ci-tmp/skippy_memory
+  SKIPPY_WORKSPACES_ROOT: ${{ github.workspace }}/.ci-tmp/skippy_workspaces
+
+jobs:
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately install only the light dependencies. The test suite is
+      # importable without torch, gradio, chromadb, openai-whisper and
+      # kokoro-onnx; installing them would take the run from ~10 seconds to
+      # several minutes. If an import ever breaks under this set, fix the
+      # import, not this workflow.
+      - name: Install test dependencies
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install fastapi uvicorn httpx websockets pytest pytest-asyncio \
+            python-multipart duckduckgo_search paramiko
+
+      - name: Run pytest
+        run: |
+          source venv/bin/activate
+          python3 -m pytest tests/
+
+  pyflakes:
+    name: pyflakes (clean modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyflakes
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install pyflakes
+
+      # skippy_factory.py, tools.py and skippy_web.py have pre-existing
+      # warnings and are intentionally excluded; keep the modules below clean.
+      - name: Run pyflakes
+        run: |
+          source venv/bin/activate
+          python3 -m pyflakes \
+            skippy_llm.py \
+            skippy_paths.py \
+            skippy_agent.py \
+            skippy_agent_tools.py \
+            skippy_sessions.py \
+            skippy_cursor.py \
+            tests/
+
+  extension-tests:
+    name: Cursor extension tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cursor_client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc -p ./ --noEmit
+
+      # The node --test suite loads compiled JS from out/, so a real compile
+      # is required before running it; --noEmit alone is not enough.
+      - name: Compile
+        run: npm run compile
+
+      - name: Run tests
+        run: npm test
