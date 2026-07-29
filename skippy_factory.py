@@ -8,7 +8,7 @@ import subprocess
 import base64
 import io
 import uuid
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 
@@ -183,10 +183,26 @@ async def run_bash_command_stream(command: str, websocket: WebSocket) -> str:
         return f"SYSTEM ERROR: {str(e)}"
 
 # --- MULTI-CLIENT CONNECTION MANAGER ---
+class PendingRequest(NamedTuple):
+    """Bookkeeping for one in-flight request awaiting a reply through the hub.
+
+    `websocket` is the socket the question went out on, and `kind` says whether
+    it is a human approval (`"approval"`) or a machine RPC (`"rpc"`). Both exist
+    only so the legacy approval bridge in `_serve_socket` can answer two
+    questions about a reply that arrives without a `task_id`: which pending
+    futures live on this socket, and which of those are approvals. RPC futures
+    must never be matched by the bridge — Cursor replies always carry `task_id`.
+    """
+
+    future: asyncio.Future
+    websocket: Optional[WebSocket]
+    kind: str
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        self.pending_responses: Dict[str, asyncio.Future] = {}
+        self.pending_responses: Dict[str, PendingRequest] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -208,7 +224,7 @@ class ConnectionManager:
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self.pending_responses[task_id] = future
+        self.pending_responses[task_id] = PendingRequest(future, websocket, "rpc")
 
         try:
             await websocket.send_json(payload)
@@ -232,7 +248,7 @@ class ConnectionManager:
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self.pending_responses[task_id] = future
+        self.pending_responses[task_id] = PendingRequest(future, websocket, "approval")
 
         try:
             await websocket.send_json(payload)
@@ -245,9 +261,21 @@ class ConnectionManager:
             self.pending_responses.pop(task_id, None)
 
     def resolve_response(self, task_id: str, data: dict):
-        future = self.pending_responses.pop(task_id, None)
-        if future is not None and not future.done():
-            future.set_result(data)
+        pending = self.pending_responses.pop(task_id, None)
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(data)
+
+    def pending_approvals_on(self, websocket: WebSocket) -> list:
+        """The `task_id`s of human-approval requests awaiting a reply on this socket.
+
+        RPC futures are excluded by construction: Cursor replies always carry a
+        `task_id`, so the legacy bridge must never consider them.
+        """
+        return [
+            task_id
+            for task_id, pending in self.pending_responses.items()
+            if pending.kind == "approval" and pending.websocket is websocket
+        ]
 
 hub = ConnectionManager()
 
@@ -892,6 +920,16 @@ AGENT_MODES = {"Agent", "RE"}
 RPC_ONLY_CLIENTS = {"cursor", "vscode"}
 
 
+def strict_auth_task_id() -> bool:
+    """SKIPPY_STRICT_AUTH_TASK_ID=1 disables the legacy approval bridge.
+
+    Flip it once the SwiftUI app echoes `task_id`; the bridge gets deleted when
+    this becomes the default. Read per-message so a running server honours it
+    without a restart being wasted on a stale value.
+    """
+    return os.environ.get("SKIPPY_STRICT_AUTH_TASK_ID", "").strip() == "1"
+
+
 async def _serve_socket(websocket: WebSocket, client_id: str, default_mode: str):
     await hub.connect(websocket, client_id)
 
@@ -907,6 +945,52 @@ async def _serve_socket(websocket: WebSocket, client_id: str, default_mode: str)
             if "task_id" in data:
                 hub.resolve_response(data["task_id"], data)
                 continue
+
+            # DEPRECATION BRIDGE for SwiftUI clients that predate ADR 0005 and do
+            # not echo `task_id` yet. A reply-shaped message (it carries "status")
+            # is matched to a pending approval only when exactly one approval is
+            # waiting on this very socket; RPC futures are never candidates. With
+            # zero or several candidates we refuse to guess and fall through to
+            # the old behaviour (the message becomes a new task and the waiting
+            # gate burns its timeout and denies). Delete this block once the app
+            # echoes task_id and SKIPPY_STRICT_AUTH_TASK_ID=1 is the default.
+            if "status" in data:
+                if strict_auth_task_id():
+                    logger.warning(
+                        "SKIPPY_STRICT_AUTH_TASK_ID=1: refusing a reply without task_id "
+                        "from '%s'. The client must echo the request's task_id "
+                        "(docs/swiftui_client_contract.md).",
+                        client_id,
+                    )
+                    continue
+                approvals = hub.pending_approvals_on(websocket)
+                if len(approvals) == 1:
+                    logger.warning(
+                        "Legacy approval bridge: matched a reply without task_id from "
+                        "'%s' to pending approval %s. Update the SwiftUI client to "
+                        "echo task_id (docs/swiftui_client_contract.md).",
+                        client_id,
+                        approvals[0],
+                    )
+                    hub.resolve_response(approvals[0], data)
+                    continue
+                if len(approvals) == 0:
+                    logger.warning(
+                        "Legacy approval bridge: a reply without task_id arrived from "
+                        "'%s' but no approval is pending on this socket; dispatching "
+                        "it as a new task, as before.",
+                        client_id,
+                    )
+                else:
+                    logger.warning(
+                        "Legacy approval bridge: a reply without task_id arrived from "
+                        "'%s' but %d approvals are pending on this socket; refusing "
+                        "to guess between them. Dispatching it as a new task, as "
+                        "before, and the unanswered gates will time out closed.",
+                        client_id,
+                        len(approvals),
+                    )
+                # Fall through to normal dispatch.
 
             message_type = data.get("type")
 
