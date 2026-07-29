@@ -174,6 +174,7 @@ class ToolContext:
     approve: Optional[ApproveFn] = None
     emit: Optional[EmitFn] = None
     auto_approve: Dict[str, bool] = field(default_factory=dict)
+    session_id: str = ""
 
     async def request_approval(self, command: str, explanation: str) -> bool:
         if self.auto_approve.get("terminal"):
@@ -964,7 +965,9 @@ async def save_decision(
         return ToolResult(False, "save_decision requires both 'title' and 'body'.")
     if ctx.dry_run:
         return ToolResult(True, "Dry run: skipped save_decision.")
-    return await ctx.memory.save_decision(title=title, body=body, tags=list(tags or []))
+    return await ctx.memory.save_decision(
+        title=title, body=body, tags=list(tags or []), session_id=ctx.session_id
+    )
 
 
 # ---------------------------------------------------------------------------

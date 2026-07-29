@@ -289,6 +289,7 @@ class SkippyAgent:
                 approve=self._approve,
                 emit=self.emit,
                 auto_approve=self.auto_approve,
+                session_id=self.session_id,
             )
 
             await self.log(
@@ -441,7 +442,15 @@ class SkippyAgent:
                 )
                 result = ToolResult(False, observation)
             else:
+                if self.session is not None:
+                    # Pre-images for this step land beside the session on the NAS.
+                    self.ctx.backup_dir = self.session.backup_dir(self.step)
                 result = await agent_tools.dispatch(name, args, self.ctx)
+
+            if name == "save_decision" and result.ok and self.session is not None:
+                decision_id = result.data.get("decision_id")
+                if decision_id and decision_id not in self.session.decisions:
+                    self.session.decisions.append(decision_id)
 
             if name == "apply_patch" and result.ok:
                 for report in result.data.get("files", []):

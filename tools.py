@@ -349,47 +349,85 @@ async def read_directory_structure(path: str, max_depth: int = 2) -> str:
 # 🧠 CODEBASE INGESTION VIA RAG (Goal C)
 # ==========================================
 
-async def ingest_codebase_to_rag(path: str, collection) -> str:
-    """Recursively processes code files in a folder and saves chunks into ChromaDB."""
+SKIP_INGEST_DIRS = {
+    "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", "venv", ".venv",
+    "dist", "build", ".build", "target", ".next",
+}
+
+
+async def ingest_codebase_to_rag(path: str, collection, project_id: str = None) -> str:
+    """Recursively processes code files in a folder and saves chunks into ChromaDB.
+
+    Chunk ids are derived from the path and line range rather than a random uuid, so
+    re-ingesting a project updates chunks in place instead of stacking duplicate
+    copies of every file. Metadata carries the repo-relative path and the chunk's
+    line range so a search hit can be turned back into a `read_file` call.
+    """
     expanded_path = os.path.expanduser(path)
     if not os.path.exists(expanded_path):
         return json.dumps({"error": f"Path {expanded_path} does not exist."})
-        
+
     supported_extensions = {'.py', '.swift', '.js', '.ts', '.cpp', '.h', '.ino', '.json', '.md', '.txt', '.java', '.c'}
     chunk_count = 0
-    
-    # Helper to chunk text synchronously to avoid thread-blocking inside the loop
-    def chunk_text(text, max_chars=1500):
-        return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+    file_count = 0
+
+    def chunk_by_lines(lines, max_chars=1500):
+        """Split on line boundaries so a chunk never bisects a statement."""
+        chunks, current, size, start = [], [], 0, 1
+        for offset, line in enumerate(lines, start=1):
+            if current and size + len(line) > max_chars:
+                chunks.append((start, offset - 1, "".join(current)))
+                current, size, start = [], 0, offset
+            current.append(line)
+            size += len(line)
+        if current:
+            chunks.append((start, len(lines), "".join(current)))
+        return chunks
 
     for root, dirs, files in os.walk(expanded_path):
-        # Ignore hidden directory tracking
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_INGEST_DIRS]
+
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in supported_extensions:
-                file_path = os.path.join(root, file)
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    if not content.strip():
-                        continue
-                        
-                    chunks = chunk_text(content)
-                    for i, chunk in enumerate(chunks):
-                        chunk_id = f"code_{uuid.uuid4()}"
-                        collection.add(
-                            documents=[chunk],
-                            metadatas=[{"source": file_path, "chunk_index": i, "filename": file}],
-                            ids=[chunk_id]
-                        )
-                        chunk_count += 1
-                except Exception as e:
+            if ext not in supported_extensions:
+                continue
+            file_path = os.path.join(root, file)
+            relative_path = os.path.relpath(file_path, expanded_path)
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+
+                if not any(line.strip() for line in lines):
                     continue
 
-    return f"SUCCESS: Ingested {chunk_count} code chunks from {expanded_path} into ChromaDB memory."
+                file_count += 1
+                for index, (first_line, last_line, chunk) in enumerate(chunk_by_lines(lines)):
+                    metadata = {
+                        "source": file_path,
+                        "relative_path": relative_path,
+                        "filename": file,
+                        "extension": ext,
+                        "chunk_index": index,
+                        "start_line": first_line,
+                        "end_line": last_line,
+                    }
+                    if project_id:
+                        metadata["project_id"] = project_id
+                    chunk_id = f"code:{project_id or 'global'}:{relative_path}:{index}"
+                    document = f"{relative_path} (lines {first_line}-{last_line}):\n{chunk}"
+                    try:
+                        collection.upsert(documents=[document], metadatas=[metadata], ids=[chunk_id])
+                    except AttributeError:
+                        collection.add(documents=[document], metadatas=[metadata], ids=[chunk_id])
+                    chunk_count += 1
+            except Exception:
+                continue
+
+    scope = f" for project '{project_id}'" if project_id else ""
+    return (
+        f"SUCCESS: Ingested {chunk_count} code chunks from {file_count} file(s) in "
+        f"{expanded_path}{scope} into ChromaDB memory."
+    )
 
 # ==========================================
 # 🔍 CODEBASE SEARCH (Goal E)

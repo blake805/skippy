@@ -18,6 +18,7 @@ import tools
 import skippy_agent
 import skippy_llm
 import skippy_paths
+import skippy_sessions
 from skippy_llm import MODELS
 
 # --- SETUP LOGGING ---
@@ -67,8 +68,9 @@ class _LazyCollection:
 memory_collection = _LazyCollection("memory")
 code_collection = _LazyCollection("code")
 
-# Per-project sessions + scoped Chroma for the agent lane. None until Phase 3.
-session_store = None
+# Per-project sessions + Chroma collections scoped to a project_id, for the agent
+# lane. The shop lane keeps using the two global collections above.
+session_store = skippy_sessions.SessionStore()
 
 # --- DYNAMIC SKILLS DIRECTORY ---
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
@@ -762,12 +764,75 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
         if self.ws: await speak_text(final_summary, self.ws, self.use_tts)
 
 # --- THE AUTONOMOUS HEARTBEAT LOOP ---
+GOALS_FILE = os.path.join(os.path.dirname(__file__), "skippy_goals.json")
+
+
+def claim_pending_project_tasks() -> list:
+    """Pull ledger tasks that name a `project_id` and hand them to the agent.
+
+    Tasks without a `project_id` are left entirely alone, so the shop's ledger
+    behaviour is unchanged. Claimed tasks flip to `in_progress` here so the next
+    tick does not dispatch them a second time.
+    """
+    if not os.path.exists(GOALS_FILE):
+        return []
+    try:
+        with open(GOALS_FILE, "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    claimed = []
+    changed = False
+    for task in data.get("tasks", []):
+        if task.get("project_id") and task.get("status") == "pending":
+            task["status"] = "in_progress"
+            claimed.append(dict(task))
+            changed = True
+
+    if changed:
+        try:
+            with open(GOALS_FILE, "w") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError as exc:
+            logger.error(f"Could not claim project tasks in the ledger: {exc}")
+            return []
+    return claimed
+
+
 async def skippy_heartbeat():
     """Background task that wakes Skippy up every 5 minutes."""
     while True:
         await asyncio.sleep(300) 
         
         current_time = tools.get_system_time()
+
+        # Project work goes to the coding agent, which can actually resume a
+        # multi-file task; a blank Shop tick cannot.
+        try:
+            for task in claim_pending_project_tasks():
+                logger.info(
+                    "Heartbeat dispatching project task %s to the agent (project=%s)",
+                    task.get("id"),
+                    task.get("project_id"),
+                )
+                asyncio.create_task(
+                    skippy_agent.run_agent_task(
+                        None,
+                        {
+                            "mode": task.get("mode", "Agent"),
+                            "text": task.get("task", ""),
+                            "project_id": task["project_id"],
+                            "session_id": task.get("session_id"),
+                            "workspace_roots": task.get("workspace_roots"),
+                        },
+                        hub,
+                        session_store=session_store,
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Heartbeat project dispatch failure: {str(e)}")
+
         system_injection = (
             f"[SYSTEM TICK] - Timestamp: {current_time}. "
             "Wake up. Use 'manage_goals' (action: 'view') to check your ledger. "
