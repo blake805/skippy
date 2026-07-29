@@ -90,9 +90,56 @@ async def test_request_on_socket_awaits_an_approval(hub):
     assert hub.pending_responses == {}
 
 
+async def test_request_on_socket_carries_a_denial_through_unchanged(hub):
+    socket = FakeSocket()
+
+    async def deny():
+        while not socket.sent:
+            await asyncio.sleep(0.01)
+        hub.resolve_response(socket.sent[-1]["task_id"], {"status": "DENY"})
+
+    denier = asyncio.create_task(deny())
+    reply = await hub.request_on_socket(
+        socket, {"type": "deployment_auth", "target_file": "x.py"}, timeout=5.0
+    )
+    await denier
+
+    assert reply["status"] == "DENY"
+    assert hub.pending_responses == {}
+
+
 async def test_request_on_socket_times_out_without_leaking(hub):
     reply = await hub.request_on_socket(FakeSocket(), {"type": "terminal_auth"}, timeout=0.05)
     assert reply["status"] == "TIMEOUT"
+    assert hub.pending_responses == {}
+
+
+async def test_two_approvals_on_one_socket_each_get_their_own_answer(hub):
+    """The defect this guards: two coroutines awaiting approval on a shared socket.
+
+    Answering out of order proves the routing is keyed by `task_id` and not by
+    whoever happens to be parked on the socket.
+    """
+    socket = FakeSocket()
+
+    async def answer_the_second_one_first():
+        while len(socket.sent) < 2:
+            await asyncio.sleep(0.01)
+        first, second = socket.sent[0], socket.sent[1]
+        hub.resolve_response(second["task_id"], {"status": "APPROVE"})
+        await asyncio.sleep(0.01)
+        hub.resolve_response(first["task_id"], {"status": "DENY"})
+
+    responder = asyncio.create_task(answer_the_second_one_first())
+    denied, approved = await asyncio.gather(
+        hub.request_on_socket(socket, {"type": "terminal_auth", "command": "rm -rf /"}, timeout=5.0),
+        hub.request_on_socket(socket, {"type": "terminal_auth", "command": "ls"}, timeout=5.0),
+    )
+    await responder
+
+    assert denied["status"] == "DENY", "the dangerous command must keep its own answer"
+    assert approved["status"] == "APPROVE"
+    assert socket.sent[0]["task_id"] != socket.sent[1]["task_id"]
     assert hub.pending_responses == {}
 
 

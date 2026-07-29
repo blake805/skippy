@@ -5,6 +5,7 @@ it obvious if it does: the Tormach/skills/goals path is the production workload 
 the agent work must not disturb it.
 """
 
+import asyncio
 import json
 import os
 
@@ -21,6 +22,37 @@ class ShopHub:
 
     async def execute_tool_on_client(self, target, payload, timeout=10.0):
         return {"error": f"Client '{target}' is offline."}
+
+
+class ApprovalHub(ShopHub):
+    """Stands in for the hub's `request_on_socket`, answering from a script.
+
+    Stamps a `task_id` and puts the payload on the socket exactly as the real hub
+    does, so the outbound wire format stays assertable. An empty script means
+    nobody answered, which is the timeout case.
+    """
+
+    def __init__(self, *replies):
+        super().__init__()
+        self.replies = list(replies)
+        self.asked = []
+
+    async def request_on_socket(self, websocket, payload, timeout=300.0):
+        payload["task_id"] = f"task-{len(self.asked)}"
+        self.asked.append(payload)
+        await websocket.send_json(payload)
+        return self.replies.pop(0) if self.replies else {"status": "TIMEOUT"}
+
+
+class StrictSocket(RecordingSocket):
+    """A socket the pipeline is forbidden to read.
+
+    `_serve_socket` owns the only `receive_text()` call on a socket; a second
+    reader in the pipeline is the defect these tests cover.
+    """
+
+    async def receive_text(self):
+        raise AssertionError("SkippyPipeline must not read the socket directly")
 
 
 def architect(tool: dict) -> str:
@@ -258,3 +290,265 @@ def test_adding_the_agent_prompt_did_not_disturb_the_shop_lookup():
     assert PROMPTS.get("NotAMode", PROMPTS["Shop"]) is PROMPTS["Shop"]
     assert "architect" not in PROMPTS["Agent"]
     assert "skills/" in PROMPTS["Shop"]["qa"]
+
+
+# ---------------------------------------------------------------------------
+# Human approval gates
+#
+# All three used to read the socket directly while `_serve_socket` was reading
+# the same socket, so the answer went to whichever coroutine happened to be
+# parked in `receive_text`. They now round-trip through the hub keyed by
+# `task_id`. What gets authorized is unchanged; only the transport moved.
+# ---------------------------------------------------------------------------
+
+SSH_REQUEST = {
+    "name": "tormach_ssh",
+    "command": "halui.machine.off",
+    "explanation": "Drop the spindle before the operator opens the door.",
+}
+QA_DEPLOY_TEMPLATE = 'Ship it.\n{{"status": "DEPLOY", "target_file": "{path}", "summary": "Upgrade."}}'
+
+# `socket=None` means headless, so the helpers need a separate "not supplied".
+UNSET = object()
+
+
+def tormach_spy(monkeypatch):
+    """Record Tormach SSH commands instead of reaching for the real machine."""
+    commands = []
+
+    async def fake_ssh(command):
+        commands.append(command)
+        return "PathPilot: machine off."
+
+    monkeypatch.setattr(skippy_factory.tools, "execute_tormach_ssh", fake_ssh)
+    return commands
+
+
+async def run_ssh_gate(routed_llm, hub, socket=UNSET):
+    """Drive phase 1 to the `tormach_ssh` gate, then let the Architect wrap up."""
+    routed_llm.load(
+        [
+            architect(SSH_REQUEST),
+            architect({"name": "direct_reply", "message": "Done."}),
+        ]
+    )
+    pipeline = SkippyPipeline(
+        StrictSocket() if socket is UNSET else socket,
+        {"mode": "Shop", "text": "kill the spindle"},
+        hub,
+    )
+    await pipeline.run()
+    return routed_llm.requests[-1]["messages"][-1]["content"]
+
+
+async def test_an_approved_tormach_command_still_reaches_pathpilot(routed_llm, monkeypatch):
+    commands = tormach_spy(monkeypatch)
+
+    feedback = await run_ssh_gate(routed_llm, ApprovalHub({"status": "APPROVE"}))
+
+    assert commands == ["halui.machine.off"]
+    assert "PathPilot: machine off." in feedback
+
+
+async def test_a_denied_tormach_command_never_runs(routed_llm, monkeypatch):
+    commands = tormach_spy(monkeypatch)
+
+    feedback = await run_ssh_gate(routed_llm, ApprovalHub({"status": "DENY"}))
+
+    assert commands == []
+    assert "USER DENIED SSH EXECUTION" in feedback
+
+
+async def test_an_unanswered_tormach_request_fails_closed(routed_llm, monkeypatch):
+    """Safety-critical: no answer must never read as approval."""
+    commands = tormach_spy(monkeypatch)
+
+    feedback = await run_ssh_gate(routed_llm, ApprovalHub())  # empty script == timeout
+
+    assert commands == []
+    assert "USER DENIED SSH EXECUTION" in feedback
+
+
+@pytest.mark.parametrize("status", ["approve", "Approve", "MAYBE", "", None])
+async def test_only_an_exact_approve_authorizes_the_machine(routed_llm, monkeypatch, status):
+    """The old code compared `== "APPROVE"`. Broadening that would widen the gate."""
+    commands = tormach_spy(monkeypatch)
+
+    await run_ssh_gate(routed_llm, ApprovalHub({"status": status}))
+
+    assert commands == []
+
+
+async def test_the_terminal_auth_event_keeps_the_keys_swiftui_expects(routed_llm, monkeypatch):
+    tormach_spy(monkeypatch)
+    hub = ApprovalHub({"status": "APPROVE"})
+    socket = StrictSocket()
+
+    await run_ssh_gate(routed_llm, hub, socket=socket)
+
+    event = socket.of_type("terminal_auth")[0]
+    assert event["command"] == "halui.machine.off"
+    assert event["explanation"] == SSH_REQUEST["explanation"]
+    # The one addition: clients must echo this back for the reply to be routed.
+    assert event["task_id"] == hub.asked[0]["task_id"]
+
+
+async def test_a_headless_tormach_request_is_refused_without_a_socket(routed_llm, monkeypatch):
+    """The heartbeat runs with websocket=None and must not authorize anything."""
+    commands = tormach_spy(monkeypatch)
+
+    feedback = await run_ssh_gate(routed_llm, ApprovalHub({"status": "APPROVE"}), socket=None)
+
+    assert commands == []
+    assert "HEADLESS ERROR" in feedback
+
+
+def bash_spy(monkeypatch):
+    """Record god-mode commands instead of running a real shell."""
+    commands = []
+
+    async def fake_stream(command, websocket):
+        commands.append(command)
+        return "total 0"
+
+    monkeypatch.setattr(skippy_factory, "run_bash_command_stream", fake_stream)
+    return commands
+
+
+async def run_god_mode_gate(routed_llm, monkeypatch, tmp_path, hub):
+    monkeypatch.setattr(skippy_factory, "SKILLS_DIR", str(tmp_path / "skills"))
+    os.makedirs(skippy_factory.SKILLS_DIR, exist_ok=True)
+    routed_llm.load(
+        [
+            "SIMPLE",
+            json.dumps({"name": "request_terminal_execution", "command": "ls /tmp", "explanation": "peek"}),
+            APPROVED_CODE,
+            QA_APPROVE,
+        ]
+    )
+    pipeline = SkippyPipeline(StrictSocket(), {"mode": "Shop", "text": "look around"}, hub)
+    pipeline.blueprint = "List a directory, then write the demo skill."
+    await pipeline.phase_2_engineer_and_qa("look around")
+    # The turn after the gate carries the verdict back to the Engineer.
+    return routed_llm.requests[2]["messages"][-1]["content"]
+
+
+async def test_an_approved_god_mode_command_runs(routed_llm, monkeypatch, tmp_path):
+    commands = bash_spy(monkeypatch)
+
+    feedback = await run_god_mode_gate(
+        routed_llm, monkeypatch, tmp_path, ApprovalHub({"status": "APPROVE"})
+    )
+
+    assert commands == ["ls /tmp"]
+    assert "COMMAND EXECUTED" in feedback
+
+
+async def test_a_denied_god_mode_command_never_runs(routed_llm, monkeypatch, tmp_path):
+    commands = bash_spy(monkeypatch)
+
+    feedback = await run_god_mode_gate(
+        routed_llm, monkeypatch, tmp_path, ApprovalHub({"status": "DENY"})
+    )
+
+    assert commands == []
+    assert "USER DENIED" in feedback
+
+
+async def test_an_unanswered_god_mode_request_fails_closed(routed_llm, monkeypatch, tmp_path):
+    commands = bash_spy(monkeypatch)
+
+    feedback = await run_god_mode_gate(routed_llm, monkeypatch, tmp_path, ApprovalHub())
+
+    assert commands == []
+    assert "USER DENIED" in feedback
+
+
+async def run_deploy_gate(routed_llm, tmp_path, hub, socket=UNSET):
+    target = tmp_path / "deploy_target.py"
+    target.write_text("# original\n", encoding="utf-8")
+    routed_llm.load(
+        [
+            "SIMPLE",
+            APPROVED_CODE,
+            QA_DEPLOY_TEMPLATE.format(path=str(target)),
+            # A denial sends the Engineer round again; empty turns end the loop
+            # without touching the sandbox.
+            "",
+            "",
+            "",
+        ]
+    )
+    pipeline = SkippyPipeline(
+        StrictSocket() if socket is UNSET else socket,
+        {"mode": "Shop", "text": "upgrade yourself"},
+        hub,
+    )
+    pipeline.blueprint = "Rewrite the target file."
+    await pipeline.phase_2_engineer_and_qa("upgrade yourself")
+    return pipeline, target
+
+
+async def test_an_approved_deployment_overwrites_the_target(routed_llm, tmp_path):
+    pipeline, target = await run_deploy_gate(routed_llm, tmp_path, ApprovalHub({"status": "APPROVE"}))
+
+    assert pipeline.success
+    assert "hello from the shop" in target.read_text(encoding="utf-8")
+
+
+async def test_a_denied_deployment_leaves_the_target_alone(routed_llm, tmp_path):
+    pipeline, target = await run_deploy_gate(routed_llm, tmp_path, ApprovalHub({"status": "DENY"}))
+
+    assert not pipeline.success
+    assert target.read_text(encoding="utf-8") == "# original\n"
+
+
+async def test_an_unanswered_deployment_fails_closed(routed_llm, tmp_path):
+    pipeline, target = await run_deploy_gate(routed_llm, tmp_path, ApprovalHub())
+
+    assert not pipeline.success
+    assert target.read_text(encoding="utf-8") == "# original\n"
+
+
+async def test_the_deployment_auth_event_keeps_the_keys_swiftui_expects(routed_llm, tmp_path):
+    hub = ApprovalHub({"status": "APPROVE"})
+    socket = StrictSocket()
+
+    _, target = await run_deploy_gate(routed_llm, tmp_path, hub, socket=socket)
+
+    event = socket.of_type("deployment_auth")[0]
+    assert event["target_file"] == str(target)
+    assert event["summary"] == "Upgrade."
+    assert "hello from the shop" in event["content"]
+    assert event["task_id"] == hub.asked[0]["task_id"]
+
+
+async def test_two_pipelines_on_one_socket_each_get_their_own_answer():
+    """The race the fix removes, against the real ConnectionManager.
+
+    Both pipelines hold an approval open on one socket and the answers arrive in
+    the opposite order. Keyed by `task_id`, each lands where it belongs; read off
+    the raw socket, the deploy gate would have eaten the SSH denial.
+    """
+    hub = skippy_factory.ConnectionManager()
+    socket = StrictSocket()
+    deploy = SkippyPipeline(socket, {"mode": "Shop", "text": "deploy"}, hub)
+    ssh = SkippyPipeline(socket, {"mode": "Shop", "text": "ssh"}, hub)
+
+    async def answer_in_reverse():
+        while not (socket.of_type("deployment_auth") and socket.of_type("terminal_auth")):
+            await asyncio.sleep(0.01)
+        hub.resolve_response(socket.of_type("terminal_auth")[0]["task_id"], {"status": "DENY"})
+        await asyncio.sleep(0.01)
+        hub.resolve_response(socket.of_type("deployment_auth")[0]["task_id"], {"status": "APPROVE"})
+
+    responder = asyncio.create_task(answer_in_reverse())
+    deploy_ok, ssh_ok = await asyncio.gather(
+        deploy.await_authorization({"type": "deployment_auth", "target_file": "a.py"}, timeout=5.0),
+        ssh.await_authorization({"type": "terminal_auth", "command": "rm -rf /"}, timeout=5.0),
+    )
+    await responder
+
+    assert deploy_ok is True
+    assert ssh_ok is False, "the SSH denial must not be delivered to the deploy gate"
+    assert hub.pending_responses == {}
