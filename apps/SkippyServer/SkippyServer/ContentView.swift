@@ -8,7 +8,6 @@ class ServerManager: ObservableObject {
     @Published var isCompressorRunning = false
     @Published var is405BRunning = false
     @Published var isBackendRunning = false
-    @Published var isComfyRunning = false
     
     // Debug Mode Toggle
     @Published var isDebugMode = false
@@ -27,7 +26,6 @@ class ServerManager: ObservableObject {
     private var processCompressor: Process?
     private var process405B: Process?
     private var processBackend: Process?
-    private var processComfy: Process?
     
     private var statsTimer: Timer?
     private var isFetchingStats = false // Safety lock to prevent thread pileups
@@ -91,10 +89,6 @@ class ServerManager: ObservableObject {
         // 4. Boot FastAPI Backend
         processBackend = runCommand("cd ~/shop-jarvis && source venv/bin/activate && python skippy_factory.py")
         isBackendRunning = true
-        
-        // 5. Boot ComfyUI Image Engine (Pony Realism)
-        processComfy = runCommand("cd ~/ComfyUI && venv/bin/python main.py --listen 127.0.0.1 --port 8188")
-        isComfyRunning = true
     }
     
     func killAll() {
@@ -103,16 +97,14 @@ class ServerManager: ObservableObject {
         processCompressor?.terminate()
         process405B?.terminate()
         processBackend?.terminate()
-        processComfy?.terminate()
         
         is70BRunning = false
         isCompressorRunning = false
         is405BRunning = false
         isBackendRunning = false
-        isComfyRunning = false
         
-        // Ensure all service ports are cleared (including ComfyUI on 8188)
-        _ = runCommand("lsof -ti:8080,8081,8082,8000,8188 | xargs kill -9")
+        // Ensure all service ports are cleared
+        _ = runCommand("lsof -ti:8080,8081,8082,8000 | xargs kill -9")
         log("All ports cleared.")
     }
     
@@ -240,7 +232,6 @@ struct ContentView: View {
                 StatusCard(title: "32B Compressor", port: "8082", isRunning: manager.isCompressorRunning)
                 StatusCard(title: "480B Engineer", port: "8081", isRunning: manager.is405BRunning)
                 StatusCard(title: "Factory Backend", port: "8000", isRunning: manager.isBackendRunning)
-                StatusCard(title: "Image Engine", port: "8188", isRunning: manager.isComfyRunning)
             }
             
             // Log Console

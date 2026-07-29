@@ -143,42 +143,6 @@ _SCHEMAS = {
             "required": ["action"],
         },
     },
-    "generate_image": {
-        "description": (
-            "Generates a hyperrealistic image from a text description using the local "
-            "Pony Realism model. Describe the scene in detail: subject, materials, "
-            "lighting, camera angle. Returns the saved file path — always tell the user "
-            "the exact path."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "Detailed scene description (subject, materials, lighting, camera)."},
-                "negative_prompt": {"type": "string", "description": "Things to avoid in the image (optional)."},
-                "width": {"type": "integer", "description": "Image width in pixels. Use SDXL sizes: 1024, 832, 1216. Default 1024."},
-                "height": {"type": "integer", "description": "Image height in pixels. Use SDXL sizes: 1024, 832, 1216. Default 1024."},
-            },
-            "required": ["prompt"],
-        },
-    },
-    "edit_image": {
-        "description": (
-            "Edits an existing image file guided by a text prompt (img2img with the "
-            "Pony Realism model). Use strength to control how much changes: 0.2-0.4 "
-            "subtle touch-up, 0.5-0.6 moderate restyle, 0.7-0.9 heavy transformation. "
-            "Returns the new file path — always tell the user the exact path."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "image_path": {"type": "string", "description": "Absolute path of the source image on the Mac Studio."},
-                "prompt": {"type": "string", "description": "Description of the desired result."},
-                "strength": {"type": "number", "description": "How strongly to change the image, 0.05-1.0. Default 0.55."},
-                "negative_prompt": {"type": "string", "description": "Things to avoid (optional)."},
-            },
-            "required": ["image_path", "prompt"],
-        },
-    },
     "direct_reply": {
         "description": (
             "Delivers a final conversational answer to the user and ENDS the pipeline "
@@ -212,7 +176,7 @@ _MODE_TOOL_NAMES = {
         "direct_reply", "get_system_time", "check_device_status", "run_shop_skill",
         "tormach_ssh", "vscode_get_active_file", "github_manager",
         "read_directory_structure", "ingest_codebase_to_rag", "search_codebase",
-        "manage_goals", "generate_image", "edit_image", "wake_engineer",
+        "manage_goals", "wake_engineer",
     ],
     "Software": [
         "web_search", "read_website", "search_memory", "save_memory", "send_to_tormach",
@@ -239,7 +203,7 @@ _MODE_TOOL_NAMES = {
     ],
     "Whiteboard": [
         "web_search", "read_website", "search_memory", "save_memory",
-        "direct_reply", "get_system_time", "generate_image", "edit_image",
+        "direct_reply", "get_system_time",
     ],
 }
 

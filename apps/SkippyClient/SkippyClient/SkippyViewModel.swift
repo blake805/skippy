@@ -165,8 +165,8 @@ class SkippyViewModel: ObservableObject {
             return
         }
         
-        // Binary files (images etc.) are base64-uploaded to the Mac Studio
-        // so Skippy's tools (like edit_image) can work on them there.
+        // Binary files are base64-uploaded to the Mac Studio so Skippy's tools
+        // can reach them there by path.
         do {
             let data = try Data(contentsOf: url)
             guard data.count <= 60_000_000 else {
