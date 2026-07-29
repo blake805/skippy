@@ -17,6 +17,9 @@ mlx-trace.json
 *.log
 .DS_Store
 
+# User uploads (binary attachments from clients)
+uploads/
+
 # Xcode
 xcuserdata/
 DerivedData/

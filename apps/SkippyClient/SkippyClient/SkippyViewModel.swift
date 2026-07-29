@@ -156,14 +156,56 @@ class SkippyViewModel: ObservableObject {
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
         
+        let fileName = url.lastPathComponent
+        
+        // Text files are injected inline into the prompt.
+        if let content = try? String(contentsOf: url, encoding: .utf8) {
+            sendInjectedFile(fileName: fileName, fileContent: content, messageText: inputText)
+            inputText = ""
+            return
+        }
+        
+        // Binary files (images etc.) are base64-uploaded to the Mac Studio
+        // so Skippy's tools (like edit_image) can work on them there.
         do {
-            let content = try String(contentsOf: url, encoding: .utf8)
-            sendInjectedFile(fileName: url.lastPathComponent, fileContent: content, messageText: inputText)
+            let data = try Data(contentsOf: url)
+            guard data.count <= 60_000_000 else {
+                messages.append("❌ \(fileName) is too large to attach (60MB limit).")
+                updateCurrentSession()
+                return
+            }
+            sendBinaryFile(fileName: fileName, base64: data.base64EncodedString(), messageText: inputText)
             inputText = ""
         } catch {
-            messages.append("❌ Could not read \(url.lastPathComponent): \(error.localizedDescription)")
+            messages.append("❌ Could not read \(fileName): \(error.localizedDescription)")
             updateCurrentSession()
         }
+    }
+    
+    func sendBinaryFile(fileName: String, base64: String, messageText: String) {
+        let userMessage = messageText.isEmpty ? "I have attached a file: \(fileName)" : messageText
+        
+        messages.append("You: (Attached \(fileName)) \(messageText)")
+        updateCurrentSession()
+        
+        logText = ""
+        terminalLog = ""
+        isProcessing = true
+        currentAgentTask = "Uploading \(fileName) to Mac Studio..."
+        
+        isSkippyTalking = true
+        speechManager.mute()
+        audioManager.stop()
+        
+        let payload: [String: Any] = [
+            "mode": selectedMode,
+            "text": userMessage,
+            "history": messages.filter { $0.starts(with: "You:") || $0.starts(with: "Skippy:") },
+            "use_tts": isConversationMode,
+            "attachment": ["name": fileName, "data_base64": base64]
+        ]
+        
+        networkManager.sendJSON(payload: payload)
     }
     
     func sendInjectedFile(fileName: String, fileContent: String, messageText: String = "") {

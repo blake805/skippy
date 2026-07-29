@@ -228,6 +228,11 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.pending_responses: Dict[str, asyncio.Future] = {}
+        # Pending human-authorization futures keyed by websocket identity.
+        # The endpoint loop is the ONLY reader of each websocket; pipelines
+        # wait on these futures instead of calling receive() themselves,
+        # which would race the endpoint loop for incoming frames.
+        self.pending_auth: Dict[int, asyncio.Future] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -266,6 +271,30 @@ class ConnectionManager:
                 future.set_result(data)
             del self.pending_responses[task_id]
 
+    async def request_authorization(self, websocket: WebSocket, payload: dict, timeout: float = 300.0) -> dict:
+        """Sends an auth request and waits for the human's reply, delivered by
+        the endpoint loop via resolve_auth(). Returns the reply dict, or a
+        DENY-equivalent on timeout/disconnect."""
+        key = id(websocket)
+        future = asyncio.get_running_loop().create_future()
+        self.pending_auth[key] = future
+        try:
+            await websocket.send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            return {"status": "DENY", "reason": "timeout or connection error"}
+        finally:
+            self.pending_auth.pop(key, None)
+
+    def resolve_auth(self, websocket: WebSocket, data: dict) -> bool:
+        """Called by the endpoint loop when a frame arrives while an auth
+        request is pending on this websocket. Returns True if consumed."""
+        future = self.pending_auth.get(id(websocket))
+        if future and not future.done():
+            future.set_result(data)
+            return True
+        return False
+
 hub = ConnectionManager()
 
 # --- TTS HELPER ---
@@ -299,11 +328,43 @@ class SkippyPipeline:
         self.user_input = payload.get("text", "")
         self.chat_history = payload.get("history", [])
         self.use_tts = payload.get("use_tts", False)
-        
+
+        # Binary attachments (images etc.) arrive base64-encoded from the
+        # client and are saved locally so tools like edit_image can use them.
+        attachment = payload.get("attachment")
+        if attachment and attachment.get("data_base64"):
+            saved_path = self._save_attachment(attachment)
+            if saved_path:
+                self.user_input += (
+                    f"\n\n[SYSTEM NOTE: The user attached a binary file, saved on the Mac Studio at: "
+                    f"{saved_path} — for images, use the edit_image tool with this exact path.]"
+                )
+
         self.blueprint = ""
         self.is_direct_reply = False
         self.success = False
         self.execution_result = ""
+
+    def _save_attachment(self, attachment: dict) -> Optional[str]:
+        try:
+            uploads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+            os.makedirs(uploads_dir, exist_ok=True)
+            # Sanitize the filename and keep names unique across uploads.
+            raw_name = os.path.basename(attachment.get("name", "upload.bin"))
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name) or "upload.bin"
+            stem, ext = os.path.splitext(safe_name)
+            path = os.path.join(uploads_dir, safe_name)
+            counter = 1
+            while os.path.exists(path):
+                path = os.path.join(uploads_dir, f"{stem}_{counter}{ext}")
+                counter += 1
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(attachment["data_base64"]))
+            logger.info(f"Attachment saved: {path}")
+            return path
+        except Exception as e:
+            logger.error(f"Failed to save attachment: {e}")
+            return None
 
     async def send_log(self, msg: str):
         if not self.ws:
@@ -475,9 +536,9 @@ class SkippyPipeline:
             
             await self.send_log(f"\n⚠️ [Architect] Requested Tormach SSH: {command}\nWaiting for human authorization...\n")
             if self.ws:
-                await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                auth_reply = await self.ws.receive_text()
-                auth_data = json.loads(auth_reply)
+                auth_data = await self.manager.request_authorization(
+                    self.ws, {"type": "terminal_auth", "command": command, "explanation": explanation}
+                )
                 if auth_data.get("status") == "APPROVE":
                     await self.send_log(f"✅ Authorization GRANTED. Connecting to PathPilot...\n")
                     return await tools.execute_tormach_ssh(command)
@@ -503,6 +564,22 @@ class SkippyPipeline:
             target_path = args.get("path", "")
             await self.send_log(f"\n*(Architect is chunking and embedding {target_path} into ChromaDB...)*\n")
             return await tools.ingest_codebase_to_rag(target_path, code_collection)
+        elif tool_name == "generate_image":
+            await self.send_log(f"\n🎨 *(Skippy is painting: \"{args.get('prompt', '')[:80]}...\")*\n")
+            return await tools.generate_image(
+                prompt=args.get("prompt", ""),
+                negative_prompt=args.get("negative_prompt", ""),
+                width=int(args.get("width", 1024)),
+                height=int(args.get("height", 1024)),
+            )
+        elif tool_name == "edit_image":
+            await self.send_log(f"\n🎨 *(Skippy is editing {args.get('image_path', '')}...)*\n")
+            return await tools.edit_image(
+                image_path=args.get("image_path", ""),
+                prompt=args.get("prompt", ""),
+                strength=float(args.get("strength", 0.55)),
+                negative_prompt=args.get("negative_prompt", ""),
+            )
         elif tool_name == "search_codebase":
             # --- COMPRESSOR INTERCEPT FOR SEARCH ---
             search_query = args.get("query", "")
@@ -727,9 +804,9 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                     
                     await self.send_log(f"\n⚠️ [Engineer] Requested God Mode: {command}\nWaiting for human authorization...\n")
                     if self.ws:
-                        await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                        auth_reply = await self.ws.receive_text()
-                        auth_data = json.loads(auth_reply)
+                        auth_data = await self.manager.request_authorization(
+                            self.ws, {"type": "terminal_auth", "command": command, "explanation": explanation}
+                        )
                         if auth_data.get("status") == "APPROVE":
                             await self.send_log(f"✅ Authorization GRANTED. Executing: {command}...\n")
                             cmd_output = await run_bash_command_stream(command, self.ws)
@@ -896,15 +973,12 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         
                         await self.send_log(f"\n⚠️ [QA Lead] Requested DEPLOYMENT to {target_file}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({
+                            auth_data = await self.manager.request_authorization(self.ws, {
                                 "type": "deployment_auth",
                                 "target_file": target_file,
                                 "summary": summary,
                                 "content": code_to_test
                             })
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            
                             if auth_data.get("status") == "APPROVE":
                                 await self.send_log(f"✅ Deployment AUTHORIZED. Overwriting {target_file}...\n")
                                 expanded_path = os.path.expanduser(target_file)
@@ -1004,7 +1078,12 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
             if "task_id" in data:
                 hub.resolve_response(data["task_id"], data)
                 continue
-                
+
+            # Auth replies (APPROVE/DENY) go to the waiting pipeline, not a new one.
+            if "status" in data and "text" not in data:
+                if hub.resolve_auth(websocket, data):
+                    continue
+
             pipeline = SkippyPipeline(websocket, data, hub)
             asyncio.create_task(pipeline.run())
 
@@ -1032,4 +1111,6 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("skippy_factory:app", host="0.0.0.0", port=8000, reload=False)
+    # ws_max_size raised so base64-encoded photo attachments (e.g. iPhone JPGs)
+    # fit in a single websocket message (default is 16MB).
+    uvicorn.run("skippy_factory:app", host="0.0.0.0", port=8000, reload=False, ws_max_size=100 * 1024 * 1024)
