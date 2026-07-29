@@ -54,6 +54,19 @@ def sessions_root(ensure: bool = True) -> str:
     return path
 
 
+def patch_journal_root(ensure: bool = True) -> str:
+    """Pre-images written before each patch, kept outside the repos being edited.
+
+    Outside deliberately: a journal inside a workspace would show up in the repo's
+    own git status, and a patch that touched it would be journalling into the thing
+    it is protecting.
+    """
+    path = os.path.join(memory_root(), "patch_journal")
+    if ensure:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
 def configured_workspace_roots() -> list:
     """The repos the agent may touch, from `SKIPPY_WORKSPACE_ROOTS` (os.pathsep).
 
