@@ -124,12 +124,27 @@ heartbeat and handed to the agent instead of the shop pipeline:
 
 Tasks without a `project_id` are left completely alone.
 
+## Before you restart the shop server on new code
+
+The SwiftUI clients speak a documented websocket contract — see
+[`swiftui_client_contract.md`](swiftui_client_contract.md). One change in flight
+requires updating the app:
+
+- **Authorization replies must echo `task_id`** (PR #5, ADR 0005). Until the
+  SwiftUI app round-trips that field, the Tormach SSH gate and the Developer-mode
+  deploy gate stall for 600 seconds and then deny. It fails closed, so nothing is
+  authorized by accident, but those gates stop working. Update the client, or add
+  a server-side bridge, before this code serves the shop.
+
+Do development in a clone that is *not* the directory the shop server runs from.
+
 ## Known gaps
 
 - `tools.execute_tormach_ssh` still has a plaintext password. PR #1 addresses it;
   it should not reach a public branch.
-- The shop pipeline's terminal-approval path still reads the socket directly, which
-  races the endpoint loop. The agent lane routes approvals through the hub instead.
-  Fixing the shop lane is a Phase 6 item.
+- The shop pipeline's terminal-approval path reads the socket directly, racing the
+  endpoint loop. The agent lane routes approvals through the hub instead. PR #5
+  fixes the shop lane the same way; see the note above for the client-side
+  consequence.
 - Reverse-engineering mode (Phase 5) is not implemented. `mode: "RE"` currently
   reaches the agent with the standard Agent prompt and no RE tooling.
