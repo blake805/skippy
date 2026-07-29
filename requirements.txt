@@ -17,3 +17,7 @@ ddgs
 
 # Misc
 numpy
+
+# Tests
+pytest
+pytest-asyncio
