@@ -329,15 +329,15 @@ class SkippyPipeline:
         self.chat_history = payload.get("history", [])
         self.use_tts = payload.get("use_tts", False)
 
-        # Binary attachments (images etc.) arrive base64-encoded from the
-        # client and are saved locally so tools like edit_image can use them.
+        # Binary attachments arrive base64-encoded from the client and are saved
+        # locally so tools can reach them by path.
         attachment = payload.get("attachment")
         if attachment and attachment.get("data_base64"):
             saved_path = self._save_attachment(attachment)
             if saved_path:
                 self.user_input += (
                     f"\n\n[SYSTEM NOTE: The user attached a binary file, saved on the Mac Studio at: "
-                    f"{saved_path} — for images, use the edit_image tool with this exact path.]"
+                    f"{saved_path} — use this exact path to reach it.]"
                 )
 
         self.blueprint = ""
@@ -564,22 +564,6 @@ class SkippyPipeline:
             target_path = args.get("path", "")
             await self.send_log(f"\n*(Architect is chunking and embedding {target_path} into ChromaDB...)*\n")
             return await tools.ingest_codebase_to_rag(target_path, code_collection)
-        elif tool_name == "generate_image":
-            await self.send_log(f"\n🎨 *(Skippy is painting: \"{args.get('prompt', '')[:80]}...\")*\n")
-            return await tools.generate_image(
-                prompt=args.get("prompt", ""),
-                negative_prompt=args.get("negative_prompt", ""),
-                width=int(args.get("width", 1024)),
-                height=int(args.get("height", 1024)),
-            )
-        elif tool_name == "edit_image":
-            await self.send_log(f"\n🎨 *(Skippy is editing {args.get('image_path', '')}...)*\n")
-            return await tools.edit_image(
-                image_path=args.get("image_path", ""),
-                prompt=args.get("prompt", ""),
-                strength=float(args.get("strength", 0.55)),
-                negative_prompt=args.get("negative_prompt", ""),
-            )
         elif tool_name == "search_codebase":
             # --- COMPRESSOR INTERCEPT FOR SEARCH ---
             search_query = args.get("query", "")
