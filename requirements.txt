@@ -1,9 +1,15 @@
+# Reconciled union of the requirements.txt added by PR #1
+# (cursor/skippy-hardening-and-roadmap-e73e) and PR #3
+# (cursor/skippy-agent-runtime-f411). Every entry from PR #1 is present;
+# entries marked "PR #3 only" below do not exist in PR #1's file.
+# Whichever PR merges second should take this file verbatim.
+
 # Core server
 fastapi
 uvicorn
 httpx
 websockets
-python-multipart
+python-multipart  # PR #3 only
 
 # LLM memory / RAG
 chromadb
@@ -16,7 +22,7 @@ sounddevice
 
 # Tools
 ddgs
-duckduckgo-search
+duckduckgo-search  # PR #3 only (legacy alias of ddgs; kept for imports of duckduckgo_search)
 paramiko
 
 # Image generation (skippy.py / skippy_web.py)
@@ -35,6 +41,6 @@ requests
 # Local inference (Apple Silicon only; skip on Linux/CI)
 # mlx-lm
 
-# Dev / test
+# Dev / test (PR #3 only)
 pytest
 pytest-asyncio
