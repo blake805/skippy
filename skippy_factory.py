@@ -16,6 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from prompts import PROMPTS
 import tools
 import skippy_agent
+import skippy_cursor
 import skippy_llm
 import skippy_paths
 import skippy_sessions
@@ -243,6 +244,9 @@ class ConnectionManager:
             future.set_result(data)
 
 hub = ConnectionManager()
+
+# RPC channel to the Cursor extension (client_id=cursor). Inert until it connects.
+cursor_bridge = skippy_cursor.CursorBridge(hub)
 
 # --- TTS HELPER ---
 async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
@@ -828,6 +832,7 @@ async def skippy_heartbeat():
                         },
                         hub,
                         session_store=session_store,
+                        cursor_bridge=cursor_bridge,
                     )
                 )
         except Exception as e:
@@ -912,6 +917,7 @@ async def _serve_socket(websocket: WebSocket, client_id: str, default_mode: str)
                         hub,
                         session_store=session_store,
                         speak=speak_text,
+                        cursor_bridge=cursor_bridge,
                     )
                 )
                 continue

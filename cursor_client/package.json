@@ -1,0 +1,81 @@
+{
+  "name": "skippy-cursor-client",
+  "displayName": "Skippy Cursor Client",
+  "description": "Connects Cursor to the local Skippy agent hub so Skippy can read diagnostics and apply multi-file edits in the editor.",
+  "version": "0.1.0",
+  "publisher": "blake805",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "skippy.connect",
+        "title": "Skippy: Connect to hub"
+      },
+      {
+        "command": "skippy.disconnect",
+        "title": "Skippy: Disconnect from hub"
+      },
+      {
+        "command": "skippy.status",
+        "title": "Skippy: Show connection status"
+      }
+    ],
+    "configuration": {
+      "title": "Skippy",
+      "properties": {
+        "skippy.serverUrl": {
+          "type": "string",
+          "default": "ws://127.0.0.1:8000/ws/factory",
+          "description": "WebSocket URL of the Skippy hub. Use the Mac Studio's hostname when running Cursor on another machine."
+        },
+        "skippy.clientId": {
+          "type": "string",
+          "default": "cursor",
+          "description": "Client id registered with the hub. The server addresses RPCs to this id."
+        },
+        "skippy.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Connect automatically when the window opens."
+        },
+        "skippy.confirmPatches": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ask before applying an edit set from Skippy."
+        },
+        "skippy.taskTimeoutMs": {
+          "type": "number",
+          "default": 240000,
+          "description": "How long a run_task command may run before it is killed."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node --test \"test/*.test.js\"",
+    "package": "vsce package --out skippy-cursor-client.vsix"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.3"
+  }
+}

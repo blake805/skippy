@@ -17,8 +17,10 @@ import os
 import shlex
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+
+import skippy_cursor
 
 logger = logging.getLogger("skippy_agent_tools")
 
@@ -175,6 +177,7 @@ class ToolContext:
     emit: Optional[EmitFn] = None
     auto_approve: Dict[str, bool] = field(default_factory=dict)
     session_id: str = ""
+    cursor: Any = None
 
     async def request_approval(self, command: str, explanation: str) -> bool:
         if self.auto_approve.get("terminal"):
@@ -252,6 +255,19 @@ TOOL_SPECS: Sequence[ToolSpec] = (
         "Record a durable decision in project memory.",
         mutates=True,
     ),
+    ToolSpec(
+        "cursor_apply_patch",
+        '{"edits": [{"path": "<file>", "action": "edit", "search": "...", "replace": "..."}]}',
+        "Same edit shape as apply_patch, but routed through the editor so the change lands in "
+        "the user's undo stack. Falls back to a direct write when Cursor is not attached.",
+        mutates=True,
+    ),
+    ToolSpec(
+        "cursor_diagnostics",
+        '{"paths": ["<file>"]}',
+        "Fetch the editor's live errors and warnings. Prefer this over guessing after an edit.",
+    ),
+    ToolSpec("cursor_open_files", "{}", "List the files the user currently has open."),
     ToolSpec(
         "finish",
         '{"summary": "<what you did>", "files_changed": ["<path>"]}',
@@ -971,6 +987,115 @@ async def save_decision(
 
 
 # ---------------------------------------------------------------------------
+# Cursor-mediated tools
+# ---------------------------------------------------------------------------
+
+async def cursor_apply_patch(ctx: ToolContext, edits: Sequence[dict]) -> ToolResult:
+    """Apply an edit set through the editor, falling back to a direct write.
+
+    The patch is validated and diffed locally first, for two reasons: the model gets
+    the same rejection messages either way, and the editor is never handed a path
+    that escapes the workspace roots.
+    """
+    preview = apply_patch(replace(ctx, dry_run=True, backup_dir=None), edits)
+    if not preview.ok:
+        return preview
+    if ctx.dry_run:
+        return preview
+    if not preview.data.get("files"):
+        return preview
+
+    bridge = ctx.cursor
+    if bridge is None or not bridge.connected:
+        result = apply_patch(ctx, edits)
+        if result.ok:
+            result.summary += " (Cursor not attached; wrote to disk directly.)"
+            result.data["via"] = "filesystem"
+        return result
+
+    absolute_edits = []
+    for edit in edits:
+        prepared = dict(edit)
+        prepared["path"] = ctx.sandbox.resolve(edit.get("path"))
+        absolute_edits.append(prepared)
+
+    response = await bridge.apply_patches(absolute_edits)
+    if not response["ok"]:
+        fallback = apply_patch(ctx, edits)
+        if fallback.ok:
+            fallback.summary += f" (Cursor refused the edit: {response['error']}; wrote to disk.)"
+            fallback.data["via"] = "filesystem"
+            return fallback
+        return ToolResult(
+            False,
+            f"Cursor could not apply the patch ({response['error']}) and the direct write "
+            f"also failed.",
+            fallback.content,
+        )
+
+    failed = (response["result"] or {}).get("failed") or []
+    if failed:
+        return ToolResult(
+            False,
+            f"Cursor rejected {len(failed)} edit(s); nothing was applied.",
+            json.dumps(failed, indent=2),
+            {"failed": failed},
+        )
+
+    data = dict(preview.data)
+    data.pop("dry_run", None)
+    data["via"] = "cursor"
+    return ToolResult(
+        True,
+        preview.summary.replace("Dry run: ", "").replace(
+            " would change (nothing written).", " changed via Cursor."
+        ),
+        preview.content,
+        data,
+    )
+
+
+async def cursor_diagnostics(ctx: ToolContext, paths: Optional[Sequence[str]] = None) -> ToolResult:
+    bridge = ctx.cursor
+    if bridge is None or not bridge.connected:
+        return ToolResult(
+            False,
+            "Cursor is not attached, so editor diagnostics are unavailable. Use run_tests or "
+            "read the code instead.",
+        )
+    resolved = [ctx.sandbox.resolve(path) for path in (paths or [])]
+    response = await bridge.diagnostics(resolved)
+    if not response["ok"]:
+        return ToolResult(False, f"Could not fetch diagnostics: {response['error']}")
+
+    rendered = skippy_cursor.format_diagnostics(response["result"])
+    if not rendered:
+        return ToolResult(True, "Cursor reports no diagnostics.", "", {"count": 0})
+    count = len(rendered.splitlines())
+    return ToolResult(True, f"{count} diagnostic(s) from Cursor.", rendered, {"count": count})
+
+
+async def cursor_open_files(ctx: ToolContext) -> ToolResult:
+    bridge = ctx.cursor
+    if bridge is None or not bridge.connected:
+        return ToolResult(False, "Cursor is not attached.")
+    response = await bridge.open_files()
+    if not response["ok"]:
+        return ToolResult(False, f"Could not list open files: {response['error']}")
+
+    files = (response["result"] or {}).get("files") or []
+    lines = []
+    for entry in files:
+        if isinstance(entry, dict):
+            flags = [flag for flag, on in (("active", entry.get("active")), ("unsaved", entry.get("dirty"))) if on]
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            lines.append(f"{entry.get('path', '?')}{suffix}")
+        else:
+            lines.append(str(entry))
+    return ToolResult(True, f"{len(files)} file(s) open in Cursor.", "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -993,6 +1118,9 @@ _ASYNC_TOOLS: Dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "git_push": git_push,
     "search_project_memory": search_project_memory,
     "save_decision": save_decision,
+    "cursor_apply_patch": cursor_apply_patch,
+    "cursor_diagnostics": cursor_diagnostics,
+    "cursor_open_files": cursor_open_files,
 }
 
 

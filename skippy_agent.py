@@ -141,11 +141,13 @@ class SkippyAgent:
         manager,
         session_store: Any = None,
         speak=None,
+        cursor_bridge: Any = None,
     ):
         self.ws = websocket
         self.hub = manager
         self.store = session_store
         self.speak = speak
+        self.cursor = cursor_bridge
         self.payload = payload or {}
 
         self.mode = self.payload.get("mode", "Agent")
@@ -208,11 +210,15 @@ class SkippyAgent:
 
     # -- setup ------------------------------------------------------------
 
-    def _resolve_roots(self) -> List[str]:
+    async def _resolve_roots(self) -> List[str]:
         candidates = list(self.payload.get("workspace_roots") or [])
         if not candidates and self.store is not None:
             meta = self.store.project_meta(self.project_id)
             candidates = list((meta or {}).get("workspace_roots") or [])
+        if not candidates and self.cursor is not None and self.cursor.connected:
+            candidates = await self.cursor.workspace_roots()
+            if candidates:
+                await self.log(f"📎 *Adopted {len(candidates)} workspace root(s) from Cursor.*\n")
         if not candidates:
             default_root = os.path.join(skippy_paths.workspaces_root(), self.project_id)
             if os.path.isdir(default_root):
@@ -259,7 +265,7 @@ class SkippyAgent:
                 await self.emit({"type": "done"})
                 return outcome
 
-            roots = self._resolve_roots()
+            roots = await self._resolve_roots()
             try:
                 self.sandbox = Sandbox(roots)
             except SandboxError as exc:
@@ -290,6 +296,7 @@ class SkippyAgent:
                 emit=self.emit,
                 auto_approve=self.auto_approve,
                 session_id=self.session_id,
+                cursor=self.cursor,
             )
 
             await self.log(
@@ -452,16 +459,19 @@ class SkippyAgent:
                 if decision_id and decision_id not in self.session.decisions:
                     self.session.decisions.append(decision_id)
 
-            if name == "apply_patch" and result.ok:
-                for report in result.data.get("files", []):
+            # Any tool that reports file changes feeds the patch stream, so the
+            # Cursor-mediated path emits the same events as the direct one.
+            if result.ok and result.data.get("files"):
+                for report in result.data["files"]:
                     path = report.get("path")
                     if path and path not in self.files_changed:
                         self.files_changed.append(path)
                 await self.emit(
                     {
                         "type": "agent_patch",
-                        "files": result.data.get("files", []),
+                        "files": result.data["files"],
                         "diff": result.data.get("diff", ""),
+                        "via": result.data.get("via", "filesystem"),
                     }
                 )
 
@@ -552,8 +562,20 @@ def _redact(args: dict) -> dict:
 
 
 async def run_agent_task(
-    websocket, payload: dict, manager, session_store: Any = None, speak=None
+    websocket,
+    payload: dict,
+    manager,
+    session_store: Any = None,
+    speak=None,
+    cursor_bridge: Any = None,
 ) -> AgentOutcome:
     """Entry point used by the websocket endpoints in `skippy_factory`."""
-    agent = SkippyAgent(websocket, payload, manager, session_store=session_store, speak=speak)
+    agent = SkippyAgent(
+        websocket,
+        payload,
+        manager,
+        session_store=session_store,
+        speak=speak,
+        cursor_bridge=cursor_bridge,
+    )
     return await agent.run()
