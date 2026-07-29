@@ -72,7 +72,7 @@ class ToolResult:
         return {
             "ok": self.ok,
             "summary": self.summary,
-            "content": _cap(self.content, MAX_TOOL_OUTPUT_CHARS),
+            "content": cap_text(self.content, MAX_TOOL_OUTPUT_CHARS),
             "data": self.data,
         }
 
@@ -80,10 +80,10 @@ class ToolResult:
         head = ("OK: " if self.ok else "ERROR: ") + self.summary
         if not self.content:
             return head
-        return f"{head}\n{_cap(self.content, MAX_TOOL_OUTPUT_CHARS)}"
+        return f"{head}\n{cap_text(self.content, MAX_TOOL_OUTPUT_CHARS)}"
 
 
-def _cap(text: str, limit: int) -> str:
+def cap_text(text: str, limit: int) -> str:
     if text is None:
         return ""
     if len(text) <= limit:
@@ -359,7 +359,7 @@ def read_file(
     body = "\n".join(f"{first + idx:6d}| {line}" for idx, line in enumerate(selected))
     truncated = len(body) > MAX_FILE_CHARS
     if truncated:
-        body = _cap(body, MAX_FILE_CHARS)
+        body = cap_text(body, MAX_FILE_CHARS)
 
     window = f"lines {first}-{last} of {total}"
     return ToolResult(
@@ -632,7 +632,7 @@ def apply_patch(ctx: ToolContext, edits: Sequence[dict]) -> ToolResult:
             {"path": rel, "action": item.action, "added": added, "removed": removed}
         )
 
-    diff = _cap("".join(diff_chunks), MAX_DIFF_CHARS)
+    diff = cap_text("".join(diff_chunks), MAX_DIFF_CHARS)
 
     if ctx.dry_run:
         return ToolResult(
@@ -884,7 +884,7 @@ async def git_diff(
     label = "staged diff" if staged else "working tree diff"
     if code == 0 and not output.strip():
         return ToolResult(True, f"No {label} in {ctx.sandbox.relative(root)}.")
-    return ToolResult(code == 0, f"{label} for {ctx.sandbox.relative(root)}.", _cap(output, MAX_DIFF_CHARS))
+    return ToolResult(code == 0, f"{label} for {ctx.sandbox.relative(root)}.", cap_text(output, MAX_DIFF_CHARS))
 
 
 async def git_log(ctx: ToolContext, repo: Optional[str] = None, limit: int = 10) -> ToolResult:

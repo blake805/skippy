@@ -4,13 +4,12 @@ import json
 import os
 import threading
 
-import pytest
 from fastapi.testclient import TestClient
 
 import skippy_agent_tools as agent_tools
 import skippy_cursor
 from skippy_agent import SkippyAgent
-from skippy_agent_tools import Sandbox, ToolContext
+from skippy_agent_tools import ToolContext
 from skippy_cursor import CursorBridge, format_diagnostics
 from tests.fake_llm import raw_tool_call, tool_call
 from tests.test_agent_loop import RecordingSocket, StubHub

@@ -526,7 +526,7 @@ class SkippyAgent:
             return f"{head}\n[compressed]\n{condensed}"
         except Exception:
             logger.warning("Compression failed; falling back to truncation.")
-            return agent_tools._cap(raw, COMPRESS_THRESHOLD)
+            return agent_tools.cap_text(raw, COMPRESS_THRESHOLD)
 
     def _trim_history(self):
         """Drop the oldest observation pairs when the transcript gets too long.

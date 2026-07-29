@@ -97,23 +97,29 @@ def get_kokoro():
     return _voice_state["kokoro"]
 
 # --- ASYNC HELPERS ---
-async def query_model_async(messages: list, temp: float = 0.2, url: str = None, model_name: str = None, stop_sequences: list = None) -> str:
-    """Back-compat shim over `skippy_llm.query_model`.
+async def query_model_async(
+    messages: list,
+    temp: float = 0.2,
+    url: str = None,
+    model_name: str = None,
+    stop_sequences: list = None,
+    role: str = None,
+) -> str:
+    """Query a model by role, so the request picks up that role's `max_tokens`.
 
-    Existing call sites address endpoints by URL; resolve that back to a role so the
-    request picks up the role's `max_tokens` instead of a flat 4096 cap.
+    `url`/`model_name` are kept for callers outside this module that still address
+    endpoints directly; they are resolved back to a role when possible. Prefer
+    `role=` -- a URL lookup cannot survive the registry being reconfigured.
     """
-    target_url = url or MODELS["fast"].url
-    resolved = skippy_llm.endpoint_for_url(target_url)
-    if resolved is None:
-        logger.warning("No registered role for %s; falling back to 'fast' limits.", target_url)
-        resolved = MODELS["fast"]
-    return await skippy_llm.query_model(
-        messages,
-        role=resolved.role,
-        temp=temp,
-        stop=stop_sequences,
-    )
+    if role is None:
+        target_url = url or MODELS["fast"].url
+        resolved = skippy_llm.endpoint_for_url(target_url)
+        if resolved is None:
+            logger.warning("No registered role for %s; falling back to 'fast'.", target_url)
+            role = "fast"
+        else:
+            role = resolved.role
+    return await skippy_llm.query_model(messages, role=role, temp=temp, stop=stop_sequences)
 
 async def execute_python_code(code: str) -> str:
     if re.search(r'\bfunction\s+\w+\s*\(|\bvar\s+\w+\s*=', code) or code.strip().startswith("//"):
@@ -433,8 +439,7 @@ class SkippyPipeline:
             arch_response = await query_model_async(
                 arch_messages, 
                 temp=0.2, 
-                url=LOCAL_70B_URL, 
-                model_name=MODEL_70B_NAME,
+                role="fast",
                 stop_sequences=["TOOL RESULT:", "Observation:"]
             )
             
@@ -518,7 +523,7 @@ class SkippyPipeline:
                         
                         raw_tool_result = await tools.search_codebase(search_query, code_collection)
                         
-                        await self.send_log(f"*(Compressing search results via 32B Node to protect Architect's context window...)*\n")
+                        await self.send_log("*(Compressing search results via the compressor node to protect Architect's context window...)*\n")
                         compressor_prompt = f"""You are a data extraction node. 
 The Architect needs to know: '{search_query}'. 
 Here is the raw codebase data pulled from ChromaDB: 
@@ -529,8 +534,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         compressed_result = await query_model_async(
                             [{"role": "user", "content": compressor_prompt}], 
                             temp=0.1, 
-                            url=LOCAL_COMPRESSOR_URL, 
-                            model_name=MODEL_COMPRESSOR_NAME
+                            role="compressor",
                         )
                         tool_result = f"COMPRESSED MEMORY RESULT:\n{compressed_result}"
                         
@@ -551,16 +555,15 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
         await self.send_log("\n[Triage Cop] Evaluating task complexity for routing...\n")
         if self.mode == "Developer":
             is_complex = True
-            await self.send_log("*(Developer Mode detected. Bypassing triage and routing to 405B Kraken...)*\n")
+            await self.send_log("*(Developer Mode detected. Bypassing triage and routing to the heavy model...)*\n")
         else:
             triage_prompt = f"Review this blueprint:\n{self.blueprint}\nIf this requires complex architectural changes, large Python scripts, or generating G-code/firmware, output ONLY the word: COMPLEX. If it is a simple short script, basic calculation, or a single bash command, output ONLY the word: SIMPLE."
-            triage_verdict = await query_model_async([{"role": "user", "content": triage_prompt}], temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+            triage_verdict = await query_model_async([{"role": "user", "content": triage_prompt}], temp=0.1, role="fast")
             is_complex = "COMPLEX" in triage_verdict.upper()
-            if is_complex: await self.send_log("*(Triage Cop classified task as COMPLEX. Routing to 405B Kraken...)*\n")
-            else: await self.send_log("*(Triage Cop classified task as SIMPLE. Routing to 70B Fast Worker...)*\n")
+            if is_complex: await self.send_log("*(Triage Cop classified task as COMPLEX. Routing to the heavy model...)*\n")
+            else: await self.send_log("*(Triage Cop classified task as SIMPLE. Routing to the fast model...)*\n")
 
-        eng_url = LOCAL_405B_URL if is_complex else LOCAL_70B_URL
-        eng_model = MODEL_405B_NAME if is_complex else MODEL_70B_NAME
+        eng_role = "heavy" if is_complex else "fast"
         
         dev_context = ""
         if self.mode == "Developer":
@@ -580,13 +583,13 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
         code_to_test = ""
         
         for attempt in range(4):
-            engine_name = "405B Model" if is_complex else "70B Model"
+            engine_name = MODELS[eng_role].model
             await self.send_log(f"\n[Engineer] Coding session started on {engine_name}. Attempt {attempt + 1}/4...\n")
             
             current_eng_messages = base_eng_messages.copy()
             if qa_feedback: current_eng_messages.append({"role": "user", "content": qa_feedback})
             
-            engineer_response = await query_model_async(current_eng_messages, temp=0.1, url=eng_url, model_name=eng_model)
+            engineer_response = await query_model_async(current_eng_messages, temp=0.1, role=eng_role)
             await self.send_log(f"----- ENGINEER RESPONSE -----\n{engineer_response}\n-----------------------------\n")
             
             code_to_test = ""
@@ -668,7 +671,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             qa_review = await query_model_async([
                 {"role": "system", "content": PROMPTS.get(self.mode, PROMPTS["Shop"]).get("qa", "")},
                 {"role": "user", "content": qa_prompt_injection}
-            ], temp=0.1, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+            ], temp=0.1, role="fast")
             
             await self.send_log(f"----- QA VERDICT REPORT -----\n{qa_review}\n-----------------------------\n")
 
@@ -763,7 +766,7 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
             {"role": "user", "content": f"Task: {self.user_input}\nBlueprint: {self.blueprint}\nOutcome: {status_text}\nQA Feedback/Results: {self.execution_result}\nWrite the conversational summary."}
         ]
         
-        final_summary = await query_model_async(summary_messages, temp=0.4, url=LOCAL_70B_URL, model_name=MODEL_70B_NAME)
+        final_summary = await query_model_async(summary_messages, temp=0.4, role="fast")
         await self.send_chat(final_summary)
         if self.ws: await speak_text(final_summary, self.ws, self.use_tts)
 
