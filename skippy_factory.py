@@ -251,6 +251,11 @@ class ConnectionManager:
 
 hub = ConnectionManager()
 
+# A human has to walk over and look at the request before answering, so the window
+# is deliberately long. A client that does not echo `task_id` back never resolves
+# and will burn the whole timeout — see docs/adr/0005-approval-routing.md.
+HUMAN_APPROVAL_TIMEOUT = 600.0
+
 # RPC channel to the Cursor extension (client_id=cursor). Inert until it connects.
 cursor_bridge = skippy_cursor.CursorBridge(hub)
 
@@ -310,6 +315,19 @@ class SkippyPipeline:
             await self.ws.send_json({"type": "chat", "content": msg})
         except Exception:
             pass
+
+    async def await_authorization(self, payload: dict, timeout: float = HUMAN_APPROVAL_TIMEOUT) -> bool:
+        """Send a human-approval request and await the answer through the hub.
+
+        `_serve_socket` owns the only `receive_text()` call on this socket, so the
+        reply has to come back through `pending_responses` keyed by `task_id`
+        rather than being read here. Anything that is not an explicit APPROVE —
+        a denial, a timeout, a dead socket — fails closed.
+        """
+        reply = await self.manager.request_on_socket(self.ws, payload, timeout=timeout)
+        if reply.get("status") == "TIMEOUT":
+            await self.send_log(f"⌛ No answer within {timeout:.0f}s. Treating as DENIED.\n")
+        return reply.get("status") == "APPROVE"
 
     def smart_truncate(self, filepath: str, content: str, max_chars: int = 15000) -> str:
         if len(content) <= max_chars:
@@ -487,10 +505,10 @@ class SkippyPipeline:
                         
                         await self.send_log(f"\n⚠️ [Architect] Requested Tormach SSH: {command}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
+                            authorized = await self.await_authorization(
+                                {"type": "terminal_auth", "command": command, "explanation": explanation}
+                            )
+                            if authorized:
                                 await self.send_log(f"✅ Authorization GRANTED. Connecting to PathPilot...\n")
                                 tool_result = await tools.execute_tormach_ssh(command)
                             else:
@@ -605,10 +623,10 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         
                         await self.send_log(f"\n⚠️ [Engineer] Requested God Mode: {command}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({"type": "terminal_auth", "command": command, "explanation": explanation})
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            if auth_data.get("status") == "APPROVE":
+                            authorized = await self.await_authorization(
+                                {"type": "terminal_auth", "command": command, "explanation": explanation}
+                            )
+                            if authorized:
                                 await self.send_log(f"✅ Authorization GRANTED. Executing: {command}...\n")
                                 cmd_output = await run_bash_command_stream(command, self.ws)
                                 await self.send_log(f"----- EXECUTION FINISHED -----\n")
@@ -719,16 +737,14 @@ Extract ONLY the specific math, logic, formulas, variable mappings, or architect
                         
                         await self.send_log(f"\n⚠️ [QA Lead] Requested DEPLOYMENT to {target_file}\nWaiting for human authorization...\n")
                         if self.ws:
-                            await self.ws.send_json({
+                            authorized = await self.await_authorization({
                                 "type": "deployment_auth",
                                 "target_file": target_file,
                                 "summary": summary,
                                 "content": code_to_test
                             })
-                            auth_reply = await self.ws.receive_text()
-                            auth_data = json.loads(auth_reply)
-                            
-                            if auth_data.get("status") == "APPROVE":
+
+                            if authorized:
                                 await self.send_log(f"✅ Deployment AUTHORIZED. Overwriting {target_file}...\n")
                                 expanded_path = os.path.expanduser(target_file)
                                 if not "/" in expanded_path: expanded_path = os.path.join(os.getcwd(), expanded_path)
