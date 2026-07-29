@@ -1,0 +1,14 @@
+# The light dependency set the test suite runs on, and the single source of truth
+# for CI. Deliberately excludes chromadb, openai-whisper, kokoro-onnx, soundfile
+# and torch: the suite must stay importable without them, which keeps a CI run at
+# seconds rather than minutes. If an import breaks under this set, fix the import
+# rather than adding a package here.
+fastapi
+uvicorn
+httpx
+websockets
+python-multipart
+ddgs
+pytest
+pytest-asyncio
+pyflakes
