@@ -15,6 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 # --- IMPORT MODULARIZED LOGIC ---
 from prompts import PROMPTS
 import tools
+import skippy_agent
 import skippy_llm
 import skippy_paths
 from skippy_llm import MODELS
@@ -65,6 +66,9 @@ class _LazyCollection:
 
 memory_collection = _LazyCollection("memory")
 code_collection = _LazyCollection("code")
+
+# Per-project sessions + scoped Chroma for the agent lane. None until Phase 3.
+session_store = None
 
 # --- DYNAMIC SKILLS DIRECTORY ---
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
@@ -790,28 +794,80 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Skippy Assembly Line API (Ultimate Routing Edition)", lifespan=lifespan)
 
-# --- MULTI-CLIENT WEBSOCKET ENDPOINT ---
-@app.websocket("/ws/factory")
-async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
+# --- MULTI-CLIENT WEBSOCKET ENDPOINTS ---
+# Modes that belong to the coding agent rather than the shop assembly line.
+AGENT_MODES = {"Agent", "RE"}
+
+# Clients that exist purely to answer RPCs. A stray message from one of these must
+# never spawn a Shop pipeline.
+RPC_ONLY_CLIENTS = {"cursor", "vscode"}
+
+
+async def _serve_socket(websocket: WebSocket, client_id: str, default_mode: str):
     await hub.connect(websocket, client_id)
-    
+
     try:
         while True:
             raw_input = await websocket.receive_text()
             try:
                 data = json.loads(raw_input)
             except json.JSONDecodeError:
-                data = {"mode": "Shop", "text": raw_input, "history": [], "use_tts": False}
-                
+                data = {"mode": default_mode, "text": raw_input, "history": [], "use_tts": False}
+
+            # Replies to anything the server asked for: RPC results and auth decisions.
             if "task_id" in data:
                 hub.resolve_response(data["task_id"], data)
                 continue
-                
+
+            message_type = data.get("type")
+
+            if message_type == "agent_cancel":
+                session_id = data.get("session_id", "")
+                found = skippy_agent.cancel_session(session_id)
+                await websocket.send_json(
+                    {"type": "agent_cancelled", "session_id": session_id, "found": found}
+                )
+                continue
+
+            if message_type in ("hello", "ping", "register"):
+                await websocket.send_json({"type": "hello_ack", "client_id": client_id})
+                continue
+
+            if client_id in RPC_ONLY_CLIENTS and not data.get("text"):
+                logger.info("Ignoring non-task message from RPC client '%s': %s", client_id, message_type)
+                continue
+
+            mode = data.get("mode") or default_mode
+            if mode in AGENT_MODES:
+                data.setdefault("mode", mode)
+                asyncio.create_task(
+                    skippy_agent.run_agent_task(
+                        websocket,
+                        data,
+                        hub,
+                        session_store=session_store,
+                        speak=speak_text,
+                    )
+                )
+                continue
+
             pipeline = SkippyPipeline(websocket, data, hub)
             asyncio.create_task(pipeline.run())
 
     except WebSocketDisconnect:
         hub.disconnect(client_id)
+
+
+@app.websocket("/ws/factory")
+async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
+    """Shop lane by default; `mode: "Agent"` routes the same socket to SkippyAgent."""
+    await _serve_socket(websocket, client_id, default_mode="Shop")
+
+
+@app.websocket("/ws/agent")
+async def agent_endpoint(websocket: WebSocket, client_id: str = "agent"):
+    """Coding-agent lane. Identical handler, different default mode."""
+    await _serve_socket(websocket, client_id, default_mode="Agent")
 
 @app.get("/ping")
 async def ping():
