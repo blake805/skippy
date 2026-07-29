@@ -5,8 +5,8 @@
 # schemas are sent in the `tools` field of the chat completion request and
 # the model responds with structured `tool_calls`.
 #
-# What remains here is the research and context half of the toolset. The
-# filesystem, patch, and terminal schemas arrive with the agent runtime.
+# The workspace tools (read, search, patch) live here alongside the research and
+# context half of the toolset. Terminal execution arrives with the agent runtime.
 
 _SCHEMAS = {
     "list_dir": {
@@ -142,6 +142,68 @@ _SCHEMAS = {
             "required": ["query"],
         },
     },
+    "apply_patch": {
+        "description": (
+            "Edits, creates and deletes files. This is the only way to change anything, "
+            "and it is all-or-nothing: every edit is validated first, and if any one of "
+            "them is bad, NOTHING is written. So put every edit of a coherent change in "
+            "one call — a rename touching five files is one call, not five. Several edits "
+            "to the same file are applied in order, each seeing the previous result. "
+            "Search text must match the file byte-for-byte, including indentation and "
+            "blank lines, so read the file first rather than guessing. Pass dry_run to "
+            "see the diff without writing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "description": "The edits to apply together, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "File path, relative to the workspace root."},
+                            "action": {
+                                "type": "string",
+                                "enum": ["edit", "create", "delete"],
+                                "description": "Defaults to 'edit'.",
+                            },
+                            "search": {
+                                "type": "string",
+                                "description": (
+                                    "edit only. Exact text to find. Include enough surrounding "
+                                    "context to make it unique, or the edit is rejected as ambiguous."
+                                ),
+                            },
+                            "replace": {
+                                "type": "string",
+                                "description": "edit only. Replacement text. Use \"\" to delete the found text.",
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "description": "edit only. Replace every occurrence instead of requiring a unique match.",
+                            },
+                            "occurrence": {
+                                "type": "integer",
+                                "description": "edit only. Replace just the Nth occurrence, 1-based.",
+                            },
+                            "content": {"type": "string", "description": "create only. Full contents of the new file."},
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "create only. Required to replace a file that already exists.",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Return the diff without writing anything. Useful for checking a large change first.",
+                },
+            },
+            "required": ["edits"],
+        },
+    },
 }
 
 
@@ -158,11 +220,17 @@ def _wrap(name: str) -> dict:
 
 
 FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
+WRITE_TOOLS = ("apply_patch",)
 
 
 def filesystem_tools() -> list:
     """The read-only workspace tools, wrapped for the `tools` request field."""
     return [_wrap(name) for name in FILESYSTEM_TOOLS]
+
+
+def workspace_tools() -> list:
+    """Read and write. What an agent needs to actually finish a coding task."""
+    return [_wrap(name) for name in FILESYSTEM_TOOLS + WRITE_TOOLS]
 
 
 def research_tools() -> list:

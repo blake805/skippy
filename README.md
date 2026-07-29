@@ -70,6 +70,24 @@ prompt. `GET /health` reports the roots actually in effect.
 [ADR 0008](docs/adr/0008-path-sandbox.md) covers the boundary and, importantly,
 what it does not defend against.
 
+### How edits are applied
+
+`apply_patch` is the only way anything gets written, and it is all-or-nothing: a
+list of edits spanning any number of files is validated against staged content
+first, and if any one edit is bad, nothing is written and every problem is reported
+together. A rename touching five files is one call, not five, so a half-applied
+refactor is not a state the repo can reach.
+
+Edits are byte-for-byte search/replace rather than line numbers, which go stale as
+soon as an earlier edit shifts them. An ambiguous search is rejected instead of
+guessed at. `dry_run` returns the diff without writing.
+
+Files that are not valid UTF-8, look binary, or exceed 8MB are refused rather than
+rewritten, and CRLF line endings are preserved. Pre-images go to
+`patch_journal_root()` with a manifest that documents how to restore them.
+[ADR 0009](docs/adr/0009-atomic-multi-file-patching.md) has the details, including
+the three data-destroying bugs this replaced.
+
 ### Why transcripts are append-only
 
 `mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
@@ -89,6 +107,7 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_llm.py` | Model role registry, inference, cloud policy, append-only transcripts |
 | `skippy_sandbox.py` | The path boundary every filesystem tool goes through |
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
+| `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
 | `skippy_paths.py` | Where NAS-backed state lives, and which repos are in scope |
 | `skippy_factory.py` | FastAPI server: websocket hub, voice, transcription, endpoints |
 | `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
