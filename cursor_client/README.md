@@ -11,7 +11,7 @@ The extension is a websocket **client** of the Skippy hub. It registers as
 ```bash
 cd cursor_client
 npm install
-npm run compile
+npm run compile              # required before npm test: the suite loads out/
 npm test                     # patch semantics must match the server
 npx @vscode/vsce package     # produces skippy-cursor-client.vsix
 ```

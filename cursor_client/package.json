@@ -66,7 +66,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "node --test \"test/*.test.js\"",
+    "test": "node --test test/patches.test.js",
     "package": "vsce package --out skippy-cursor-client.vsix"
   },
   "dependencies": {
