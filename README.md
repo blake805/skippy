@@ -70,6 +70,29 @@ prompt. `GET /health` reports the roots actually in effect.
 [ADR 0008](docs/adr/0008-path-sandbox.md) covers the boundary and, importantly,
 what it does not defend against.
 
+### Running a task
+
+```python
+import asyncio, skippy_agent, skippy_fs, skippy_paths
+
+outcome = asyncio.run(skippy_agent.run_task(
+    "Add a mm_to_thou helper, export it, and add a test.",
+    skippy_fs.build_sandbox(),
+    journal_dir=skippy_paths.patch_journal_root(),
+))
+print(outcome.status, outcome.files_changed)
+```
+
+The loop stops for one of four reasons and says which: `finished`, `max_steps`,
+`stopped_without_finish`, or `cancelled`. **Only `finished` is success** — a run that
+exhausted its step budget may have changed real files, but the model never decided
+it was done, and reporting that as success would hide a stalled run.
+
+Tool calls travel as native OpenAI `tool_calls`, so every call gets exactly one
+`tool` message in reply and the transcript only ever grows.
+[ADR 0010](docs/adr/0010-agent-loop-native-tool-calling.md) covers the loop,
+including what it does when the model gets stuck.
+
 ### How edits are applied
 
 `apply_patch` is the only way anything gets written, and it is all-or-nothing: a
@@ -108,6 +131,9 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_sandbox.py` | The path boundary every filesystem tool goes through |
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
+| `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
+| `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
+| `prompts.py` | The system prompt, and the fold-summary extraction prompt |
 | `skippy_paths.py` | Where NAS-backed state lives, and which repos are in scope |
 | `skippy_factory.py` | FastAPI server: websocket hub, voice, transcription, endpoints |
 | `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
