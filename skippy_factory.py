@@ -18,6 +18,8 @@ logger = logging.getLogger("skippy_factory")
 # Models are addressed by role (fast / heavy / compressor); skippy_llm owns the
 # url and weight mapping, and refuses to reach off-machine unless asked to.
 import skippy_llm
+import skippy_fs
+from skippy_sandbox import SandboxError
 
 # Chroma, Whisper and Kokoro are all loaded on first use rather than at import.
 # Two reasons. Importing this module no longer requires the NAS to be mounted or
@@ -27,7 +29,8 @@ import skippy_llm
 # when uvicorn imported `skippy_factory` by name.
 
 # --- CONNECT NAS MEMORY ---
-NAS_MEMORY_PATH = os.environ.get("SKIPPY_CHROMA_PATH", "/Volumes/skippy_memory/chroma_db")
+import skippy_paths
+
 _chroma_state: dict = {}
 
 def get_chroma() -> dict:
@@ -35,8 +38,7 @@ def get_chroma() -> dict:
     if "client" not in _chroma_state:
         import chromadb
 
-        os.makedirs(NAS_MEMORY_PATH, exist_ok=True)
-        client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
+        client = chromadb.PersistentClient(path=skippy_paths.chroma_path())
         _chroma_state["client"] = client
         _chroma_state["memory"] = client.get_or_create_collection(name="skippy_longterm")
         _chroma_state["code"] = client.get_or_create_collection(name="skippy_code_projects")
@@ -191,6 +193,12 @@ async def lifespan(app: FastAPI):
     logger.info("Model roles:\n%s", skippy_llm.describe_registry())
     if not skippy_llm.cloud_allowed():
         logger.info("Cloud escalation is off. Set SKIPPY_ALLOW_CLOUD=1 to enable it.")
+    try:
+        logger.info("Workspace roots: %s", skippy_fs.build_sandbox().roots)
+    except SandboxError as exc:
+        # Not fatal: the server is still useful for voice and health checks, and a
+        # loud warning at boot beats a confusing failure on the first tool call.
+        logger.warning("No workspace access: %s", exc)
     logger.info("Skippy core online. Agent runtime not yet installed.")
     yield
     logger.info("Skippy core offline.")
@@ -240,13 +248,23 @@ async def ping():
 
 @app.get("/health")
 async def health():
-    """Which weights are actually serving each role, and whether any is off-machine."""
+    """Which weights serve each role, whether any is off-machine, and what Skippy can see."""
+    # Reported rather than constructed: a bad root should show up here as a plain
+    # error instead of taking the endpoint down.
+    try:
+        roots = skippy_fs.build_sandbox().roots
+        roots_error = None
+    except SandboxError as exc:
+        roots, roots_error = [], str(exc)
+
     return {
         "cloud_allowed": skippy_llm.cloud_allowed(),
         "roles": {
             role: {"model": target.model, "url": target.url, "local": target.is_local}
             for role, target in skippy_llm.MODELS.items()
         },
+        "workspace_roots": roots,
+        "workspace_roots_error": roots_error,
     }
 
 @app.post("/transcribe")

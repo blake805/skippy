@@ -9,6 +9,63 @@
 # filesystem, patch, and terminal schemas arrive with the agent runtime.
 
 _SCHEMAS = {
+    "list_dir": {
+        "description": (
+            "Lists a directory tree inside the workspace. Start here to orient in an "
+            "unfamiliar repo before reading anything."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory to list. Omit it to list every workspace root, which is how you find out what repositories exist."},
+                "depth": {"type": "integer", "description": "How many levels deep, 1-6. Defaults to 2."},
+            },
+            "required": [],
+        },
+    },
+    "read_file": {
+        "description": (
+            "Reads a text file with line numbers. Pass start_line/end_line for a window "
+            "into a large file rather than pulling all of it into context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to the workspace root."},
+                "start_line": {"type": "integer", "description": "First line to read, 1-based."},
+                "end_line": {"type": "integer", "description": "Last line to read, inclusive."},
+            },
+            "required": ["path"],
+        },
+    },
+    "grep": {
+        "description": (
+            "Searches file contents by regular expression and returns path:line:text. "
+            "The fastest way to find where something is defined or used."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regular expression to search for."},
+                "path": {"type": "string", "description": "Directory to search. Omit it to search every workspace root."},
+                "glob": {"type": "string", "description": "Restrict to matching filenames, e.g. '*.py'."},
+                "max_results": {"type": "integer", "description": "Cap on lines returned, 1-500. Defaults to 50."},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive search."},
+            },
+            "required": ["pattern"],
+        },
+    },
+    "glob_files": {
+        "description": "Finds files by path pattern, e.g. '**/test_*.py'. Use when you know the shape of the name but not the location.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.swift'."},
+                "path": {"type": "string", "description": "Directory to search from. Omit it to search every workspace root."},
+            },
+            "required": ["pattern"],
+        },
+    },
     "get_system_time": {
         "description": "Returns the current system date and time.",
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -98,6 +155,14 @@ def _wrap(name: str) -> dict:
             "parameters": schema["parameters"],
         },
     }
+
+
+FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
+
+
+def filesystem_tools() -> list:
+    """The read-only workspace tools, wrapped for the `tools` request field."""
+    return [_wrap(name) for name in FILESYSTEM_TOOLS]
 
 
 def research_tools() -> list:

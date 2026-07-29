@@ -54,6 +54,22 @@ Without `SKIPPY_ALLOW_CLOUD=1`, resolving an off-machine role raises `CloudNotAl
 `is_local` is computed from the URL rather than declared, and only loopback counts — a
 LAN or tailnet address is treated as off-machine on purpose.
 
+### Which repositories Skippy can touch
+
+`SKIPPY_WORKSPACE_ROOTS` is an `os.pathsep`-separated list of directories, and it
+is the only thing that grants filesystem access:
+
+```bash
+export SKIPPY_WORKSPACE_ROOTS="$HOME/skippy-workspaces/skippy:$HOME/skippy-workspaces/symatix"
+```
+
+It defaults to **empty**, so an unconfigured agent can reach nothing. Every path a
+tool touches is resolved — symlinks followed, `..` collapsed — and then required to
+land inside a root, so `../../.ssh/id_ed25519` is a hard error rather than a
+prompt. `GET /health` reports the roots actually in effect.
+[ADR 0008](docs/adr/0008-path-sandbox.md) covers the boundary and, importantly,
+what it does not defend against.
+
 ### Why transcripts are append-only
 
 `mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
@@ -71,6 +87,9 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | File | Purpose |
 | --- | --- |
 | `skippy_llm.py` | Model role registry, inference, cloud policy, append-only transcripts |
+| `skippy_sandbox.py` | The path boundary every filesystem tool goes through |
+| `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
+| `skippy_paths.py` | Where NAS-backed state lives, and which repos are in scope |
 | `skippy_factory.py` | FastAPI server: websocket hub, voice, transcription, endpoints |
 | `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
 | `tool_schemas.py` | OpenAI-format function schemas for native tool calling |

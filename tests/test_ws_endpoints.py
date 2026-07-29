@@ -6,6 +6,7 @@ disk. If that regresses, this whole file stops collecting in CI.
 """
 
 import importlib
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -64,6 +65,21 @@ def test_health_reports_every_role_and_the_cloud_flag(client):
         assert role["local"] is True
         assert role["model"]
         assert role["url"]
+
+
+def test_health_reports_a_missing_workspace_config_instead_of_failing(client, monkeypatch):
+    monkeypatch.delenv("SKIPPY_WORKSPACE_ROOTS", raising=False)
+    body = client.get("/health").json()
+    assert body["workspace_roots"] == []
+    assert "SKIPPY_WORKSPACE_ROOTS" in body["workspace_roots_error"]
+
+
+def test_health_reports_configured_workspace_roots(client, tmp_path, monkeypatch):
+    (tmp_path / "a_repo").mkdir()
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(tmp_path / "a_repo"))
+    body = client.get("/health").json()
+    assert body["workspace_roots"] == [os.path.realpath(str(tmp_path / "a_repo"))]
+    assert body["workspace_roots_error"] is None
 
 
 def test_health_surfaces_an_offmachine_role(client, monkeypatch):
