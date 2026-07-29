@@ -4,6 +4,9 @@
 # These replace the old "output ONLY this exact JSON" text protocol: the
 # schemas are sent in the `tools` field of the chat completion request and
 # the model responds with structured `tool_calls`.
+#
+# What remains here is the research and context half of the toolset. The
+# filesystem, patch, and terminal schemas arrive with the agent runtime.
 
 _SCHEMAS = {
     "get_system_time": {
@@ -41,55 +44,6 @@ _SCHEMAS = {
             "properties": {"fact": {"type": "string", "description": "The fact to store."}},
             "required": ["fact"],
         },
-    },
-    "send_to_tormach": {
-        "description": "Transfers a local G-code file to the Tormach PathPilot controller via SCP.",
-        "parameters": {
-            "type": "object",
-            "properties": {"local_file_path": {"type": "string", "description": "Absolute path of the local file to send."}},
-            "required": ["local_file_path"],
-        },
-    },
-    "check_device_status": {
-        "description": "Pings a device on the shop network and reports ONLINE or OFFLINE.",
-        "parameters": {
-            "type": "object",
-            "properties": {"ip_address": {"type": "string", "description": "IP address to ping."}},
-            "required": ["ip_address"],
-        },
-    },
-    "run_shop_skill": {
-        "description": (
-            "Runs an EXISTING Python skill from the skills/ library with command-line "
-            "arguments and returns its output. This CANNOT create, edit, or save skills — "
-            "to create a NEW skill, call wake_engineer with a blueprint instead."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "skill_name": {"type": "string", "description": "Name of the existing skill (without .py)."},
-                "arguments": {"type": "string", "description": "Command-line arguments to pass, as a single string."},
-            },
-            "required": ["skill_name"],
-        },
-    },
-    "tormach_ssh": {
-        "description": (
-            "Executes a shell command on the Tormach PathPilot controller over SSH. "
-            "Requires explicit human approval before it runs."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to execute on PathPilot."},
-                "explanation": {"type": "string", "description": "One-sentence summary of why, shown to the human approver."},
-            },
-            "required": ["command", "explanation"],
-        },
-    },
-    "vscode_get_active_file": {
-        "description": "Asks the connected VS Code client for the contents of the currently active file.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "github_manager": {
         "description": "Performs GitHub operations (clone a repo, list issues, create an issue) via the gh CLI.",
@@ -131,80 +85,6 @@ _SCHEMAS = {
             "required": ["query"],
         },
     },
-    "manage_goals": {
-        "description": "Views or edits Skippy's persistent goal ledger.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["view", "add", "start", "complete"]},
-                "task": {"type": "string", "description": "Task description (add only)."},
-                "task_id": {"type": "integer", "description": "Task ID (start/complete only)."},
-            },
-            "required": ["action"],
-        },
-    },
-    "direct_reply": {
-        "description": (
-            "Delivers a final conversational answer to the user and ENDS the pipeline "
-            "immediately — the Engineer will never run after this. Use it ONLY for casual "
-            "chat or answers that need no code. NEVER use it to announce future work."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"message": {"type": "string", "description": "The conversational answer."}},
-            "required": ["message"],
-        },
-    },
-    "wake_engineer": {
-        "description": (
-            "Hands off to the Engineer to write code. This is the ONLY way code gets "
-            "written. The blueprint must be complete plain-English instructions: formulas, "
-            "inputs, outputs, and the save path. Do not include code in the blueprint."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"blueprint": {"type": "string", "description": "Complete plain-English instructions for the Engineer."}},
-            "required": ["blueprint"],
-        },
-    },
-}
-
-# Which tools each Architect mode may call (mirrors the old per-mode prompt lists).
-_MODE_TOOL_NAMES = {
-    "Shop": [
-        "web_search", "read_website", "search_memory", "save_memory", "send_to_tormach",
-        "direct_reply", "get_system_time", "check_device_status", "run_shop_skill",
-        "tormach_ssh", "vscode_get_active_file", "github_manager",
-        "read_directory_structure", "ingest_codebase_to_rag", "search_codebase",
-        "manage_goals", "wake_engineer",
-    ],
-    "Software": [
-        "web_search", "read_website", "search_memory", "save_memory", "send_to_tormach",
-        "direct_reply", "get_system_time", "check_device_status", "run_shop_skill",
-        "tormach_ssh", "vscode_get_active_file", "github_manager",
-        "read_directory_structure", "ingest_codebase_to_rag", "search_codebase",
-        "wake_engineer",
-    ],
-    "CNC": [
-        "web_search", "read_website", "search_memory", "save_memory", "send_to_tormach",
-        "direct_reply", "get_system_time", "check_device_status", "run_shop_skill",
-        "tormach_ssh", "wake_engineer",
-    ],
-    "Electronics": [
-        "web_search", "read_website", "search_memory", "save_memory",
-        "direct_reply", "get_system_time", "check_device_status", "run_shop_skill",
-        "wake_engineer",
-    ],
-    "Developer": [
-        "web_search", "read_website", "search_memory", "save_memory",
-        "check_device_status", "get_system_time", "github_manager",
-        "read_directory_structure", "ingest_codebase_to_rag", "search_codebase",
-        "wake_engineer",
-    ],
-    "Whiteboard": [
-        "web_search", "read_website", "search_memory", "save_memory",
-        "direct_reply", "get_system_time",
-    ],
 }
 
 
@@ -220,104 +100,7 @@ def _wrap(name: str) -> dict:
     }
 
 
-def get_architect_tools(mode: str) -> list:
-    names = _MODE_TOOL_NAMES.get(mode, _MODE_TOOL_NAMES["Shop"])
-    return [_wrap(n) for n in names]
+def research_tools() -> list:
+    """Every schema here, wrapped for the `tools` field of a completion request."""
+    return [_wrap(name) for name in _SCHEMAS]
 
-
-_ENGINEER_SCHEMAS = {
-    "request_terminal_execution": {
-        "description": (
-            "Requests execution of a bash command on the host Mac. Requires explicit "
-            "human approval. Use only when the blueprint cannot be satisfied by code alone."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The bash command to run."},
-                "explanation": {"type": "string", "description": "One-sentence summary shown to the human approver."},
-            },
-            "required": ["command", "explanation"],
-        },
-    },
-    "patch_file": {
-        "description": (
-            "Surgically patches the running server source by exact-string replacement. "
-            "Each search_text must match the current source EXACTLY, including whitespace."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "patches": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "search_text": {"type": "string", "description": "Exact existing code to replace."},
-                            "replace_text": {"type": "string", "description": "New code to insert in its place."},
-                        },
-                        "required": ["search_text", "replace_text"],
-                    },
-                },
-            },
-            "required": ["patches"],
-        },
-    },
-}
-
-
-def get_engineer_tools(mode: str) -> list:
-    names = ["request_terminal_execution"]
-    if mode == "Developer":
-        names.append("patch_file")
-    return [
-        {
-            "type": "function",
-            "function": {"name": n, "description": _ENGINEER_SCHEMAS[n]["description"], "parameters": _ENGINEER_SCHEMAS[n]["parameters"]},
-        }
-        for n in names
-    ]
-
-
-QA_TEST_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_script_test",
-        "description": (
-            "Runs the Engineer's draft script in the sandbox with real command-line "
-            "arguments and returns its stdout/stderr. For CLI scripts, ALWAYS test at "
-            "least one realistic example input (e.g. from the blueprint) before submitting "
-            "your verdict — a usage/argparse message alone proves nothing about correctness."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "arguments": {"type": "string", "description": "Command-line arguments to pass to the script, e.g. 'M6x1.0'."},
-            },
-            "required": ["arguments"],
-        },
-    },
-}
-
-QA_VERDICT_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "submit_verdict",
-        "description": "Submits the final QA verdict on the Engineer's code. You MUST call this exactly once per review.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["APPROVE", "FAIL", "DEPLOY"],
-                    "description": "APPROVE saves the code as a skill/file. FAIL sends it back to the Engineer. DEPLOY (Developer mode only) overwrites production source after human approval.",
-                },
-                "save_path": {"type": "string", "description": "Where to save the approved code, e.g. skills/tap_drill.py (APPROVE only)."},
-                "feedback": {"type": "string", "description": "Detailed list of required fixes (FAIL only)."},
-                "target_file": {"type": "string", "description": "Production file to overwrite (DEPLOY only)."},
-                "summary": {"type": "string", "description": "One-sentence summary of the change (DEPLOY only)."},
-            },
-            "required": ["status"],
-        },
-    },
-}

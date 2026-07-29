@@ -74,16 +74,21 @@ class ServerManager: ObservableObject {
     func bootSequence() {
         log("🚀 Initiating Tri-Brain Boot Sequence...")
         
+        // Offline mode is not optional. Without it mlx_lm.server calls the Hugging
+        // Face API to check each model's revision, which fails with a 401 and takes
+        // the server down with it — and reaches the network at runtime besides.
+        let offline = "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"
+        
         // 1. Boot 30B Architect
-        process70B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && python -m mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --host 127.0.0.1 --port 8080")
+        process70B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --host 127.0.0.1 --port 8080")
         is70BRunning = true
         
         // 2. Boot 32B Compressor
-        processCompressor = runCommand("cd ~/shop-jarvis && source venv/bin/activate && python -m mlx_lm.server --model mlx-community/Qwen2.5-Coder-32B-Instruct-4bit --host 127.0.0.1 --port 8082")
+        processCompressor = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen2.5-Coder-32B-Instruct-4bit --host 127.0.0.1 --port 8082")
         isCompressorRunning = true
         
         // 3. Boot 480B Engineer
-        process405B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && python -m mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --host 127.0.0.1 --port 8081")
+        process405B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --host 127.0.0.1 --port 8081")
         is405BRunning = true
         
         // 4. Boot FastAPI Backend
