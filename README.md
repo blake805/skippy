@@ -78,7 +78,23 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `apps/SkippyClient/` | macOS/iOS chat client |
 | `docs/adr/` | Architecture decision records |
 
-Run the tests with `python -m pytest`.
+## Tests
+
+```bash
+pip install -r requirements-test.txt
+python -m pytest
+```
+
+`requirements-test.txt` is the light dependency set CI installs, so a local run
+matches CI exactly. The suite needs no model server, no weights, no NAS, and no
+network — `tests/fake_llm.py` stands in for `mlx_lm.server`. Chroma, Whisper and
+Kokoro are loaded on first use rather than at import, which is what keeps
+`skippy_factory` importable without them. Adding an import-time dependency on any
+of them will break collection.
+
+CI runs the suite three ways: normally, again inside a network namespace with only
+loopback available so nothing can quietly reach the internet, and `pyflakes` over
+every module with no exclusions.
 
 ## Setup
 

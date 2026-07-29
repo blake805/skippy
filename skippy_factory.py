@@ -7,13 +7,9 @@ import tempfile
 import base64
 import io
 import uuid
-import soundfile as sf
 from typing import Dict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
-import chromadb
-import whisper
-from kokoro_onnx import Kokoro
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -23,18 +19,66 @@ logger = logging.getLogger("skippy_factory")
 # url and weight mapping, and refuses to reach off-machine unless asked to.
 import skippy_llm
 
-# --- CONNECT NAS MEMORY ---
-NAS_MEMORY_PATH = "/Volumes/skippy_memory/chroma_db"
-os.makedirs(NAS_MEMORY_PATH, exist_ok=True)
-chroma_client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
-memory_collection = chroma_client.get_or_create_collection(name="skippy_longterm")
-code_collection = chroma_client.get_or_create_collection(name="skippy_code_projects")
+# Chroma, Whisper and Kokoro are all loaded on first use rather than at import.
+# Two reasons. Importing this module no longer requires the NAS to be mounted or
+# ~700MB of model weights to be present, which is what makes the hub and the
+# endpoints testable in CI. And `python skippy_factory.py` used to load Whisper
+# and Kokoro *twice* — once when __main__ ran the module top level, then again
+# when uvicorn imported `skippy_factory` by name.
 
-# --- INITIALIZE VOICE ENGINES ---
-logger.info("Loading Whisper Speech Engine...")
-whisper_model = whisper.load_model("base")
-logger.info("Loading Kokoro Voice Engine...")
-kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+# --- CONNECT NAS MEMORY ---
+NAS_MEMORY_PATH = os.environ.get("SKIPPY_CHROMA_PATH", "/Volumes/skippy_memory/chroma_db")
+_chroma_state: dict = {}
+
+def get_chroma() -> dict:
+    """Open the Chroma store on first use."""
+    if "client" not in _chroma_state:
+        import chromadb
+
+        os.makedirs(NAS_MEMORY_PATH, exist_ok=True)
+        client = chromadb.PersistentClient(path=NAS_MEMORY_PATH)
+        _chroma_state["client"] = client
+        _chroma_state["memory"] = client.get_or_create_collection(name="skippy_longterm")
+        _chroma_state["code"] = client.get_or_create_collection(name="skippy_code_projects")
+    return _chroma_state
+
+class _LazyCollection:
+    """Resolves to a real Chroma collection on first attribute access.
+
+    Keeps `memory_collection` / `code_collection` usable as module globals by
+    `tools.py` without paying the Chroma import at startup.
+    """
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def _target(self):
+        return get_chroma()[self._key]
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+memory_collection = _LazyCollection("memory")
+code_collection = _LazyCollection("code")
+
+# --- VOICE ENGINES (loaded on first transcription / TTS request) ---
+_voice_state: dict = {}
+
+def get_whisper():
+    if "whisper" not in _voice_state:
+        import whisper
+
+        logger.info("Loading Whisper Speech Engine...")
+        _voice_state["whisper"] = whisper.load_model("base")
+    return _voice_state["whisper"]
+
+def get_kokoro():
+    if "kokoro" not in _voice_state:
+        from kokoro_onnx import Kokoro
+
+        logger.info("Loading Kokoro Voice Engine...")
+        _voice_state["kokoro"] = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+    return _voice_state["kokoro"]
 
 # --- MULTI-CLIENT CONNECTION MANAGER ---
 class ConnectionManager:
@@ -67,15 +111,20 @@ class ConnectionManager:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self.pending_responses[task_id] = future
-        
-        await self.active_connections[target_client].send_json(payload)
-        
+
+        # The send is inside the try because a dead socket raises: without this,
+        # the exception escapes to the caller and the future is stranded, so every
+        # later assumption that pending_responses drains is quietly false.
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
+            await self.active_connections[target_client].send_json(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            del self.pending_responses[task_id]
             return {"error": f"Timeout: '{target_client}' did not respond within {timeout} seconds."}
+        except Exception as exc:
+            return {"error": f"Transport failure sending to '{target_client}': {exc}"}
+        finally:
+            # pop, not del: resolve_response may already have removed it.
+            self.pending_responses.pop(task_id, None)
 
     def resolve_response(self, task_id: str, data: dict):
         if task_id in self.pending_responses:
@@ -119,7 +168,9 @@ async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
     sentences = re.split(r'(?<=[.!?]) +', clean_text)
     
     def generate_tts(t):
-        samples, sample_rate = kokoro.create(t, voice="am_michael", speed=1.25, lang="en-us")
+        import soundfile as sf
+
+        samples, sample_rate = get_kokoro().create(t, voice="am_michael", speed=1.25, lang="en-us")
         wav_io = io.BytesIO()
         sf.write(wav_io, samples, sample_rate, format='WAV')
         return base64.b64encode(wav_io.getvalue()).decode('utf-8')
@@ -208,7 +259,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
         tmp.write(await file.read())
         input_path = tmp.name
     try:
-        result = await asyncio.to_thread(whisper_model.transcribe, input_path, fp16=False)
+        result = await asyncio.to_thread(get_whisper().transcribe, input_path, fp16=False)
     finally:
         os.remove(input_path)
     return {"text": result["text"].strip()}

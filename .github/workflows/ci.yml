@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Never let a test reach the real NAS paths.
+  SKIPPY_MEMORY_ROOT: ${{ github.workspace }}/.ci-tmp/skippy_memory
+  SKIPPY_WORKSPACES_ROOT: ${{ github.workspace }}/.ci-tmp/skippy_workspaces
+  SKIPPY_CHROMA_PATH: ${{ github.workspace }}/.ci-tmp/skippy_memory/chroma_db
+
+jobs:
+  tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the production interpreter on the Mac Studio (3.11.15).
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run pytest
+        run: python -m pytest
+
+  offline:
+    name: Python tests (no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      # Skippy is meant to work with the internet unplugged, and the local/cloud
+      # policy in ADR 0007 is only meaningful if that is enforced rather than
+      # asserted. The suite runs in a network namespace with nothing but loopback,
+      # so anything reaching for the internet fails here. The runner's own agent
+      # stays outside the namespace and can still report the result.
+      # sudo rather than --map-root-user: Ubuntu 24.04 restricts unprivileged user
+      # namespaces via AppArmor, so the unprivileged form fails on this runner.
+      - name: Run pytest with only loopback available
+        run: |
+          sudo -E env "PATH=$PATH" unshare --net -- \
+            sh -c 'ip link set lo up && python -m pytest'
+
+  lint:
+    name: pyflakes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pyflakes
+        run: pip install pyflakes
+
+      # No exclusions: every module in the tree is expected to be clean. If that
+      # becomes painful, fix the module rather than adding it to an ignore list.
+      - name: Run pyflakes
+        run: python -m pyflakes *.py tests/
