@@ -13,13 +13,20 @@ reverse-engineering mode — with no cloud LLM in the runtime path.
 
 ## Architecture
 
-All inference is local via MLX-served OpenAI-compatible endpoints:
+Models are addressed by **role**, never by size or port. `skippy_llm.py` owns the
+mapping, so changing weights is configuration rather than a code change:
 
-| Node | Port | Model | Role |
+| Role | Port | Model | Used for |
 | --- | --- | --- | --- |
-| Fast | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Cheap turns, triage, summarization |
-| Heavy | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | Multi-file edits, RE analysis |
-| Compressor | 8082 | Qwen2.5-Coder-32B-Instruct-4bit | Compresses retrieval results to protect context |
+| `fast` | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Cheap turns, triage, routing |
+| `heavy` | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | The agent loop: multi-file edits, RE analysis |
+| `compressor` | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Squeezing oversized tool output |
+
+Two server processes, not three — `compressor` shares `fast`'s. Override any role with
+`SKIPPY_<ROLE>_URL`, `SKIPPY_<ROLE>_MODEL`, and `SKIPPY_<ROLE>_MAX_TOKENS`. `GET /health`
+reports what each role actually resolved to. See
+[ADR 0007](docs/adr/0007-model-roles-and-cloud-escalation.md) for the benchmark behind
+these choices.
 
 Serve them with `HF_HUB_OFFLINE=1` set. Without it `mlx_lm.server` calls the Hugging Face
 API to check each model's revision, which both reaches the network at runtime and takes
@@ -30,7 +37,30 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --port 8080 --host 127.0.0.1
 ```
 
-The `SkippyServer` menu-bar app boots all three plus the backend for you.
+The `SkippyServer` menu-bar app boots the models plus the backend for you.
+
+### Cloud escalation
+
+Local by default. A role may point at any OpenAI-compatible hosted endpoint, but
+reaching off-machine is opt-in and never silent:
+
+```bash
+export SKIPPY_ALLOW_CLOUD=1
+export SKIPPY_HEAVY_URL="https://api.example.com/v1/chat/completions"
+export SKIPPY_HEAVY_API_KEY="..."
+```
+
+Without `SKIPPY_ALLOW_CLOUD=1`, resolving an off-machine role raises `CloudNotAllowed`.
+`is_local` is computed from the URL rather than declared, and only loopback counts — a
+LAN or tailnet address is treated as off-machine on purpose.
+
+### Why transcripts are append-only
+
+`mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
+12K-token prefill measures 59.9s cold against 2.8–3.3s warm. Editing an already-sent
+message invalidates that cache and forces a full re-prefill, so `skippy_llm.Transcript`
+exposes no way to delete or rewrite a turn. Use `fold()` when context genuinely has to
+be shed; it returns a new transcript and logs the cost.
 
 Tool interaction uses native OpenAI-style function calling — schemas in `tool_schemas.py`,
 parsed server-side by `mlx_lm.server`. `parse_leaked_tool_calls` in `skippy_factory.py`
@@ -40,11 +70,15 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 
 | File | Purpose |
 | --- | --- |
-| `skippy_factory.py` | FastAPI server: model routing, websocket hub, voice, transcription |
+| `skippy_llm.py` | Model role registry, inference, cloud policy, append-only transcripts |
+| `skippy_factory.py` | FastAPI server: websocket hub, voice, transcription, endpoints |
 | `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
 | `tool_schemas.py` | OpenAI-format function schemas for native tool calling |
 | `apps/SkippyServer/` | macOS app that boots the model servers and backend |
 | `apps/SkippyClient/` | macOS/iOS chat client |
+| `docs/adr/` | Architecture decision records |
+
+Run the tests with `python -m pytest`.
 
 ## Setup
 
