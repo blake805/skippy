@@ -7,9 +7,11 @@ the agent work must not disturb it.
 
 import asyncio
 import json
+import logging
 import os
 
 import pytest
+from fastapi import WebSocketDisconnect
 
 import skippy_factory
 from skippy_factory import SkippyPipeline
@@ -552,3 +554,216 @@ async def test_two_pipelines_on_one_socket_each_get_their_own_answer():
     assert deploy_ok is True
     assert ssh_ok is False, "the SSH denial must not be delivered to the deploy gate"
     assert hub.pending_responses == {}
+
+
+# ---------------------------------------------------------------------------
+# Legacy approval bridge
+#
+# The SwiftUI app does not echo `task_id` yet (docs/adr/0005-approval-routing.md),
+# so until it ships, `_serve_socket` bridges a reply-shaped message — no task_id,
+# but a "status" field — to the sole pending approval on that socket. Ambiguity
+# is never guessed at, every bridged reply is logged at WARNING, and
+# SKIPPY_STRICT_AUTH_TASK_ID=1 turns the whole thing off.
+# ---------------------------------------------------------------------------
+
+DISCONNECT = object()
+
+
+class LiveSocket(RecordingSocket):
+    """Drives `_serve_socket` directly: scripted inbound, recorded outbound."""
+
+    def __init__(self):
+        super().__init__()
+        self.inbound = asyncio.Queue()
+
+    async def accept(self):
+        pass
+
+    async def receive_text(self):
+        item = await self.inbound.get()
+        if item is DISCONNECT:
+            raise WebSocketDisconnect(1000)
+        return item
+
+    def push(self, payload: dict):
+        self.inbound.put_nowait(json.dumps(payload))
+
+    def hang_up(self):
+        self.inbound.put_nowait(DISCONNECT)
+
+
+@pytest.fixture
+def bridge_hub(monkeypatch):
+    """A fresh ConnectionManager wired into `_serve_socket`, plus a pipeline spy
+    that records what would have been dispatched as a new Shop task."""
+    hub = skippy_factory.ConnectionManager()
+    monkeypatch.setattr(skippy_factory, "hub", hub)
+
+    dispatched = []
+
+    class SpyPipeline:
+        def __init__(self, websocket, payload, manager):
+            dispatched.append(payload)
+
+        async def run(self):
+            pass
+
+    monkeypatch.setattr(skippy_factory, "SkippyPipeline", SpyPipeline)
+    return hub, dispatched
+
+
+async def open_socket(hub):
+    socket = LiveSocket()
+    server = asyncio.create_task(skippy_factory._serve_socket(socket, "swiftui", "Shop"))
+    while "swiftui" not in hub.active_connections:
+        await asyncio.sleep(0.01)
+    return socket, server
+
+
+async def hold_approval(hub, socket, payload, sent_before=0):
+    """Park an approval request on the socket, as `await_authorization` does."""
+    waiter = asyncio.create_task(hub.request_on_socket(socket, payload, timeout=5.0))
+    while len(socket.sent) <= sent_before:
+        await asyncio.sleep(0.01)
+    return waiter, socket.sent[-1]["task_id"]
+
+
+async def close_socket(socket, server):
+    socket.hang_up()
+    await asyncio.wait_for(server, timeout=2.0)
+
+
+def warnings_from(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_a_legacy_reply_is_bridged_to_the_single_pending_approval(bridge_hub, caplog):
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+    waiter, task_id = await hold_approval(
+        hub, socket, {"type": "terminal_auth", "command": "ls", "explanation": "peek"}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="skippy_factory"):
+        socket.push({"status": "APPROVE"})
+        reply = await asyncio.wait_for(waiter, timeout=2.0)
+
+    assert reply["status"] == "APPROVE", "the bridge must deliver the approval"
+    assert dispatched == [], "the reply must not become a new Shop task"
+    assert any(task_id in message for message in warnings_from(caplog)), (
+        "every bridged reply is logged at WARNING with the task_id it matched"
+    )
+    assert hub.pending_responses == {}
+    await close_socket(socket, server)
+
+
+async def test_two_pending_approvals_are_never_guessed_between(bridge_hub, caplog):
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+    first, _ = await hold_approval(hub, socket, {"type": "terminal_auth", "command": "a"})
+    second, _ = await hold_approval(
+        hub, socket, {"type": "deployment_auth", "target_file": "x.py"}, sent_before=1
+    )
+
+    with caplog.at_level(logging.WARNING, logger="skippy_factory"):
+        socket.push({"status": "APPROVE"})
+        while not dispatched:
+            await asyncio.sleep(0.01)
+
+    assert not first.done() and not second.done(), "neither gate may receive a guessed answer"
+    assert dispatched == [{"status": "APPROVE"}], "today's behaviour: it becomes a new task"
+    assert any("refusing to guess" in message for message in warnings_from(caplog))
+
+    for payload in socket.sent:
+        hub.resolve_response(payload["task_id"], {"status": "DENY"})
+    await asyncio.gather(first, second)
+    await close_socket(socket, server)
+
+
+async def test_a_legacy_reply_with_nothing_pending_falls_through(bridge_hub, caplog):
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+
+    with caplog.at_level(logging.WARNING, logger="skippy_factory"):
+        socket.push({"status": "APPROVE"})
+        while not dispatched:
+            await asyncio.sleep(0.01)
+
+    assert dispatched == [{"status": "APPROVE"}]
+    assert any("no approval is pending" in message for message in warnings_from(caplog))
+    await close_socket(socket, server)
+
+
+async def test_an_agent_rpc_is_invisible_to_the_bridge(bridge_hub):
+    """An agent task's RPC and a shop approval pending on one socket: the legacy
+    reply must land on the approval and never on the agent's future."""
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+
+    rpc = asyncio.create_task(
+        hub.execute_tool_on_client("swiftui", {"action": "get_active_file"}, timeout=5.0)
+    )
+    while not socket.sent:
+        await asyncio.sleep(0.01)
+    approval, _ = await hold_approval(
+        hub, socket, {"type": "terminal_auth", "command": "ls"}, sent_before=1
+    )
+
+    socket.push({"status": "APPROVE"})
+    reply = await asyncio.wait_for(approval, timeout=2.0)
+
+    assert reply["status"] == "APPROVE"
+    assert not rpc.done(), "the agent's future must never be resolved by a legacy shop reply"
+    assert dispatched == []
+
+    # The RPC reply carries its task_id, as Cursor replies always do, and is
+    # routed exactly as before — the bridge never sees it.
+    rpc_id = next(p["task_id"] for p in socket.sent if p.get("action") == "get_active_file")
+    socket.push({"task_id": rpc_id, "content": "main.py"})
+    assert (await asyncio.wait_for(rpc, timeout=2.0)) == {"task_id": rpc_id, "content": "main.py"}
+    assert hub.pending_responses == {}
+    await close_socket(socket, server)
+
+
+async def test_strict_mode_refuses_a_reply_without_task_id(bridge_hub, caplog, monkeypatch):
+    """SKIPPY_STRICT_AUTH_TASK_ID=1 is the switch to flip once the SwiftUI app
+    echoes task_id: the bridge is off and the legacy reply is dropped outright."""
+    monkeypatch.setenv("SKIPPY_STRICT_AUTH_TASK_ID", "1")
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+    waiter, task_id = await hold_approval(hub, socket, {"type": "terminal_auth", "command": "ls"})
+
+    with caplog.at_level(logging.WARNING, logger="skippy_factory"):
+        socket.push({"status": "APPROVE"})
+        socket.push({"type": "ping"})  # a later message proves the reply was consumed
+        while not socket.of_type("hello_ack"):
+            await asyncio.sleep(0.01)
+
+    assert not waiter.done(), "strict mode must not bridge; the gate times out closed"
+    assert dispatched == [], "strict mode must not dispatch the reply as a task either"
+    assert any("SKIPPY_STRICT_AUTH_TASK_ID" in message for message in warnings_from(caplog))
+
+    hub.resolve_response(task_id, {"status": "DENY"})
+    await waiter
+    await close_socket(socket, server)
+
+
+async def test_a_modern_reply_with_task_id_bypasses_the_bridge_entirely(bridge_hub):
+    """Once the app echoes task_id, routing is exact even with several approvals
+    pending — the bridge's one-candidate rule never comes into play."""
+    hub, dispatched = bridge_hub
+    socket, server = await open_socket(hub)
+    first, first_id = await hold_approval(hub, socket, {"type": "terminal_auth", "command": "a"})
+    second, second_id = await hold_approval(
+        hub, socket, {"type": "deployment_auth", "target_file": "x.py"}, sent_before=1
+    )
+
+    socket.push({"status": "APPROVE", "task_id": second_id})
+    assert (await asyncio.wait_for(second, timeout=2.0))["status"] == "APPROVE"
+    assert not first.done()
+
+    socket.push({"status": "DENY", "task_id": first_id})
+    assert (await asyncio.wait_for(first, timeout=2.0))["status"] == "DENY"
+    assert dispatched == []
+    assert hub.pending_responses == {}
+    await close_socket(socket, server)

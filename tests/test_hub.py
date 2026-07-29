@@ -168,6 +168,87 @@ async def test_concurrent_requests_do_not_cross_wires(hub):
     assert hub.pending_responses == {}
 
 
+# ---------------------------------------------------------------------------
+# Legacy approval bridge bookkeeping
+#
+# A SwiftUI client that predates ADR 0005 answers an auth request without the
+# task_id. `_serve_socket` can only bridge that reply if the hub can say which
+# pending futures belong to a socket and which of those are human approvals
+# rather than RPCs. That context lives in `PendingRequest`.
+# ---------------------------------------------------------------------------
+
+
+async def test_request_on_socket_registers_an_approval_on_that_socket(hub):
+    socket = FakeSocket()
+
+    waiter = asyncio.create_task(
+        hub.request_on_socket(socket, {"type": "terminal_auth", "command": "ls"}, timeout=5.0)
+    )
+    while not socket.sent:
+        await asyncio.sleep(0.01)
+
+    assert hub.pending_approvals_on(socket) == [socket.sent[0]["task_id"]]
+    assert hub.pending_approvals_on(FakeSocket()) == [], "another socket sees nothing"
+
+    hub.resolve_response(socket.sent[0]["task_id"], {"status": "DENY"})
+    await waiter
+    assert hub.pending_approvals_on(socket) == []
+    assert hub.pending_responses == {}
+
+
+async def test_an_rpc_future_is_never_an_approval_candidate(hub):
+    """An agent RPC and a shop approval share the socket; only the approval may
+    ever be matched to a legacy reply, so only it shows up as a candidate."""
+    socket = FakeSocket()
+    await hub.connect(socket, "swiftui")
+
+    rpc = asyncio.create_task(
+        hub.execute_tool_on_client("swiftui", {"action": "get_active_file"}, timeout=5.0)
+    )
+    approval = asyncio.create_task(
+        hub.request_on_socket(socket, {"type": "terminal_auth", "command": "ls"}, timeout=5.0)
+    )
+    while len(socket.sent) < 2:
+        await asyncio.sleep(0.01)
+
+    approval_id = next(p["task_id"] for p in socket.sent if p.get("type") == "terminal_auth")
+    rpc_id = next(p["task_id"] for p in socket.sent if p.get("action") == "get_active_file")
+
+    assert hub.pending_approvals_on(socket) == [approval_id]
+
+    # Resolving the sole candidate — what the bridge does — must not touch the RPC.
+    hub.resolve_response(approval_id, {"status": "APPROVE"})
+    assert (await approval)["status"] == "APPROVE"
+    assert not rpc.done(), "the agent's future must never be resolved by a legacy shop reply"
+
+    # And the Cursor-style reply, which always carries task_id, lands as before.
+    hub.resolve_response(rpc_id, {"content": "main.py"})
+    assert (await rpc) == {"content": "main.py"}
+    assert hub.pending_responses == {}
+
+
+async def test_two_pending_approvals_are_both_reported(hub):
+    """Two candidates means the bridge must refuse to guess; the hub's job is
+    just to report both so `_serve_socket` can see the ambiguity."""
+    socket = FakeSocket()
+
+    first = asyncio.create_task(
+        hub.request_on_socket(socket, {"type": "terminal_auth", "command": "a"}, timeout=5.0)
+    )
+    second = asyncio.create_task(
+        hub.request_on_socket(socket, {"type": "deployment_auth", "target_file": "x.py"}, timeout=5.0)
+    )
+    while len(socket.sent) < 2:
+        await asyncio.sleep(0.01)
+
+    assert sorted(hub.pending_approvals_on(socket)) == sorted(p["task_id"] for p in socket.sent)
+
+    for payload in socket.sent:
+        hub.resolve_response(payload["task_id"], {"status": "DENY"})
+    await asyncio.gather(first, second)
+    assert hub.pending_responses == {}
+
+
 async def test_disconnect_removes_the_client(hub):
     await hub.connect(FakeSocket(), "swiftui")
     assert "swiftui" in hub.active_connections

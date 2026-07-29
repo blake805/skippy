@@ -61,11 +61,43 @@ actions in ADR 0004 do.
 {"status": "APPROVE", "task_id": "9f2c..."}
 ```
 
-A SwiftUI client that does not echo `task_id` will have its reply treated as a new
-Shop task, and the pipeline will sit until the 600-second timeout and then deny.
-That is a visible ten-minute stall rather than a silent mis-delivery, which is the
-right way for this to fail while the clients are updated. The clients must be
-updated to round-trip the field.
+A SwiftUI client that does not echo `task_id` would, on the routing rule alone,
+have its reply treated as a new Shop task, and the pipeline would sit until the
+600-second timeout and then deny. Failing closed is right, but a ten-minute hang
+on every approval is not a deployable state — which is why the temporary bridge
+below exists. The clients must still be updated to round-trip the field.
+
+## Deprecation bridge for clients that predate this ADR (temporary)
+
+The shipped SwiftUI app does not echo `task_id` yet, so `_serve_socket` carries a
+compatibility path until it does:
+
+- An inbound message with **no** `task_id` but **with** a `"status"` field is
+  reply-shaped. If **exactly one** approval future is pending on that same
+  socket, the message resolves that future instead of being dispatched as a task.
+- With zero or more than one approval pending on the socket, the bridge refuses
+  to guess — guessing between two pending approvals is worse than the hang — and
+  the message falls through to the old behaviour: it becomes a new Shop task and
+  the unanswered gates time out closed.
+- Only human approvals are candidates. `ConnectionManager.pending_responses` now
+  stores a `PendingRequest(future, websocket, kind)` per `task_id`, where `kind`
+  is `"approval"` (from `request_on_socket`) or `"rpc"` (from
+  `execute_tool_on_client`). Cursor RPC replies always carry `task_id` and are
+  never matched by the bridge.
+- Every bridged reply is logged at WARNING with the `task_id` it was matched to,
+  so the gap stays visible in the shop log rather than silent.
+- `SKIPPY_STRICT_AUTH_TASK_ID=1` disables the bridge: a reply without `task_id`
+  is then refused outright (dropped with a WARNING, never bridged, never
+  dispatched as a task).
+
+The decision rule is untouched: `{"status": "APPROVE"}` and nothing else means
+approve; denials, timeouts, and dead sockets still fail closed, and headless
+operation (`websocket=None`) is unaffected. The bridge changes only how a reply
+is matched to a waiting gate, never what gets authorized.
+
+**Removal condition.** Once the SwiftUI app echoes `task_id`,
+`SKIPPY_STRICT_AUTH_TASK_ID=1` becomes the default and the bridge block in
+`_serve_socket` is deleted, along with this section.
 
 ## Consequences
 

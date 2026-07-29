@@ -91,11 +91,35 @@ The single new obligation is to send the request's `task_id` back verbatim:
 {"status": "APPROVE", "task_id": "9f2c48e1-..."}
 ```
 
-**If the app does not echo it**, the reply is treated as a brand new Shop task and
-the waiting pipeline stalls for the full 600-second `HUMAN_APPROVAL_TIMEOUT` before
+**If the app does not echo it**, a temporary deprecation bridge in the server
+usually keeps the reply working — see the next section. When the bridge cannot
+apply (or is disabled), the reply is treated as a brand new Shop task and the
+waiting pipeline stalls for the full 600-second `HUMAN_APPROVAL_TIMEOUT` before
 denying. That is a visible ten-minute hang, not a silent mis-authorization, which is
-the correct way for this to fail — but it does mean the Tormach SSH gate and the
-Developer-mode deploy gate stop working until the client is updated.
+the correct way for this to fail — but it is why the client must be updated.
+
+### The deprecation bridge (temporary — do not rely on it)
+
+Until the app echoes `task_id`, the server bridges legacy replies:
+
+- A message with no `task_id` but with a `"status"` field is treated as a reply.
+  If exactly **one** approval is pending on the socket it came in on, it resolves
+  that approval. Every bridged reply is logged at WARNING with the `task_id` it
+  was matched to.
+- If zero or several approvals are pending on that socket, the server refuses to
+  guess. The message falls through as a new Shop task and the unanswered gates
+  time out closed — the old ten-minute stall.
+- Cursor RPC replies always carry `task_id` and are never touched by the bridge.
+- The decision rule is unchanged: `{"status": "APPROVE"}` and nothing else means
+  approve. Denials, timeouts, and dead sockets still fail closed.
+
+**This bridge is temporary and will be deleted.** The removal condition: the
+SwiftUI app echoes `task_id` on every authorization reply, then
+`SKIPPY_STRICT_AUTH_TASK_ID=1` (which disables the bridge and refuses any reply
+without a `task_id` outright) becomes the server default, and the bridge code is
+removed. An updated app therefore must not depend on this behaviour — it means
+losing the ability to answer two approvals held open at once, and it stops
+working the moment strict mode is switched on.
 
 On the app side this is small: keep the `task_id` from the auth event alongside
 whatever state holds the pending prompt, and include it in the reply.
