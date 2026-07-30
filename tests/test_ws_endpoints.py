@@ -100,15 +100,16 @@ def test_health_surfaces_an_offmachine_role(client, monkeypatch):
 
 # --- websocket ---
 
-def test_a_chat_message_gets_an_answer_and_a_done(client):
+def test_a_message_with_no_workspace_configured_says_so_and_names_the_fix(client):
+    """The suite configures no roots, so this is the path a fresh install hits. A
+    silent empty run would look like the agent simply found nothing to do."""
     with client.websocket_connect("/ws/factory?client_id=test") as socket:
         socket.send_json({"mode": "Agent", "text": "add a feature", "history": [], "use_tts": False})
         first = socket.receive_json()
         second = socket.receive_json()
 
     assert first["type"] == "chat"
-    # Until the agent runtime lands, the honest answer is that it is missing.
-    assert "not installed" in first["content"]
+    assert "SKIPPY_WORKSPACE_ROOTS" in first["content"]
     assert second["type"] == "done"
 
 
