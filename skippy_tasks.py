@@ -32,6 +32,7 @@ import logging
 from typing import Any, Callable, Dict, Optional
 
 import skippy_agent
+import skippy_cursor
 import skippy_paths
 from skippy_sandbox import Sandbox, SandboxError
 
@@ -51,6 +52,9 @@ class TaskRunner:
 
     def __init__(self, hub, roots_provider: Optional[Callable[[], list]] = None):
         self.hub = hub
+        # One bridge for the life of the runner. Whether an editor is actually there is
+        # decided per call, so connecting Cursor mid-session just starts working.
+        self.cursor = skippy_cursor.CursorBridge(hub)
         # Injected so a test does not need the environment, and so the Cursor bridge
         # can later offer the editor's open folders instead.
         self.roots_provider = roots_provider or skippy_paths.configured_workspace_roots
@@ -126,7 +130,7 @@ class TaskRunner:
 
         loop = skippy_agent.AgentLoop(
             task, sandbox, emit=emit, mode=mode, target=target,
-            journal_dir=skippy_paths.patch_journal_root(),
+            journal_dir=skippy_paths.patch_journal_root(), cursor=self.cursor,
         )
         self._loops[client_id] = loop
         try:

@@ -17,8 +17,8 @@ import inspect
 import logging
 from typing import Any, Dict, Optional
 
-import skippy_edit
 import skippy_exec
+import skippy_cursor
 import skippy_fs
 import skippy_memory
 import skippy_re
@@ -32,7 +32,6 @@ _SYNC_TOOLS = {
     "list_dir": skippy_fs.list_dir,
     "read_file": skippy_fs.read_file,
     "glob_files": skippy_fs.glob_files,
-    "apply_patch": skippy_edit.apply_patch,
     "note_finding": skippy_re.note_finding,
     "read_notes": skippy_re.read_notes,
     "record_decision": skippy_memory.record_decision,
@@ -48,6 +47,8 @@ _MEMORY_TOOLS = ("record_decision", "recall_project")
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,
     "run_command": skippy_exec.run_command,
+    # Async because it may route the write through the attached editor.
+    "apply_patch": skippy_cursor.apply_patch,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
@@ -77,6 +78,7 @@ async def dispatch(
     mode: str = skippy_exec.DEFAULT_MODE,
     notes_pack: Optional[Any] = None,
     memory: Optional[Any] = None,
+    cursor: Optional[Any] = None,
 ) -> ToolResult:
     """Run one tool. Never raises."""
     args: Dict[str, Any] = dict(args or {})
@@ -108,10 +110,15 @@ async def dispatch(
     # Never model-controlled. `mode` belongs here for the same reason as the sandbox:
     # a model in RE mode that could request the coding table could execute the
     # artifact it was asked to analyse, which is the one thing the split prevents.
-    for injected in ("sandbox", "journal_dir", "mode", "pack", "memory"):
+    for injected in ("sandbox", "journal_dir", "mode", "pack", "memory", "bridge", "writer"):
         args.pop(injected, None)
-    if name == "apply_patch" and journal_dir:
-        args["journal_dir"] = journal_dir
+    if name == "apply_patch":
+        if journal_dir:
+            args["journal_dir"] = journal_dir
+        # Routed through the editor when one is attached, so the change is a single
+        # undo step. The model is not told which happened and has no way to ask: it
+        # would only be a choice it could get wrong.
+        args["bridge"] = cursor
     if name == "run_command":
         args["mode"] = mode
     # The notes tools write to a pack rather than to the workspace, so they take the

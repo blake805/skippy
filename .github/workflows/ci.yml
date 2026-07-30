@@ -80,3 +80,33 @@ jobs:
       # becomes painful, fix the module rather than adding it to an ignore list.
       - name: Run pyflakes
         run: python -m pyflakes *.py tests/
+
+  extension:
+    name: Cursor extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: cursor_client/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: cursor_client
+
+      # The compile is the type check: the extension talks to the VS Code API and to
+      # the hub's wire protocol, and neither one tells you at runtime that a field is
+      # missing until the moment it matters.
+      - name: Compile
+        run: npx tsc -p ./
+        working-directory: cursor_client
+
+      # Includes the parity table, which is the only thing keeping the editor's patch
+      # semantics from drifting away from the server's. tests/test_cursor.py runs the
+      # same table on the Python side.
+      - name: Test
+        run: node --test test/*.test.js
+        working-directory: cursor_client
