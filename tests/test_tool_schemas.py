@@ -14,6 +14,7 @@ import pytest
 import skippy_edit
 import skippy_exec
 import skippy_fs
+import skippy_re
 import tool_schemas
 
 # The schemas that describe a real Python function, and the function they describe.
@@ -24,6 +25,21 @@ IMPLEMENTED = {
     "glob_files": skippy_fs.glob_files,
     "apply_patch": skippy_edit.apply_patch,
     "run_command": skippy_exec.run_command,
+    "note_finding": skippy_re.note_finding,
+    "read_notes": skippy_re.read_notes,
+}
+
+# Arguments the dispatcher supplies. The model never sees these, so a schema that
+# declared one would be describing a parameter it cannot fill.
+INJECTED = ("sandbox", "pack", "journal_dir", "mode")
+
+# Tools that accept their required arguments with Python defaults and check them in
+# the body, so an omission comes back as a message naming the field and its legal
+# values rather than as a TypeError from the dispatcher. Worth the exception for a
+# tool with a closed vocabulary — "'struct' is not a finding kind, use one of..." is
+# something the model can act on; "Bad arguments" is not.
+SELF_VALIDATING = {
+    "note_finding": {"kind", "title", "body", "confidence"},
 }
 
 
@@ -49,28 +65,64 @@ def test_every_property_has_a_type_and_a_description(name):
 def test_schema_parameters_match_the_function_signature(name, function):
     """Catches the drift that turns a tool call into a TypeError."""
     signature = inspect.signature(function)
-    # The sandbox is injected by the dispatcher, not chosen by the model.
-    accepted = {p for p in signature.parameters if p != "sandbox"}
+    accepted = {p for p in signature.parameters if p not in INJECTED}
     declared = set(tool_schemas._SCHEMAS[name]["parameters"]["properties"])
     assert declared <= accepted, f"{name} declares parameters {function.__name__} cannot take: {declared - accepted}"
 
 
 @pytest.mark.parametrize("name,function", sorted(IMPLEMENTED.items()))
+def test_no_schema_declares_an_injected_argument(name, function):
+    """The sandbox, the note pack, the journal and the mode are chosen by the loop.
+    Naming one in a schema would invite the model to set it."""
+    declared = set(tool_schemas._SCHEMAS[name]["parameters"]["properties"])
+    assert not (declared & set(INJECTED)), f"{name} exposes {declared & set(INJECTED)}"
+
+
+@pytest.mark.parametrize("name,function", sorted(IMPLEMENTED.items()))
 def test_every_required_parameter_is_actually_required(name, function):
     """A parameter with a Python default must not be declared required, and one
-    without a default must be, or the model learns the wrong contract."""
+    without a default must be, or the model learns the wrong contract.
+
+    Self-validating tools are exempt from the first half and checked separately
+    below: they take defaults deliberately so they can answer with a usable message.
+    """
     signature = inspect.signature(function)
     required = set(tool_schemas._SCHEMAS[name]["parameters"].get("required", []))
-    for param in required:
+    exempt = SELF_VALIDATING.get(name, set())
+    for param in required - exempt:
         assert signature.parameters[param].default is inspect.Parameter.empty, (
             f"{name} declares '{param}' required, but it has a default"
         )
     mandatory = {
         p.name for p in signature.parameters.values()
-        if p.name != "sandbox" and p.default is inspect.Parameter.empty
+        if p.name not in INJECTED and p.default is inspect.Parameter.empty
         and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
     }
     assert mandatory <= required, f"{name} omits required parameters: {mandatory - required}"
+
+
+@pytest.mark.parametrize("name,fields", sorted(SELF_VALIDATING.items()))
+def test_a_self_validating_tool_actually_rejects_what_it_calls_required(name, fields, tmp_path):
+    """The exemption above is only safe if the check really happens in the body.
+    Without this, giving a required field a default would quietly make it optional.
+    """
+    declared = set(tool_schemas._SCHEMAS[name]["parameters"].get("required", []))
+    assert fields <= declared, f"{name}: {fields - declared} not declared required"
+
+    valid = {
+        "kind": "structure",
+        "title": "Header is 32 bytes",
+        "body": "Load commands start at 0x20.",
+        "evidence": "otool -h reports sizeofcmds 0x20",
+        "confidence": "confirmed",
+    }
+    pack = skippy_re.open_pack(str(tmp_path / "notes"), target="t")
+    assert IMPLEMENTED[name](pack, **valid).ok, "the baseline call should succeed"
+
+    for field in fields:
+        without = dict(valid, **{field: ""})
+        result = IMPLEMENTED[name](pack, **without)
+        assert not result.ok, f"{name} accepted a call with no '{field}'"
 
 
 def test_the_mutating_tools_are_not_in_the_read_only_set():
@@ -89,6 +141,32 @@ def test_wrapped_schemas_have_the_shape_the_api_expects():
     for tool in tool_schemas.workspace_tools():
         assert tool["type"] == "function"
         assert set(tool["function"]) == {"name", "description", "parameters"}
+
+
+def test_the_re_toolset_cannot_edit_and_can_record():
+    names = {t["function"]["name"] for t in tool_schemas.re_tools()}
+    # The artifact is not ours to change, and editing it would destroy the evidence
+    # the findings cite.
+    assert "apply_patch" not in names
+    assert {"note_finding", "read_notes", "read_file", "grep", "run_command"} <= names
+
+
+def test_note_finding_explains_why_evidence_is_required():
+    """The model supplies real evidence only if the description says what it is for;
+    asked for a field called 'evidence' with no reason, it writes 'observed'."""
+    description = tool_schemas._SCHEMAS["note_finding"]["description"].lower()
+    assert "evidence" in description
+    assert "recheck" in description
+    properties = tool_schemas._SCHEMAS["note_finding"]["parameters"]["properties"]
+    assert "offset" in properties["evidence"]["description"].lower()
+
+
+def test_the_finding_vocabularies_come_from_the_module_not_a_copy():
+    """A hand-copied enum in the schema is a second source of truth: the module would
+    start accepting a kind the model is never told about, or the reverse."""
+    properties = tool_schemas._SCHEMAS["note_finding"]["parameters"]["properties"]
+    assert set(properties["kind"]["enum"]) == set(skippy_re.KINDS)
+    assert set(properties["confidence"]["enum"]) == set(skippy_re.CONFIDENCE)
 
 
 def test_apply_patch_describes_its_all_or_nothing_behaviour():

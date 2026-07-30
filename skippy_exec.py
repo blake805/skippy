@@ -92,10 +92,13 @@ class Rule:
 
     subcommands: Optional[Set[str]] = None  # None means any first argument
     forbidden_flags: Set[str] = field(default_factory=set)
+    # At least one of these must appear. For tools whose default behaviour writes and
+    # which only read when asked: bare `unzip` extracts, `unzip -l` lists.
+    required_any: Optional[Set[str]] = None
     note: str = ""
 
 
-_RULES: Dict[str, Rule] = {
+CODING_RULES: Dict[str, Rule] = {
     # Test runners and task tools. Each of these can execute repo-defined code by
     # design; see the module docstring.
     "pytest": Rule(),
@@ -129,6 +132,53 @@ _RULES: Dict[str, Rule] = {
     "git": Rule(subcommands=GIT_READ_ONLY, forbidden_flags=GIT_FORBIDDEN_FLAGS),
 }
 
+# Static inspection, for reverse-engineering work. Deliberately contains no
+# interpreter, no build tool and no test runner: RE mode must not be able to *run*
+# the artifact it is analysing. Dynamic analysis is a real need and a different
+# thing, and it needs the VM boundary that ADR 0011 identifies as the only real
+# containment — not an entry added to this table.
+#
+# Several of these read by default and write when asked, which is the trap the
+# `forbidden_flags` and `required_any` entries below are for. `codesign -s` signs,
+# `lipo -create` writes a new binary, `plutil -convert` rewrites a plist in place,
+# and bare `unzip` extracts over the target directory.
+INSPECTION_RULES: Dict[str, Rule] = {
+    "file": Rule(),
+    "strings": Rule(),
+    "nm": Rule(),
+    "size": Rule(),
+    "otool": Rule(),
+    "objdump": Rule(),
+    "dwarfdump": Rule(),
+    "hexdump": Rule(),
+    "xxd": Rule(forbidden_flags={"-r", "--revert"}),
+    "c++filt": Rule(),
+    "swift-demangle": Rule(),
+    "lipo": Rule(
+        forbidden_flags={
+            "-create", "-extract", "-extract_family", "-remove", "-replace",
+            "-thin", "-output", "-o",
+        },
+        required_any={"-info", "-detailed_info", "-archs", "-verify_arch"},
+    ),
+    "codesign": Rule(
+        forbidden_flags={
+            "-s", "--sign", "-f", "--force", "--remove-signature", "--deep",
+        },
+        required_any={"-d", "--display", "-v", "--verify", "--verbose", "-dv", "--entitlements"},
+    ),
+    "plutil": Rule(
+        forbidden_flags={"-convert", "-insert", "-replace", "-remove", "-o"},
+        required_any={"-p", "-lint"},
+    ),
+    "unzip": Rule(required_any={"-l", "-v", "-t", "-p", "-Z"}),
+    "tar": Rule(),  # checked by _validate_tar, whose flag clusters need real parsing
+    "git": Rule(subcommands=GIT_READ_ONLY, forbidden_flags=GIT_FORBIDDEN_FLAGS),
+}
+
+MODES = {"coding": CODING_RULES, "re": INSPECTION_RULES}
+DEFAULT_MODE = "coding"
+
 # Environment is allowlisted, not filtered. A denylist of secret-looking names is a
 # guessing game, and the code that inherits this is the repo's own test suite —
 # which, when reverse-engineering someone else's project, is not code to hand an
@@ -158,8 +208,17 @@ def extra_commands() -> Set[str]:
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
-def allowed_programs() -> List[str]:
-    return sorted(set(_RULES) | extra_commands())
+def rules_for(mode: str) -> Dict[str, Rule]:
+    table = MODES.get(str(mode or DEFAULT_MODE).lower())
+    if table is None:
+        raise CommandRejected(
+            f"Unknown execution mode '{mode}'. Known modes: {', '.join(sorted(MODES))}."
+        )
+    return table
+
+
+def allowed_programs(mode: str = DEFAULT_MODE) -> List[str]:
+    return sorted(set(rules_for(mode)) | extra_commands())
 
 
 def _unquoted_operator(command: str) -> Optional[str]:
@@ -195,8 +254,41 @@ def _unquoted_operator(command: str) -> Optional[str]:
     return None
 
 
-def validate(command: str) -> List[str]:
+def _shell_alternative(operator: str) -> str:
+    """What to do instead, named for the operator that was used.
+
+    "Run one program per call" is true and useless: it says what is forbidden without
+    saying how to get the result. A live RE run spent three of its eighteen steps
+    retrying pipes against that message, because nothing in it suggested a different
+    approach. A refusal is part of the interface — if the model cannot act on it, it
+    retries until the budget is gone.
+    """
+    if operator in ("|",):
+        return (
+            "The command's full output is returned to you, so there is nothing to pipe "
+            "into: run it without the pipe and read the result. To search inside files "
+            "rather than output, use the grep tool."
+        )
+    if operator in (">", ">>", "<"):
+        return (
+            "Output is returned to you rather than written to a file, so redirection is "
+            "not needed. To create a file, use apply_patch."
+        )
+    if operator in ("&&", "||", ";", "\n"):
+        return "Make one call per program; you will see each result before deciding the next."
+    if operator in ("`", "$("):
+        return (
+            "Substitute the value yourself: run the inner command in its own call, read "
+            "the result, then use it in the next command."
+        )
+    if operator == "&":
+        return "Everything runs in the foreground and returns when it finishes."
+    return "Run one program per call."
+
+
+def validate(command: str, mode: str = DEFAULT_MODE) -> List[str]:
     """Parse and check a command, returning argv. Raises CommandRejected."""
+    table = rules_for(mode)
     if not command or not command.strip():
         raise CommandRejected("No command given.")
 
@@ -214,7 +306,7 @@ def validate(command: str) -> List[str]:
     if found:
         raise CommandRejected(
             f"Commands are run directly, not through a shell, so '{found}' has no meaning "
-            "here. Run one program per call."
+            f"here. {_shell_alternative(found)}"
         )
 
     program = os.path.basename(argv[0])
@@ -235,12 +327,19 @@ def validate(command: str) -> List[str]:
     if program in extra_commands():
         return argv
 
-    rule = _RULES.get(program)
+    rule = table.get(program)
     if rule is None:
-        raise CommandRejected(
-            f"'{program}' is not an allowed program. Allowed: {', '.join(allowed_programs())}. "
+        purpose = (
+            "This list is for static inspection of an artifact; nothing here can run it. "
+            "Running the target is dynamic analysis, which needs a VM rather than another "
+            "entry on this list."
+            if mode == "re" else
             "This list is for running tests, linters and builds; if you need something "
             "else, say so in your finish summary instead."
+        )
+        raise CommandRejected(
+            f"'{program}' is not an allowed program. Allowed: "
+            f"{', '.join(allowed_programs(mode))}. {purpose}"
         )
 
     args = argv[1:]
@@ -248,6 +347,17 @@ def validate(command: str) -> List[str]:
     if program == "python":
         _validate_python(args)
         return argv
+
+    if program == "tar":
+        _validate_tar(args)
+        return argv
+
+    if rule.required_any is not None and not rule.required_any & set(args):
+        raise CommandRejected(
+            f"'{program}' writes unless told to read, so it needs one of "
+            + ", ".join(sorted(rule.required_any))
+            + f". E.g. `{program} {sorted(rule.required_any)[0]} <file>`."
+        )
 
     if rule.subcommands is not None:
         subcommand = next((a for a in args if not a.startswith("-")), None)
@@ -307,6 +417,33 @@ def _validate_python(args: Sequence[str]) -> None:
             f"'{args[0]}' is not an allowed python flag. Use `python -m <module>` or "
             "`python <script.py>`."
         )
+
+
+def _validate_tar(args: Sequence[str]) -> None:
+    """Listing an archive is allowed; extracting or creating one is not.
+
+    Needs its own parser because tar takes a bundled flag cluster that may or may not
+    have a leading dash — `tar tf x.tar`, `tar -tf x.tar` and `tar --list -f x.tar`
+    are all the same request, and `tar xf x.tar` unpacks over the working directory.
+    """
+    if not args:
+        raise CommandRejected("tar needs arguments, e.g. `tar -tf archive.tar`.")
+
+    long_forms = {a for a in args if a.startswith("--")}
+    if long_forms & {"--extract", "--create", "--append", "--update", "--delete"}:
+        raise CommandRejected("tar may only list an archive here, not extract or modify one.")
+
+    # The mode letter lives in the first non-`--` argument, dash or not.
+    cluster = next((a for a in args if not a.startswith("--")), "")
+    letters = set(cluster.lstrip("-"))
+    writing = letters & set("xcruAd")
+    if writing:
+        raise CommandRejected(
+            f"tar '{''.join(sorted(writing))}' would extract or modify the archive. "
+            "Only listing is allowed: `tar -tf archive.tar`."
+        )
+    if "t" not in letters and "--list" not in long_forms:
+        raise CommandRejected("tar needs 't' (list), e.g. `tar -tf archive.tar`.")
 
 
 def _child_env() -> Dict[str, str]:
@@ -370,10 +507,15 @@ async def run_command(
     command: str,
     cwd: Optional[str] = None,
     timeout: Optional[float] = None,
+    mode: str = DEFAULT_MODE,
 ) -> ToolResult:
-    """Run one allowlisted program in the workspace and return its output."""
+    """Run one allowlisted program in the workspace and return its output.
+
+    `mode` selects which allowlist applies and is set by the agent loop, never by the
+    model — otherwise RE mode could ask for the coding table and run the artifact.
+    """
     try:
-        argv = validate(command)
+        argv = validate(command, mode)
     except CommandRejected as exc:
         return ToolResult(False, str(exc))
 

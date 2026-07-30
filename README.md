@@ -134,6 +134,43 @@ allowlisted environment so a repo's test suite is never handed your API keys. Ex
 the program list per machine with `SKIPPY_EXTRA_COMMANDS`; installers and anything that
 fetches are excluded by default.
 
+### Reverse-engineering mode
+
+```python
+outcome = await skippy_agent.run_task(
+    "Work out the container format and where the payload starts",
+    sandbox,
+    mode="re",
+    target="/opt/samples/firmware.bin",
+)
+```
+
+RE mode differs from coding mode in three things, and nothing else:
+
+- **The notes are the deliverable.** A coding task leaves a diff and the repo remembers
+  it; an RE task changes nothing, so anything not written down is lost when the
+  transcript folds. `note_finding` writes one markdown file per finding under
+  `notes_root()`, keyed by target, so next month's session accumulates onto this one
+  instead of re-deriving it. The loop says how many findings already exist and tells the
+  model to read them first.
+- **Evidence and confidence are mandatory.** A finding with no evidence is refused:
+  "the header is 32 bytes" is worthless later, "`otool -h` reports sizeofcmds 0x20" can
+  be rechecked. Confidence is `speculative` / `likely` / `confirmed`, recorded
+  separately, because the thing that ruins an investigation is a guess getting cited as
+  fact by everything built on it. Corrections supersede rather than overwrite, and a
+  superseded finding is marked as such on every path that reads it.
+- **It cannot run the artifact.** There is no `apply_patch`, and `run_command` switches
+  to an inspection-only allowlist: `file`, `strings`, `nm`, `otool`, `objdump`,
+  `dwarfdump`, `xxd`, `c++filt` and friends, with no interpreter, build tool or test
+  runner in it. Tools that read by default and write when asked are constrained to their
+  read-only form — `lipo -info` yes, `lipo -create` no; `plutil -p` yes, `-convert` no;
+  `tar -tf` yes, `tar xf` no. The mode is set by the loop and stripped from the model's
+  arguments, so it cannot ask for the coding table.
+
+Static inspection only. Running the target under a debugger is a real need and wants a
+VM, not another entry in the allowlist; the refusal says so, and the model records the
+question instead. See [ADR 0012](docs/adr/0012-reverse-engineering-mode.md).
+
 ### Why transcripts are append-only
 
 `mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
@@ -155,6 +192,7 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
 | `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
+| `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings that outlive the session |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
 | `prompts.py` | The system prompt, and the fold-summary extraction prompt |

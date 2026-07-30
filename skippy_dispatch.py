@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 import skippy_edit
 import skippy_exec
 import skippy_fs
+import skippy_re
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
 
 logger = logging.getLogger("skippy_dispatch")
@@ -31,7 +32,12 @@ _SYNC_TOOLS = {
     "read_file": skippy_fs.read_file,
     "glob_files": skippy_fs.glob_files,
     "apply_patch": skippy_edit.apply_patch,
+    "note_finding": skippy_re.note_finding,
+    "read_notes": skippy_re.read_notes,
 }
+
+# These take a `pack` the loop opens, and only exist when there is one.
+_NOTES_TOOLS = ("note_finding", "read_notes")
 
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,
@@ -52,7 +58,7 @@ def _expected(name: str) -> str:
         return ""
     params = [
         p for p in inspect.signature(handler).parameters
-        if p not in ("sandbox", "journal_dir")
+        if p not in ("sandbox", "journal_dir", "mode", "pack")
     ]
     return ", ".join(params)
 
@@ -62,6 +68,8 @@ async def dispatch(
     args: Optional[dict],
     sandbox: Sandbox,
     journal_dir: Optional[str] = None,
+    mode: str = skippy_exec.DEFAULT_MODE,
+    notes_pack: Optional[Any] = None,
 ) -> ToolResult:
     """Run one tool. Never raises."""
     args: Dict[str, Any] = dict(args or {})
@@ -90,16 +98,32 @@ async def dispatch(
             str(raw)[:400],
         )
 
-    # Never model-controlled.
-    args.pop("sandbox", None)
-    args.pop("journal_dir", None)
+    # Never model-controlled. `mode` belongs here for the same reason as the sandbox:
+    # a model in RE mode that could request the coding table could execute the
+    # artifact it was asked to analyse, which is the one thing the split prevents.
+    for injected in ("sandbox", "journal_dir", "mode", "pack"):
+        args.pop(injected, None)
     if name == "apply_patch" and journal_dir:
         args["journal_dir"] = journal_dir
+    if name == "run_command":
+        args["mode"] = mode
+    # The notes tools write to a pack rather than to the workspace, so they take the
+    # pack as their first argument where every other tool takes the sandbox.
+    if name in _NOTES_TOOLS:
+        if notes_pack is None:
+            return ToolResult(
+                False,
+                f"'{name}' needs a note pack, which only reverse-engineering mode opens. "
+                "This looks like a coding task; record what you found in your finish summary.",
+            )
+        first = notes_pack
+    else:
+        first = sandbox
 
     try:
         if name in _SYNC_TOOLS:
-            return await asyncio.to_thread(handler, sandbox, **args)
-        return await handler(sandbox, **args)
+            return await asyncio.to_thread(handler, first, **args)
+        return await handler(first, **args)
     except SandboxError as exc:
         # Expected often enough to be a normal observation rather than an error:
         # the model asked for something outside the workspace and needs to know.

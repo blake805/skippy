@@ -23,7 +23,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import prompts
 import skippy_dispatch
+import skippy_exec
 import skippy_llm
+import skippy_paths
+import skippy_re
 import tool_schemas
 from skippy_sandbox import Sandbox, ToolResult, cap_text
 
@@ -85,6 +88,10 @@ class AgentOutcome:
     steps: int = 0
     files_changed: List[str] = field(default_factory=list)
     tool_calls: int = 0
+    # The RE equivalent of files_changed: what the run left behind. Zero for a coding
+    # run, which has no pack.
+    findings: int = 0
+    pack_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -109,9 +116,18 @@ class AgentLoop:
         journal_dir: Optional[str] = None,
         role: Optional[str] = None,
         extra_context: str = "",
+        mode: str = skippy_exec.DEFAULT_MODE,
+        notes_root: Optional[str] = None,
+        target: str = "",
     ):
         if not task or not str(task).strip():
             raise ValueError("An agent run needs a task.")
+
+        self.mode = str(mode or skippy_exec.DEFAULT_MODE).lower()
+        if self.mode not in skippy_exec.MODES:
+            raise ValueError(
+                f"Unknown mode {mode!r}. Known modes: {', '.join(sorted(skippy_exec.MODES))}."
+            )
 
         self.task = str(task).strip()
         self.sandbox = sandbox
@@ -132,10 +148,28 @@ class AgentLoop:
         self._recent_calls: List[str] = []
         self._folds = 0
 
-        self.transcript = skippy_llm.Transcript(system=prompts.AGENT_SYSTEM)
+        # RE mode gets a pack keyed by the target, so a second session on the same
+        # artifact accumulates onto the first instead of starting over. The loop opens
+        # it, never the model — see `open_pack`.
+        self.notes_pack = None
+        if self.mode == "re":
+            root = notes_root or skippy_paths.notes_root()
+            self.notes_pack = skippy_re.open_pack(
+                root, target=target or "", title=self.task[:80]
+            )
+
+        system = prompts.RE_SYSTEM if self.mode == "re" else prompts.AGENT_SYSTEM
+        self.transcript = skippy_llm.Transcript(system=system)
         opening = "Workspace roots:\n" + "\n".join(
             f"- {sandbox.relative(root)} ({root})" for root in sandbox.roots
         )
+        if self.notes_pack is not None:
+            findings = len(self.notes_pack.finding_files())
+            opening += f"\n\nNote pack: {self.notes_pack.pack_id} ({findings} finding(s) so far)"
+            if findings:
+                # Said here rather than left to the prompt, because the single most
+                # wasteful thing an RE session can do is re-derive last week's work.
+                opening += ". Call read_notes before starting; this target has been looked at before."
         if extra_context:
             opening += f"\n\n{extra_context}"
         self.transcript.append({"role": "user", "content": f"{opening}\n\nTask: {self.task}"})
@@ -159,7 +193,10 @@ class AgentLoop:
             self._emit = None
 
     def tools(self) -> List[dict]:
-        return tool_schemas.workspace_tools() + [FINISH_SCHEMA]
+        offered = (
+            tool_schemas.re_tools() if self.mode == "re" else tool_schemas.workspace_tools()
+        )
+        return offered + [FINISH_SCHEMA]
 
     # -- the loop ---------------------------------------------------------
 
@@ -201,6 +238,8 @@ class AgentLoop:
             steps=self.step,
             files_changed=list(self.files_changed),
             tool_calls=self.tool_calls,
+            findings=len(self.notes_pack.finding_files()) if self.notes_pack else 0,
+            pack_id=self.notes_pack.pack_id if self.notes_pack else "",
         )
 
     async def _loop(self) -> AgentOutcome:
@@ -273,10 +312,16 @@ class AgentLoop:
                         self.files_changed.append(path)
                 return self._outcome("finished", summary)
 
-        changed = ", ".join(self.files_changed) or "none"
+        # What survived the run is mode-specific, and reporting the wrong one makes a
+        # productive run look empty: an RE run never changes a file, so "files changed:
+        # none" is both true and actively misleading about work that is sitting on disk.
+        if self.notes_pack is not None:
+            kept = f"Findings recorded: {len(self.notes_pack.finding_files())} in pack {self.notes_pack.pack_id}"
+        else:
+            kept = f"Files changed: {', '.join(self.files_changed) or 'none'}"
         return self._outcome(
             "max_steps",
-            f"Ran out of steps after {self.max_steps} without finishing. Files changed: {changed}.",
+            f"Ran out of steps after {self.max_steps} without finishing. {kept}.",
         )
 
     async def _run_tool(self, call: dict) -> ToolResult:
@@ -299,7 +344,8 @@ class AgentLoop:
             )
         else:
             result = await skippy_dispatch.dispatch(
-                name, args, self.sandbox, journal_dir=self.journal_dir
+                name, args, self.sandbox, journal_dir=self.journal_dir,
+                mode=self.mode, notes_pack=self.notes_pack,
             )
 
         # apply_patch is the only tool that reports files, and it reports them the
@@ -422,9 +468,13 @@ async def run_task(
     emit: Optional[Callable[[dict], Awaitable[None]]] = None,
     journal_dir: Optional[str] = None,
     role: Optional[str] = None,
+    mode: str = skippy_exec.DEFAULT_MODE,
+    notes_root: Optional[str] = None,
+    target: str = "",
 ) -> AgentOutcome:
     """Convenience entry point for one task."""
     loop = AgentLoop(
-        task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir, role=role
+        task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir,
+        role=role, mode=mode, notes_root=notes_root, target=target,
     )
     return await loop.run()
