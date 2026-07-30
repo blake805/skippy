@@ -28,6 +28,11 @@ large file.
 - When a tool fails, read what it says and fix the cause. Do not retry the same \
 call unchanged.
 - Match the conventions of the code you are editing rather than your own defaults.
+- After changing code, run the tests. Reading your own edit back only confirms what \
+you wrote, not that it works. If the project has a test suite, run it; if your change \
+should have a test, add one and watch it pass. A change you have not executed is a \
+guess.
+- If tests fail, fix the cause rather than the test, unless the test is what is wrong.
 
 When the task is done, call finish with a summary of what you changed and why. If \
 you cannot complete it, call finish anyway and explain precisely what is blocking \

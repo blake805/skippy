@@ -12,6 +12,7 @@ import inspect
 import pytest
 
 import skippy_edit
+import skippy_exec
 import skippy_fs
 import tool_schemas
 
@@ -22,6 +23,7 @@ IMPLEMENTED = {
     "grep": skippy_fs.grep,
     "glob_files": skippy_fs.glob_files,
     "apply_patch": skippy_edit.apply_patch,
+    "run_command": skippy_exec.run_command,
 }
 
 
@@ -71,15 +73,16 @@ def test_every_required_parameter_is_actually_required(name, function):
     assert mandatory <= required, f"{name} omits required parameters: {mandatory - required}"
 
 
-def test_the_write_tool_is_not_in_the_read_only_set():
-    """Handing out apply_patch by accident is the mistake worth a test."""
+def test_the_mutating_tools_are_not_in_the_read_only_set():
+    """Handing out apply_patch or run_command by accident is the mistake worth a test."""
     read_only = {t["function"]["name"] for t in tool_schemas.filesystem_tools()}
     assert "apply_patch" not in read_only
+    assert "run_command" not in read_only
 
 
-def test_workspace_tools_include_both_halves():
+def test_workspace_tools_include_read_write_and_verify():
     names = {t["function"]["name"] for t in tool_schemas.workspace_tools()}
-    assert {"read_file", "grep", "apply_patch"} <= names
+    assert {"read_file", "grep", "apply_patch", "run_command"} <= names
 
 
 def test_wrapped_schemas_have_the_shape_the_api_expects():

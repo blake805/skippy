@@ -142,6 +142,39 @@ _SCHEMAS = {
             "required": ["query"],
         },
     },
+    "run_command": {
+        "description": (
+            "Runs a test runner, linter, type checker or build tool in the workspace and "
+            "returns its output. Use this to check that a change actually works — it is the "
+            "only way to find out, since reading your own edit back only confirms what you "
+            "wrote. Commands run directly, not through a shell, so pipes and && do not "
+            "work; run one program per call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "The command, e.g. 'python -m pytest -q' or 'ruff check .'. Only test "
+                        "runners, linters, builds and read-only git are permitted."
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": (
+                        "Directory to run in, relative to the workspace root. Required when "
+                        "there is more than one workspace root."
+                    ),
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds before the command is killed. Defaults to 300.",
+                },
+            },
+            "required": ["command"],
+        },
+    },
     "apply_patch": {
         "description": (
             "Edits, creates and deletes files. This is the only way to change anything, "
@@ -221,6 +254,7 @@ def _wrap(name: str) -> dict:
 
 FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 WRITE_TOOLS = ("apply_patch",)
+EXEC_TOOLS = ("run_command",)
 
 
 def filesystem_tools() -> list:
@@ -229,8 +263,8 @@ def filesystem_tools() -> list:
 
 
 def workspace_tools() -> list:
-    """Read and write. What an agent needs to actually finish a coding task."""
-    return [_wrap(name) for name in FILESYSTEM_TOOLS + WRITE_TOOLS]
+    """Read, write and verify. What an agent needs to actually finish a coding task."""
+    return [_wrap(name) for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS]
 
 
 def research_tools() -> list:
