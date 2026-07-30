@@ -8,6 +8,8 @@
 # The workspace tools (read, search, patch) live here alongside the research and
 # context half of the toolset. Terminal execution arrives with the agent runtime.
 
+import skippy_re
+
 _SCHEMAS = {
     "list_dir": {
         "description": (
@@ -175,6 +177,102 @@ _SCHEMAS = {
             "required": ["command"],
         },
     },
+    "note_finding": {
+        "description": (
+            "Records one thing you have established about the target. In a "
+            "reverse-engineering session nothing is written to the target, so these notes "
+            "are the entire product of the work — anything not recorded here is lost when "
+            "the session ends. Write a finding as soon as you establish it rather than "
+            "saving them all for the end. Every finding needs evidence: where you saw it, "
+            "so it can be rechecked later. If a later finding contradicts an earlier one, "
+            "record the new one with 'supersedes' rather than pretending the first never "
+            "happened."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(skippy_re.KINDS),
+                    "description": (
+                        "structure: layout, headers, offsets, field meanings. "
+                        "behavior: what a routine or component does. "
+                        "constant: magic numbers, keys, tables. "
+                        "symbol: names, mangling, imports, exports. "
+                        "hypothesis: a theory you have a reason for but have not confirmed. "
+                        "question: something you do not understand yet, recorded so it is "
+                        "not rediscovered from scratch next session."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": "One line, specific. 'Field at 0x10 is a CRC32', not 'header info'.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "What you found, in enough detail to be useful to someone who has "
+                        "not seen the target. For a hypothesis, say what would confirm or "
+                        "refute it."
+                    ),
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": (
+                        "Where you saw this: an offset, a symbol name, the command you ran "
+                        "and the part of its output that shows it. Required for everything "
+                        "except a 'question'. 'The header is 32 bytes' is worthless in six "
+                        "months; 'otool -h reports sizeofcmds 0x20' can be rechecked."
+                    ),
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": list(skippy_re.CONFIDENCE),
+                    "description": (
+                        "confirmed: you verified it. likely: strong inference, not verified. "
+                        "speculative: a guess. Be honest here — a guess recorded as a fact "
+                        "gets cited as one by everything that follows."
+                    ),
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Where in the target, if it has a place: an offset, address, symbol or file.",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "Id(s) of findings this replaces, comma-separated. The old finding is "
+                        "kept and marked, not deleted: being wrong and then right is normal, "
+                        "and the correction is itself worth recording."
+                    ),
+                },
+            },
+            "required": ["kind", "title", "body", "confidence"],
+        },
+    },
+    "read_notes": {
+        "description": (
+            "Reads back what you have already established about this target, including "
+            "findings from earlier sessions. Call this at the start of an investigation "
+            "before re-deriving anything, and again later if you have lost track — the "
+            "conversation gets compacted as it grows, but the notes do not."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "finding_id": {
+                    "type": "string",
+                    "description": "A single finding to read in full, e.g. '3'. Omit for the summary.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(skippy_re.KINDS),
+                    "description": "Read every finding of one kind. Omit for the summary of all of them.",
+                },
+            },
+            "required": [],
+        },
+    },
     "apply_patch": {
         "description": (
             "Edits, creates and deletes files. This is the only way to change anything, "
@@ -255,6 +353,7 @@ def _wrap(name: str) -> dict:
 FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
+NOTES_TOOLS = ("note_finding", "read_notes")
 
 
 def filesystem_tools() -> list:
@@ -265,6 +364,12 @@ def filesystem_tools() -> list:
 def workspace_tools() -> list:
     """Read, write and verify. What an agent needs to actually finish a coding task."""
     return [_wrap(name) for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS]
+
+
+def re_tools() -> list:
+    """Read, inspect and record. No apply_patch: an RE session does not change the
+    artifact, and the notes are the deliverable rather than a diff."""
+    return [_wrap(name) for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS]
 
 
 def research_tools() -> list:

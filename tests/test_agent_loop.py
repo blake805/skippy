@@ -555,3 +555,192 @@ def test_dispatch_never_exposes_the_sandbox_as_a_model_argument():
     import skippy_dispatch
     assert "sandbox" not in skippy_dispatch._expected("read_file")
     assert "journal_dir" not in skippy_dispatch._expected("apply_patch")
+
+
+# --- reverse-engineering mode ---
+#
+# The two modes differ in what the loop hands the model: RE mode can read, inspect
+# and record, but has no way to change the artifact or to run it. Everything below
+# is about that boundary holding at the loop level, since that is where the mode is
+# chosen.
+
+def tool_names(loop):
+    return {t["function"]["name"] for t in loop.tools()}
+
+
+def test_re_mode_offers_notes_tools_and_no_way_to_edit(box, tmp_path):
+    loop = skippy_agent.AgentLoop(
+        "Work out the file format", box, mode="re", notes_root=str(tmp_path / "notes")
+    )
+    offered = tool_names(loop)
+    assert {"note_finding", "read_notes"} <= offered
+    # The artifact is not ours to change, and an RE run that edited it would have
+    # destroyed the evidence for its own findings.
+    assert "apply_patch" not in offered
+
+
+def test_coding_mode_offers_editing_and_no_notes_tools(box):
+    offered = tool_names(skippy_agent.AgentLoop("Fix the bug", box))
+    assert "apply_patch" in offered
+    assert "note_finding" not in offered
+
+
+def test_the_two_modes_use_different_system_prompts(box, tmp_path):
+    import prompts
+
+    coding = skippy_agent.AgentLoop("t", box)
+    re_loop = skippy_agent.AgentLoop("t", box, mode="re", notes_root=str(tmp_path / "n"))
+    assert coding.transcript.messages[0]["content"] == prompts.AGENT_SYSTEM
+    assert re_loop.transcript.messages[0]["content"] == prompts.RE_SYSTEM
+
+
+def test_an_unknown_mode_is_refused_at_construction(box):
+    """Rather than falling back to coding, which would silently grant the wider
+    command table and the ability to edit."""
+    with pytest.raises(ValueError, match="Unknown mode"):
+        skippy_agent.AgentLoop("t", box, mode="reverse-engineering")
+
+
+def test_re_mode_opens_a_pack_keyed_by_the_target(box, tmp_path):
+    notes = str(tmp_path / "notes")
+    first = skippy_agent.AgentLoop("Look at it", box, mode="re", notes_root=notes,
+                                   target="/opt/libfoo.dylib")
+    again = skippy_agent.AgentLoop("Look again", box, mode="re", notes_root=notes,
+                                   target="/opt/libfoo.dylib")
+    assert first.notes_pack.pack_id == again.notes_pack.pack_id
+
+
+def test_coding_mode_opens_no_pack(box):
+    assert skippy_agent.AgentLoop("t", box).notes_pack is None
+
+
+def test_an_earlier_session_is_pointed_out_in_the_opening_message(box, tmp_path):
+    """Re-deriving last week's conclusions is the most wasteful thing an RE session
+    can do, so the loop says so up front rather than hoping the model asks."""
+    import skippy_re
+
+    notes = str(tmp_path / "notes")
+    first = skippy_agent.AgentLoop("Look at it", box, mode="re", notes_root=notes,
+                                   target="/opt/libfoo.dylib")
+    skippy_re.note_finding(
+        first.notes_pack, kind="structure", title="Header is 32 bytes",
+        body="Load commands start at 0x20.", evidence="otool -h", confidence="confirmed",
+    )
+
+    resumed = skippy_agent.AgentLoop("Continue", box, mode="re", notes_root=notes,
+                                     target="/opt/libfoo.dylib")
+    opening = resumed.transcript.messages[1]["content"]
+    assert "1 finding" in opening
+    assert "read_notes" in opening
+
+
+def test_a_fresh_pack_does_not_claim_prior_findings(box, tmp_path):
+    loop = skippy_agent.AgentLoop("New target", box, mode="re",
+                                  notes_root=str(tmp_path / "notes"), target="/opt/new.bin")
+    assert "0 finding" in loop.transcript.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_finding_recorded_mid_run_survives_the_run(box, tmp_path, routed_llm):
+    """The notes are the deliverable, so they have to be written as findings are
+    established rather than assembled at the end — a run that stops early should
+    still leave behind what it learned before it stopped."""
+    import skippy_re
+
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call(
+            "note_finding", call_id="c1",
+            kind="structure", title="Magic is 0xCAFEBABE",
+            body="The first four bytes are 0xCAFEBABE, a fat Mach-O.",
+            evidence="xxd -l 4 shows cafebabe", confidence="confirmed",
+        ),
+        finish("Identified the container format.", call_id="c2"),
+    ])
+    outcome = await skippy_agent.run_task(
+        "Identify the format", box, mode="re", notes_root=notes, target="/opt/libfoo.dylib"
+    )
+    assert outcome.status == "finished"
+
+    pack = skippy_re.open_pack(notes, target="/opt/libfoo.dylib")
+    assert "0xCAFEBABE" in skippy_re.read_notes(pack).content
+
+
+@pytest.mark.asyncio
+async def test_the_notes_tools_are_unavailable_in_coding_mode(box, routed_llm):
+    """A coding run that called note_finding would get a pack-less failure; the
+    message has to send it somewhere useful instead of just refusing."""
+    outcome = await run(box, [
+        fl.tool_call("note_finding", call_id="c1", kind="structure", title="x",
+                     body="y", evidence="z", confidence="likely"),
+        finish(call_id="c2"),
+    ], routed_llm)
+
+    observations = routed_llm.observations()
+    assert any("finish summary" in o for o in observations)
+    assert outcome.status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_re_mode_cannot_run_the_artifact_through_the_loop(box, routed_llm, tmp_path):
+    """The end-to-end version of the mode split: the loop picks the command table, so
+    a model in RE mode asking to execute something is refused with the reason."""
+    routed_llm.load([
+        fl.tool_call("run_command", call_id="c1", command="python -m pytest"),
+        finish("Cannot run it.", call_id="c2"),
+    ])
+    await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"), target="x.bin"
+    )
+    assert any("static inspection" in o for o in routed_llm.observations())
+
+
+@pytest.mark.asyncio
+async def test_re_mode_can_still_inspect(box, routed_llm, tmp_path, repo):
+    (repo / "sample.bin").write_bytes(b"\x00MAGICSTRING\x00" + b"\xff" * 32)
+    routed_llm.load([
+        fl.tool_call("run_command", call_id="c1", command="strings -n 6 sample.bin"),
+        finish("Found a string.", call_id="c2"),
+    ])
+    await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"), target="sample.bin"
+    )
+    assert any("MAGICSTRING" in o for o in routed_llm.observations())
+
+
+@pytest.mark.asyncio
+async def test_an_re_run_out_of_steps_reports_findings_not_files(box, tmp_path, routed_llm):
+    """An RE run never changes a file, so "files changed: none" is true and actively
+    misleading about four findings sitting on disk. Observed on the first live run.
+    """
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call("note_finding", call_id="c1", kind="structure",
+                     title="Universal binary with two slices",
+                     body="x86_64 and arm64e.", evidence="lipo -info reports both",
+                     confidence="confirmed"),
+        # No finish: the run hits the step ceiling with work already recorded.
+        fl.tool_call("read_notes", call_id="c2"),
+    ])
+    outcome = await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=notes, target="x.bin", max_steps=2
+    )
+
+    assert outcome.status == "max_steps"
+    assert "Findings recorded: 1" in outcome.summary
+    assert "Files changed" not in outcome.summary
+    # Available as data too, so a UI does not have to read the prose.
+    assert outcome.findings == 1
+    assert outcome.pack_id
+
+
+@pytest.mark.asyncio
+async def test_a_coding_run_out_of_steps_still_reports_files(box, routed_llm):
+    routed_llm.load([
+        fl.tool_call("read_file", call_id="c1", path="calc/ops.py"),
+        fl.tool_call("read_file", call_id="c2", path="README.md"),
+    ])
+    outcome = await skippy_agent.run_task("Fix it", box, max_steps=2)
+    assert outcome.status == "max_steps"
+    assert "Files changed" in outcome.summary
+    assert outcome.findings == 0

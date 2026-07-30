@@ -601,3 +601,228 @@ async def test_a_refused_command_reads_as_an_error_to_the_model(box):
     result = await skippy_dispatch.dispatch("run_command", {"command": "rm -rf /"}, box)
     assert not result.ok
     assert result.as_observation().startswith("ERROR: ")
+
+
+# --- the two execution modes ---
+#
+# Coding mode runs the repo's own tests, which means running repo-defined code by
+# design. RE mode analyses someone else's artifact, where running it is the thing
+# that must not happen by accident. Same tool, two tables.
+
+def test_re_mode_cannot_run_anything(box):
+    """The point of the split. Every one of these executes code, and in RE mode the
+    code in question belongs to the artifact under analysis."""
+    for command in (
+        "python -m pytest",
+        "pytest",
+        "node index.js",
+        "make",
+        "cargo test",
+        "go test ./...",
+        "npm test",
+        "swift test",
+        "ruby script.rb",
+    ):
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate(command, mode="re")
+
+
+def test_the_re_refusal_explains_that_running_it_needs_a_vm(box):
+    """A refusal the model cannot act on becomes a retry. This one says what the
+    actual answer is, so it stops asking."""
+    with pytest.raises(skippy_exec.CommandRejected) as exc:
+        skippy_exec.validate("python -m pytest", mode="re")
+    message = str(exc.value)
+    assert "static inspection" in message
+    assert "VM" in message
+
+
+@pytest.mark.parametrize("command", [
+    "file target.dylib",
+    "strings -n 8 target.dylib",
+    "nm -gU target.dylib",
+    "otool -h target.dylib",
+    "objdump -d target.dylib",
+    "xxd target.dylib",
+    "hexdump -C target.dylib",
+    "size target.dylib",
+    "dwarfdump target.dylib",
+    "c++filt _ZN3fooEv",
+])
+def test_re_mode_allows_static_inspection(command):
+    assert skippy_exec.validate(command, mode="re")[0] == command.split()[0]
+
+
+def test_coding_mode_still_runs_tests(box):
+    assert skippy_exec.validate("pytest -q", mode="coding")
+
+
+def test_the_default_mode_is_coding(box):
+    assert skippy_exec.validate("pytest -q") == ["pytest", "-q"]
+
+
+def test_an_unknown_mode_is_refused_rather_than_falling_back(box):
+    """Falling back to a default would mean a typo in the mode silently grants the
+    wider table, which is the wrong direction to fail."""
+    with pytest.raises(skippy_exec.CommandRejected) as exc:
+        skippy_exec.validate("file x", mode="reverse")
+    assert "Unknown execution mode" in str(exc.value)
+
+
+# --- tools that read by default and write when asked ---
+#
+# The trap in the RE table: these are all legitimate inspection tools whose own
+# flags turn them into writers, so allowlisting the program name is not enough.
+
+@pytest.mark.parametrize("command,allowed", [
+    ("lipo -info target", True),
+    ("lipo -archs target", True),
+    ("lipo -detailed_info target", True),
+    ("lipo target -thin arm64 -output out", False),
+    ("lipo -create a b -output c", False),
+    ("lipo -remove arm64 target -output out", False),
+    ("codesign -d --entitlements - target", True),
+    ("codesign -dv target", True),
+    ("codesign -s ident target", False),
+    ("codesign -f -s ident target", False),
+    ("codesign --remove-signature target", False),
+    ("plutil -p Info.plist", True),
+    ("plutil -lint Info.plist", True),
+    ("plutil -convert xml1 Info.plist", False),
+    ("plutil -replace Key -string v Info.plist", False),
+    ("unzip -l app.ipa", True),
+    ("unzip -p app.ipa file", True),
+    ("unzip app.ipa", False),
+    ("unzip -o app.ipa", False),
+    ("xxd target", True),
+    ("xxd -r dump", False),
+])
+def test_read_only_flags_are_required_where_the_default_writes(command, allowed):
+    if allowed:
+        assert skippy_exec.validate(command, mode="re")
+    else:
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate(command, mode="re")
+
+
+def test_the_write_by_default_refusal_names_a_working_alternative(box):
+    with pytest.raises(skippy_exec.CommandRejected) as exc:
+        skippy_exec.validate("unzip app.ipa", mode="re")
+    message = str(exc.value)
+    assert "-l" in message
+
+
+@pytest.mark.parametrize("command,allowed", [
+    ("tar -tf archive.tar", True),
+    ("tar tf archive.tar", True),
+    ("tar -tvf archive.tar", True),
+    ("tar --list -f archive.tar", True),
+    ("tar xf archive.tar", False),
+    ("tar -xf archive.tar", False),
+    ("tar -xzf archive.tar.gz", False),
+    ("tar cf archive.tar dir", False),
+    ("tar --extract -f archive.tar", False),
+    ("tar --create -f archive.tar dir", False),
+    ("tar -rf archive.tar extra", False),
+    ("tar -df archive.tar", False),
+    ("tar archive.tar", False),
+])
+def test_tar_may_only_list(command, allowed):
+    """tar needs its own parser: the mode letter may or may not have a leading dash,
+    and it arrives bundled with the others, so `xf` and `tf` differ by one character
+    in a cluster that a flag set cannot see."""
+    if allowed:
+        assert skippy_exec.validate(command, mode="re")
+    else:
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate(command, mode="re")
+
+
+def test_git_stays_read_only_in_re_mode():
+    assert skippy_exec.validate("git log --oneline", mode="re")
+    with pytest.raises(skippy_exec.CommandRejected):
+        skippy_exec.validate("git push", mode="re")
+
+
+def test_no_interpreter_or_build_tool_is_in_the_inspection_table():
+    """Guards the table itself, so a later addition has to be deliberate."""
+    executors = {
+        "python", "python3", "node", "ruby", "perl", "php", "pytest", "make",
+        "cargo", "go", "npm", "npx", "yarn", "pnpm", "swift", "gradle", "mvn",
+        "cmake", "bazel", "dotnet", "tox", "rake", "sh", "bash", "zsh",
+    }
+    assert not (executors & set(skippy_exec.INSPECTION_RULES))
+
+
+def test_both_tables_share_the_shell_and_path_rules():
+    """The mode picks the program table, not the parsing rules."""
+    for mode in ("coding", "re"):
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate("file x; rm -rf /", mode=mode)
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate("./file x", mode=mode)
+        with pytest.raises(skippy_exec.CommandRejected):
+            skippy_exec.validate("file x | sh", mode=mode)
+
+
+@pytest.mark.asyncio
+async def test_the_mode_is_not_model_controlled(box, repo):
+    """A model in RE mode that could ask for the coding table could run the artifact
+    it is analysing, which is the one thing the split exists to prevent."""
+    import skippy_dispatch
+
+    result = await skippy_dispatch.dispatch(
+        "run_command",
+        {"command": f"{os.path.basename(sys.executable)} -m pytest -q tests/", "mode": "coding"},
+        box,
+        mode="re",
+    )
+    assert not result.ok
+    assert "static inspection" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_re_mode_actually_inspects_a_real_file(box, repo):
+    (repo / "sample.bin").write_bytes(b"\x00\x01MAGICSTRING\x00\x02" + b"\xff" * 64)
+    result = await run_command(box, "strings -n 6 sample.bin", mode="re")
+    assert result.ok
+    assert "MAGICSTRING" in result.content
+
+
+@pytest.mark.asyncio
+async def test_the_extra_commands_escape_hatch_is_per_user_not_per_mode(box, monkeypatch):
+    """SKIPPY_EXTRA_COMMANDS is the user's decision and applies in both modes; the
+    model cannot reach it."""
+    monkeypatch.setenv("SKIPPY_EXTRA_COMMANDS", "radare2")
+    assert skippy_exec.validate("radare2 -v", mode="re")
+    assert skippy_exec.validate("radare2 -v", mode="coding")
+
+
+# --- refusals have to name the alternative ---
+#
+# A live RE run spent three of eighteen steps retrying pipes, because the refusal said
+# what was forbidden without saying how to get the result. A refusal the model cannot
+# act on is a retry loop that ends when the budget does.
+
+@pytest.mark.parametrize("command,expected", [
+    ("nm target | grep foo", "grep tool"),
+    ("otool -tv target > out.txt", "apply_patch"),
+    ("file a && file b", "one call per program"),
+    ("file a; file b", "one call per program"),
+    ("strings `which ls`", "inner command"),
+    ("strings $(which ls)", "inner command"),
+    ("pytest &", "foreground"),
+])
+def test_a_shell_operator_refusal_names_what_to_do_instead(command, expected):
+    with pytest.raises(skippy_exec.CommandRejected) as exc:
+        skippy_exec.validate(command)
+    assert expected in str(exc.value), f"{command!r} -> {exc.value}"
+
+
+def test_every_rejected_operator_gets_a_specific_alternative():
+    """Guards the mapping itself: a new operator added to the detector without an
+    alternative would fall back to the generic text that caused the retry loop."""
+    for operator in ("|", ">", ">>", "<", "&&", "||", ";", "`", "$(", "&", "\n"):
+        assert skippy_exec._shell_alternative(operator) != "Run one program per call.", (
+            f"{operator!r} has no specific alternative"
+        )

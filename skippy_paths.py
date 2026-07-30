@@ -67,6 +67,22 @@ def patch_journal_root(ensure: bool = True) -> str:
     return path
 
 
+def notes_root(ensure: bool = True) -> str:
+    """Reverse-engineering note packs.
+
+    Plain files rather than a Chroma collection, and outside the workspace roots. RE
+    findings are the durable product of a session — often the only product, since the
+    target is not being changed — so they must survive an unmounted NAS, be readable
+    without Skippy running, and diff sensibly. Indexing them for search is a layer
+    that can be added on top; making search the storage would mean losing the notes
+    whenever the vector store is unavailable.
+    """
+    path = os.path.join(memory_root(), "notes")
+    if ensure:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
 def configured_workspace_roots() -> list:
     """The repos the agent may touch, from `SKIPPY_WORKSPACE_ROOTS` (os.pathsep).
 
