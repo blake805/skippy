@@ -158,3 +158,59 @@ def test_disconnect_deregisters_the_client(client):
     with client.websocket_connect("/ws/factory?client_id=goodbye"):
         assert "goodbye" in skippy_factory.hub.active_connections
     assert "goodbye" not in skippy_factory.hub.active_connections
+
+
+# --- where the hub listens ---
+#
+# There is no authentication on /ws/factory: client_id is a query parameter, and any
+# message that is not a reply, a greeting or a cancel starts an agent run. So the bind
+# address is the only thing between the local network and an agent that can edit the
+# workspace roots and run commands. ADR 0014 accepted the missing authentication on the
+# stated grounds that the bind was loopback; it was 0.0.0.0, and the SkippyServer boot
+# line runs `python skippy_factory.py`, which took that default.
+
+def test_the_default_bind_is_loopback(monkeypatch):
+    import skippy_factory
+
+    monkeypatch.delenv("SKIPPY_BIND_HOST", raising=False)
+    assert skippy_factory.bind_host() == "127.0.0.1"
+
+
+def test_a_deliberate_override_is_honoured(monkeypatch):
+    """Remote access is a real requirement. It just has to be asked for."""
+    import skippy_factory
+
+    monkeypatch.setenv("SKIPPY_BIND_HOST", "100.64.1.2")
+    assert skippy_factory.bind_host() == "100.64.1.2"
+
+
+def test_binding_beyond_loopback_says_so_loudly(monkeypatch, caplog):
+    """Silently exposing an unauthenticated agent is the failure being prevented."""
+    import logging
+
+    import skippy_factory
+
+    monkeypatch.setenv("SKIPPY_BIND_HOST", "0.0.0.0")
+    with caplog.at_level(logging.WARNING):
+        assert skippy_factory.bind_host() == "0.0.0.0"
+    logged = " ".join(record.getMessage() for record in caplog.records).lower()
+    assert "no authentication" in logged
+
+
+def test_loopback_does_not_warn(monkeypatch, caplog):
+    import logging
+
+    import skippy_factory
+
+    monkeypatch.setenv("SKIPPY_BIND_HOST", "127.0.0.1")
+    with caplog.at_level(logging.WARNING):
+        skippy_factory.bind_host()
+    assert not [r for r in caplog.records if "no authentication" in r.getMessage()]
+
+
+def test_an_empty_override_falls_back_to_loopback(monkeypatch):
+    """An env var that is present but blank must not become a bind to everything."""
+    import skippy_factory
+
+    monkeypatch.setenv("SKIPPY_BIND_HOST", "   ")
+    assert skippy_factory.bind_host() == "127.0.0.1"

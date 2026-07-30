@@ -295,8 +295,47 @@ async def transcribe_audio(file: UploadFile = File(...)):
         os.remove(input_path)
     return {"text": result["text"].strip()}
 
+DEFAULT_BIND_HOST = "127.0.0.1"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def bind_host() -> str:
+    """Where to listen. Loopback unless someone deliberately says otherwise.
+
+    This used to be `0.0.0.0`, which put the whole agent on the local network. There
+    is no authentication on `/ws/factory` — `client_id` is a query parameter — and any
+    message that is not a reply, a greeting or a cancel starts an agent run. So on a
+    `0.0.0.0` bind, anything that can reach port 8000 can edit files in the workspace
+    roots and run commands through `run_command`: write a script with apply_patch, run
+    it with the interpreter, and the allowlist has been walked around entirely.
+
+    ADR 0014 accepted the missing authentication on the stated grounds that the bind
+    was loopback. It was not; the app's own boot line is `python skippy_factory.py`,
+    which took this default. Binding loopback is what makes that reasoning true.
+
+    The override exists because remote access is a real requirement, and the answer
+    there is a private interface (Tailscale) rather than a public one — so a bind to a
+    non-loopback address is a deliberate act that says so out loud in the log.
+    """
+    host = os.environ.get("SKIPPY_BIND_HOST", "").strip() or DEFAULT_BIND_HOST
+    if host not in LOOPBACK_HOSTS:
+        logger.warning(
+            "Binding %s, which is not loopback. /ws/factory has no authentication and "
+            "can start agent runs, so anything that can reach this port can edit your "
+            "workspace roots and run commands. Only do this on a private interface.",
+            host,
+        )
+    return host
+
+
 if __name__ == "__main__":
     import uvicorn
     # ws_max_size raised so base64-encoded photo attachments (e.g. iPhone JPGs)
     # fit in a single websocket message (default is 16MB).
-    uvicorn.run("skippy_factory:app", host="0.0.0.0", port=8000, reload=False, ws_max_size=100 * 1024 * 1024)
+    uvicorn.run(
+        "skippy_factory:app",
+        host=bind_host(),
+        port=int(os.environ.get("SKIPPY_PORT", "8000")),
+        reload=False,
+        ws_max_size=100 * 1024 * 1024,
+    )
