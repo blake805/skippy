@@ -196,6 +196,24 @@ def test_useful_python_invocations_are_allowed(command):
     assert validate(command)
 
 
+@pytest.mark.parametrize("name", ["python", "python3", "python3.11", "python3.13", "python2"])
+def test_versioned_python_names_are_the_same_program(name):
+    """`sys.executable` inside a virtualenv is spelled `python3.11`, so an allowlist of
+    only the unversioned names refuses the most ordinary invocation there is. Found by
+    running the suite through the `pytest` console script instead of `python -m pytest`,
+    which changes how `sys.executable` reports itself."""
+    assert validate(f"{name} -m pytest -q")
+    # And the python-specific rules still apply to the versioned spelling.
+    with pytest.raises(CommandRejected):
+        validate(f"{name} -c 'print(1)'")
+
+
+def test_the_running_interpreter_is_always_runnable():
+    """Whatever this suite is running under must itself be an allowed program,
+    otherwise the agent cannot run the tests of the project it is working in."""
+    assert validate(f"{os.path.basename(sys.executable)} -m pytest -q")
+
+
 def test_an_unlisted_python_module_is_refused():
     with pytest.raises(CommandRejected) as exc:
         validate("python -m http.client")

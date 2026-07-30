@@ -35,6 +35,7 @@ secrets handed to whatever the repo's test suite decides to do.
 import asyncio
 import logging
 import os
+import re
 import shlex
 import signal
 from dataclasses import dataclass, field
@@ -77,6 +78,8 @@ GIT_REQUIRED_TOKENS = {
 # because it is more dangerous than pytest — it is not — but because a script in the
 # repo is journaled, reviewable and re-runnable, while inline code leaves no trace
 # of what was executed.
+_PYTHON_NAME = re.compile(r"^python(\d+(\.\d+)?)?$")
+
 PYTHON_MODULES = {
     "pytest", "unittest", "mypy", "ruff", "black", "flake8", "pyflakes",
     "compileall", "json.tool", "http.server", "pip",
@@ -106,8 +109,7 @@ _RULES: Dict[str, Rule] = {
     "yarn": Rule(subcommands={"test", "run"}),
     "pnpm": Rule(subcommands={"test", "run"}),
     "node": Rule(),
-    "python": Rule(),
-    "python3": Rule(),
+    "python": Rule(),  # covers python3 and python3.N via _PYTHON_NAME
     # Linters and type checkers: the cheapest useful feedback there is.
     "ruff": Rule(),
     "mypy": Rule(),
@@ -216,7 +218,14 @@ def validate(command: str) -> List[str]:
         )
 
     program = os.path.basename(argv[0])
-    if program != argv[0]:
+    if _PYTHON_NAME.match(program):
+        # python, python3, python3.11, python3.13 — all the same program with the same
+        # rules. Listing only the unversioned names looked fine until a real invocation
+        # arrived as `python3.11 -m pytest`, which is exactly how `sys.executable`
+        # spells itself inside a virtualenv.
+        program = "python"
+
+    if os.path.basename(argv[0]) != argv[0]:
         # An absolute or relative path would sidestep the allowlist entirely
         # (./pytest, /usr/bin/env, ../../bin/sh).
         raise CommandRejected(
@@ -236,7 +245,7 @@ def validate(command: str) -> List[str]:
 
     args = argv[1:]
 
-    if program in ("python", "python3"):
+    if program == "python":
         _validate_python(args)
         return argv
 
