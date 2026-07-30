@@ -19,6 +19,7 @@ logger = logging.getLogger("skippy_factory")
 # url and weight mapping, and refuses to reach off-machine unless asked to.
 import skippy_llm
 import skippy_fs
+import skippy_tasks
 from skippy_sandbox import SandboxError
 
 # Chroma, Whisper and Kokoro are all loaded on first use rather than at import.
@@ -161,6 +162,10 @@ class ConnectionManager:
 
 hub = ConnectionManager()
 
+# Owns the one-run-per-client lifecycle. Built on the same hub so a run's events
+# follow the client rather than the socket it started on.
+runner = skippy_tasks.TaskRunner(hub)
+
 # --- TTS HELPER ---
 async def speak_text(text: str, websocket: WebSocket, use_tts: bool):
     if not use_tts or not websocket: return
@@ -199,8 +204,9 @@ async def lifespan(app: FastAPI):
         # Not fatal: the server is still useful for voice and health checks, and a
         # loud warning at boot beats a confusing failure on the first tool call.
         logger.warning("No workspace access: %s", exc)
-    logger.info("Skippy core online. Agent runtime not yet installed.")
+    logger.info("Skippy core online.")
     yield
+    await runner.shutdown()
     logger.info("Skippy core offline.")
 
 app = FastAPI(title="Skippy Coding & RE Agent API", lifespan=lifespan)
@@ -227,17 +233,24 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
                 if hub.resolve_auth(websocket, data):
                     continue
 
-            # The shop assembly line was archived at tag `shop-v1`; the agent loop
-            # that replaces it lands in a later slice. Answer honestly rather than
-            # dropping the message on the floor, so clients show something useful.
-            await websocket.send_json({
-                "type": "chat",
-                "content": (
-                    "The agent runtime is not installed yet. The shop pipeline was "
-                    "archived at tag `shop-v1`; the coding and RE agent replaces it."
-                ),
-            })
-            await websocket.send_json({"type": "done"})
+            # The editor extension announces itself when it connects. It answers RPCs
+            # and does not start work of its own, so without this its greeting would
+            # launch an agent run with "hello" as the task.
+            if data.get("type") == "hello":
+                logger.info("Client '%s' announced itself.", client_id)
+                continue
+
+            if data.get("action") == "cancel":
+                stopped = runner.cancel(client_id)
+                await websocket.send_json({
+                    "type": "chat",
+                    "content": "Stopping at the next step." if stopped else "Nothing is running.",
+                })
+                continue
+
+            # Started rather than awaited: this loop is the only reader of the socket,
+            # so awaiting the run here would mean no cancel could ever arrive.
+            await runner.start(client_id, data)
 
     except WebSocketDisconnect:
         hub.disconnect(client_id)

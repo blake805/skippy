@@ -134,6 +134,36 @@ allowlisted environment so a repo's test suite is never handed your API keys. Ex
 the program list per machine with `SKIPPY_EXTRA_COMMANDS`; installers and anything that
 fetches are excluded by default.
 
+### Cursor integration
+
+Sideload `cursor_client/` and Skippy's edits land in the editor instead of behind its
+back. Two things change:
+
+- **A multi-file change is one undo step.** Edits go through a single
+  `vscode.WorkspaceEdit`, so ⌘Z reverses the whole thing. Files no longer appear to
+  mutate on disk with no undo history.
+- **Every patch reports what it broke.** A successful edit comes back with the
+  diagnostics your language servers produce for the files it touched, in the same
+  observation — not as a separate call the model has to remember to make. Diagnostics
+  are *waited for* rather than sampled: reading them the instant an edit lands returns
+  the state from before it, which would tell the agent a new error is a clean bill of
+  health.
+
+There is one `apply_patch`, and it routes to the editor when one is attached and writes
+to disk when not. Nothing in the tool schema mentions Cursor, because a model asked to
+choose on the basis of state it cannot see will choose wrong.
+
+The editor never decides what an edit *means*. The server validates, resolves paths
+against the sandbox, and stages the final text of each file; the extension is handed
+that text and puts it there. Both sides still implement search-and-replace — the editor
+has to plan against unsaved buffers — so both run the same 27-case table in
+`tests/fixtures/patch_parity.json`. If they disagreed, Skippy would give different
+answers depending on whether your editor happened to be open.
+
+Deliberately absent: any way for the editor to run a command. That would be a second
+execution path with none of the policy in `skippy_exec.py`, behind a socket that has no
+authentication yet. See [ADR 0014](docs/adr/0014-cursor-integration.md).
+
 ### Project memory across sessions
 
 A run's record is written automatically when it ends, and the next run on the same
@@ -233,6 +263,9 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
 | `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings that outlive the session |
 | `skippy_memory.py` | Project memory: sessions and decisions, carried into the next run and marked when stale |
+| `skippy_tasks.py` | Runs a task for a connected client: one at a time, cancellable, events follow the client |
+| `skippy_cursor.py` | Bridge to the editor: routes patches through it and brings diagnostics back |
+| `cursor_client/` | The sideloaded VS Code-compatible extension |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
 | `prompts.py` | The system prompt, and the fold-summary extraction prompt |

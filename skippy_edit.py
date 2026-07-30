@@ -29,7 +29,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from skippy_sandbox import (
     MAX_TOOL_OUTPUT_CHARS,
@@ -133,11 +133,18 @@ def apply_patch(
     edits: Sequence[dict],
     dry_run: bool = False,
     journal_dir: Optional[str] = None,
+    writer: Optional[Callable[[Sequence["_PlannedWrite"]], Sequence[str]]] = None,
 ) -> ToolResult:
     """Validate every edit against staged content, then write all of them or none.
 
     dry_run returns the same diff without touching the disk, so the agent can
     check its own work before committing to it.
+
+    `writer` replaces the write step only. It exists so an attached editor can apply
+    the change set itself — giving the user one undo step rather than files mutating
+    underneath them — without a second copy of the validation, journal, diff and
+    rollback logic, which is where the dangerous bugs in this file have all been. A
+    writer is expected to apply everything or nothing and to raise on failure.
     """
     if not edits or not isinstance(edits, (list, tuple)):
         return ToolResult(False, "apply_patch requires a non-empty 'edits' list.")
@@ -307,21 +314,31 @@ def apply_patch(
     written: List[str] = []
     failed_on: Optional[str] = None
     try:
-        for item in planned:
-            failed_on = item.path
-            if item.after is None:
-                os.remove(item.path)
-            else:
-                _atomic_write(item.path, _encode(item.after, item.newline))
-            written.append(item.path)
+        if writer is not None:
+            # Someone else performs the writes — the editor, so the change lands in
+            # its undo stack instead of appearing as a mysterious on-disk edit.
+            # Validation, the journal, the diff and rollback are all unchanged, which
+            # is the point of injecting here rather than reimplementing them.
+            written = list(writer(planned))
+        else:
+            for item in planned:
+                failed_on = item.path
+                if item.after is None:
+                    os.remove(item.path)
+                else:
+                    _atomic_write(item.path, _encode(item.after, item.newline))
+                written.append(item.path)
     except Exception as exc:
         restored, unrestored = _rollback(planned, written)
+        # A writer applies the whole set or none of it, so there is no single file to
+        # name — and asking the sandbox to describe None is how this first went wrong.
+        where = f"on {sandbox.relative(failed_on)}" if failed_on is not None else "in the editor"
         if unrestored:
             # The repo is now in a mixed state. Say so plainly and point at the
             # pre-images, because this is the one failure the user has to act on.
             return ToolResult(
                 False,
-                f"Write failed on {sandbox.relative(failed_on)} AND rollback failed for "
+                f"Write failed {where} AND rollback failed for "
                 f"{len(unrestored)} file(s). The workspace is in a mixed state. "
                 + (f"Pre-images are in {journal}." if journal else "No journal was configured."),
                 f"{exc}\n\nNot restored:\n" + "\n".join(unrestored),
@@ -329,7 +346,7 @@ def apply_patch(
             )
         return ToolResult(
             False,
-            f"Write failed on {sandbox.relative(failed_on)}; rolled back {restored} file(s), "
+            f"Write failed {where}; rolled back {restored} file(s), "
             "so the workspace is unchanged.",
             str(exc),
             {"rolled_back": restored},

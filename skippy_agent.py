@@ -125,6 +125,7 @@ class AgentLoop:
         memory: Optional[Any] = None,
         memory_root: Optional[str] = None,
         remember: bool = True,
+        cursor: Optional[Any] = None,
     ):
         if not task or not str(task).strip():
             raise ValueError("An agent run needs a task.")
@@ -163,6 +164,11 @@ class AgentLoop:
             self.notes_pack = skippy_re.open_pack(
                 root, target=target or "", title=self.task[:80]
             )
+
+        # The attached editor, when there is one. Held rather than consulted here: the
+        # decision to route an edit through it belongs to the tool, so that the model
+        # never sees a choice it could get wrong.
+        self.cursor = cursor
 
         # Opened by the loop, keyed by the workspace roots, so that working on the same
         # repos tomorrow lands on the same memory without anyone naming it.
@@ -414,6 +420,7 @@ class AgentLoop:
             result = await skippy_dispatch.dispatch(
                 name, args, self.sandbox, journal_dir=self.journal_dir,
                 mode=self.mode, notes_pack=self.notes_pack, memory=self.memory,
+                cursor=self.cursor,
             )
 
         # apply_patch is the only tool that reports files, and it reports them the
@@ -542,11 +549,12 @@ async def run_task(
     memory: Optional[Any] = None,
     memory_root: Optional[str] = None,
     remember: bool = True,
+    cursor: Optional[Any] = None,
 ) -> AgentOutcome:
     """Convenience entry point for one task."""
     loop = AgentLoop(
         task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir,
         role=role, mode=mode, notes_root=notes_root, target=target,
-        memory=memory, memory_root=memory_root, remember=remember,
+        memory=memory, memory_root=memory_root, remember=remember, cursor=cursor,
     )
     return await loop.run()

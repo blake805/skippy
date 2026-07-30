@@ -1,0 +1,560 @@
+{
+  "_comment": [
+    "Cases both patch implementations must agree on: skippy_edit.py on the server and",
+    "cursor_client/src/patches.ts in the editor. If they disagree the model gets",
+    "different answers depending on whether Cursor happens to be attached, which is a",
+    "bug that appears and disappears with the state of the editor.",
+    "",
+    "Read by tests/test_cursor.py and cursor_client/test/parity.test.js. Add a case",
+    "here and both sides pick it up.",
+    "",
+    "'files' is the starting tree, relative paths. 'expect.ok' is whether the patch",
+    "should be accepted at all. 'expect.files' is the resulting content of every file",
+    "that changed; a null value means the file should be gone."
+  ],
+  "cases": [
+    {
+      "name": "a unique search applies",
+      "files": {
+        "a.py": "x = 1\ny = 2\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "x = 1",
+          "replace": "x = 99"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "x = 99\ny = 2\n"
+        }
+      }
+    },
+    {
+      "name": "an ambiguous search is refused",
+      "files": {
+        "a.py": "x = 1\nx = 1\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "x = 1",
+          "replace": "x = 2"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "search text that is absent is refused",
+      "files": {
+        "a.py": "x = 1\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "nowhere",
+          "replace": "y"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "replace_all replaces every occurrence",
+      "files": {
+        "a.py": "x\nx\nx\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "x",
+          "replace": "y",
+          "replace_all": true
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "y\ny\ny\n"
+        }
+      }
+    },
+    {
+      "name": "occurrence picks the second non-overlapping match",
+      "files": {
+        "a.txt": "aaaa"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "aa",
+          "replace": "X",
+          "occurrence": 2
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.txt": "aaX"
+        }
+      }
+    },
+    {
+      "name": "occurrence picks the first non-overlapping match",
+      "files": {
+        "a.txt": "aaaa"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "aa",
+          "replace": "X",
+          "occurrence": 1
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.txt": "Xaa"
+        }
+      }
+    },
+    {
+      "name": "occurrence past the end is refused",
+      "files": {
+        "a.txt": "aaaa"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "aa",
+          "replace": "X",
+          "occurrence": 3
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "replace_all and occurrence together are refused",
+      "files": {
+        "a.txt": "x x x"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "x",
+          "replace": "y",
+          "replace_all": true,
+          "occurrence": 2
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "a dollar-ampersand replacement is literal",
+      "files": {
+        "a.js": "const x = MARK;\n"
+      },
+      "edits": [
+        {
+          "path": "a.js",
+          "search": "MARK",
+          "replace": "'$&'"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.js": "const x = '$&';\n"
+        }
+      }
+    },
+    {
+      "name": "a numbered group replacement is literal",
+      "files": {
+        "a.sh": "echo MARK\n"
+      },
+      "edits": [
+        {
+          "path": "a.sh",
+          "search": "MARK",
+          "replace": "\"$1\""
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.sh": "echo \"$1\"\n"
+        }
+      }
+    },
+    {
+      "name": "regex metacharacters in search are literal",
+      "files": {
+        "a.py": "value = x[0].y(1)\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "x[0].y(1)",
+          "replace": "z"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "value = z\n"
+        }
+      }
+    },
+    {
+      "name": "a multi-line search works",
+      "files": {
+        "a.py": "def f():\n    pass\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "def f():\n    pass",
+          "replace": "def f():\n    return 1"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "def f():\n    return 1\n"
+        }
+      }
+    },
+    {
+      "name": "later edits in one set see earlier ones",
+      "files": {
+        "a.py": "one\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "one",
+          "replace": "two"
+        },
+        {
+          "path": "a.py",
+          "search": "two",
+          "replace": "three"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "three\n"
+        }
+      }
+    },
+    {
+      "name": "one bad edit rejects the whole set",
+      "files": {
+        "a.py": "good\n",
+        "b.py": "also good\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "good",
+          "replace": "better"
+        },
+        {
+          "path": "b.py",
+          "search": "missing",
+          "replace": "x"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "files": {
+          "a.py": "good\n",
+          "b.py": "also good\n"
+        }
+      }
+    },
+    {
+      "name": "a multi-file edit applies to both",
+      "files": {
+        "a.py": "one\n",
+        "b.py": "two\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "one",
+          "replace": "1"
+        },
+        {
+          "path": "b.py",
+          "search": "two",
+          "replace": "2"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "1\n",
+          "b.py": "2\n"
+        }
+      }
+    },
+    {
+      "name": "create writes a new file",
+      "files": {},
+      "edits": [
+        {
+          "path": "new.py",
+          "action": "create",
+          "content": "hello\n"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "new.py": "hello\n"
+        }
+      }
+    },
+    {
+      "name": "create over an existing file needs overwrite",
+      "files": {
+        "a.py": "existing\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "action": "create",
+          "content": "new\n"
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "files": {
+          "a.py": "existing\n"
+        }
+      }
+    },
+    {
+      "name": "create with overwrite replaces the contents",
+      "files": {
+        "a.py": "existing\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "action": "create",
+          "content": "new\n",
+          "overwrite": true
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "new\n"
+        }
+      }
+    },
+    {
+      "name": "editing a file that does not exist is refused",
+      "files": {},
+      "edits": [
+        {
+          "path": "gone.py",
+          "search": "x",
+          "replace": "y"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "delete removes the file",
+      "files": {
+        "a.py": "bye\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "action": "delete"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": null
+        }
+      }
+    },
+    {
+      "name": "deleting a file that is not there is refused",
+      "files": {},
+      "edits": [
+        {
+          "path": "gone.py",
+          "action": "delete"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "an unknown action is refused",
+      "files": {
+        "a.py": "x\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "action": "rename"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "a missing path is refused",
+      "files": {},
+      "edits": [
+        {
+          "search": "x",
+          "replace": "y"
+        }
+      ],
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "name": "CRLF line endings are preserved",
+      "files": {
+        "a.txt": "one\r\ntwo\r\n"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "one",
+          "replace": "ONE"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.txt": "ONE\r\ntwo\r\n"
+        }
+      }
+    },
+    {
+      "name": "non-ascii content survives an edit",
+      "files": {
+        "a.txt": "caf\u00e9 \u2615\n"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "caf\u00e9",
+          "replace": "th\u00e9"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.txt": "th\u00e9 \u2615\n"
+        }
+      }
+    },
+    {
+      "name": "a tab-indented replacement keeps its tabs",
+      "files": {
+        "a.go": "func f() {\n\treturn\n}\n"
+      },
+      "edits": [
+        {
+          "path": "a.go",
+          "search": "\treturn",
+          "replace": "\treturn nil"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.go": "func f() {\n\treturn nil\n}\n"
+        }
+      }
+    },
+    {
+      "name": "a file with no trailing newline keeps none",
+      "files": {
+        "a.txt": "one"
+      },
+      "edits": [
+        {
+          "path": "a.txt",
+          "search": "one",
+          "replace": "two"
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.txt": "two"
+        }
+      }
+    },
+    {
+      "name": "replace_all when the replacement contains the search text",
+      "files": {
+        "a.py": "a b a\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "a",
+          "replace": "aa",
+          "replace_all": true
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "aa b aa\n"
+        }
+      }
+    },
+    {
+      "name": "replace_all counts non-overlapping matches",
+      "files": {
+        "a.py": "aaaa\n"
+      },
+      "edits": [
+        {
+          "path": "a.py",
+          "search": "aa",
+          "replace": "b",
+          "replace_all": true
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "files": {
+          "a.py": "bb\n"
+        }
+      }
+    }
+  ]
+}
