@@ -744,3 +744,252 @@ async def test_a_coding_run_out_of_steps_still_reports_files(box, routed_llm):
     assert outcome.status == "max_steps"
     assert "Files changed" in outcome.summary
     assert outcome.findings == 0
+
+
+# --- project memory across sessions ---
+#
+# The criterion this exists for: a second session on the same repos continues the
+# first instead of starting blind. Everything here is about the handoff.
+
+@pytest.mark.asyncio
+async def test_a_run_is_recorded_in_project_memory(box, tmp_path, routed_llm):
+    import skippy_memory
+
+    store = str(tmp_path / "projects")
+    routed_llm.load([finish("Added retry with backoff to the transport.", files=["calc/ops.py"])])
+    outcome = await skippy_agent.run_task("Add retry", box, memory_root=store)
+
+    assert outcome.session_id
+    memory = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    records = memory.sessions()
+    assert len(records) == 1
+    assert "backoff" in records[0]["summary"]
+    assert records[0]["files_changed"] == ["calc/ops.py"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_session_opens_knowing_what_the_first_did(box, tmp_path, routed_llm):
+    """The whole point. Without this the second run re-derives everything and may
+    redo work the first already finished."""
+    store = str(tmp_path / "projects")
+
+    routed_llm.load([finish("Added retry with backoff in the transport layer.")])
+    await skippy_agent.run_task("Add retry", box, memory_root=store)
+
+    second = skippy_agent.AgentLoop("Now add a circuit breaker", box, memory_root=store)
+    opening = second.transcript.messages[1]["content"]
+    assert "backoff in the transport" in opening
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_ran_out_of_steps_is_still_handed_forward(box, tmp_path, routed_llm):
+    """A half-finished migration is the most useful thing for the next session to
+    know, and a save-on-success rule would have discarded exactly that.
+
+    Recorded even though this run wrote nothing: unlike an unreachable endpoint, the
+    model did run and call tools, so "this was attempted and did not get there" is
+    real history about the task.
+    """
+    store = str(tmp_path / "projects")
+    routed_llm.load([
+        fl.tool_call("read_file", call_id="c1", path="calc/ops.py"),
+        fl.tool_call("read_file", call_id="c2", path="README.md"),
+    ])
+    outcome = await skippy_agent.run_task("Big migration", box, max_steps=2, memory_root=store)
+    assert outcome.status == "max_steps"
+
+    opening = skippy_agent.AgentLoop("Continue", box, memory_root=store).transcript.messages[1]["content"]
+    assert "max_steps" in opening
+    assert "Big migration" in opening or "Ran out of steps" in opening
+
+
+@pytest.mark.asyncio
+async def test_a_decision_recorded_in_one_session_reaches_the_next(box, tmp_path, routed_llm):
+    store = str(tmp_path / "projects")
+    routed_llm.load([
+        fl.tool_call(
+            "record_decision", call_id="c1",
+            title="Retries belong in the transport",
+            body="Per-call retries duplicated the backoff logic in four places.",
+            affects="calc/ops.py",
+        ),
+        finish("Moved retries into the transport.", call_id="c2"),
+    ])
+    outcome = await skippy_agent.run_task("Sort out retries", box, memory_root=store)
+    assert outcome.status == "finished"
+
+    opening = skippy_agent.AgentLoop("Something else", box, memory_root=store).transcript.messages[1]["content"]
+    assert "Retries belong in the transport" in opening
+
+
+@pytest.mark.asyncio
+async def test_a_stale_decision_is_flagged_to_the_next_session(box, tmp_path, routed_llm, repo):
+    """Confidently wrong memory is worse than none: unmarked, the next session works
+    from a file that is no longer there."""
+    store = str(tmp_path / "projects")
+    routed_llm.load([
+        fl.tool_call("record_decision", call_id="c1", title="Ops live in calc/ops.py",
+                     body="Kept next to the transport.", affects="calc/ops.py"),
+        finish(call_id="c2"),
+    ])
+    await skippy_agent.run_task("Decide", box, memory_root=store)
+
+    (repo / "calc" / "ops.py").unlink()
+    opening = skippy_agent.AgentLoop("Continue", box, memory_root=store).transcript.messages[1]["content"]
+    assert "OUT OF DATE" in opening
+
+
+def test_a_brand_new_project_adds_no_preamble(box, tmp_path):
+    loop = skippy_agent.AgentLoop("First ever task", box, memory_root=str(tmp_path / "projects"))
+    opening = loop.transcript.messages[1]["content"]
+    assert "already know" not in opening
+
+
+def test_memory_can_be_switched_off(box, tmp_path):
+    loop = skippy_agent.AgentLoop("t", box, memory_root=str(tmp_path / "p"), remember=False)
+    assert loop.memory is None
+
+
+@pytest.mark.asyncio
+async def test_a_run_survives_memory_being_unavailable(box, tmp_path, routed_llm, monkeypatch):
+    """An unmounted NAS costs continuity, not the run."""
+    import skippy_memory
+
+    def unavailable(*args, **kwargs):
+        raise OSError("memory root not mounted")
+
+    monkeypatch.setattr(skippy_memory, "open_project", unavailable)
+    routed_llm.load([finish("Done anyway.")])
+    outcome = await skippy_agent.run_task("Do the thing", box)
+    assert outcome.status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_a_failure_to_write_the_record_does_not_fail_the_run(box, tmp_path, routed_llm):
+    """The work is already on disk; losing the note about it must not lose the run."""
+    class Broken:
+        project_id = "broken"
+
+        def opening_context(self):
+            return ""
+
+        def record_session(self, **kwargs):
+            raise OSError("disk full")
+
+    routed_llm.load([finish("Work completed.")])
+    outcome = await skippy_agent.run_task("Do the thing", box, memory=Broken())
+    assert outcome.status == "finished"
+    assert outcome.session_id == ""
+
+
+@pytest.mark.asyncio
+async def test_the_project_is_not_model_controlled(box, tmp_path, routed_llm):
+    """A model that could pick the project could read another one's history."""
+    import skippy_dispatch
+    import skippy_memory
+
+    store = str(tmp_path / "projects")
+    mine = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    result = await skippy_dispatch.dispatch(
+        "record_decision",
+        {"title": "t", "body": "b", "memory": "somewhere-else"},
+        box,
+        memory=mine,
+    )
+    assert result.ok
+    assert len(mine.decisions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_memory_tools_report_plainly_when_there_is_no_memory(box, routed_llm):
+    import skippy_dispatch
+
+    result = await skippy_dispatch.dispatch("record_decision", {"title": "t", "body": "b"}, box)
+    assert not result.ok
+    assert "finish summary" in result.summary
+
+
+def test_both_modes_can_remember(box, tmp_path):
+    """Continuing prior work is not specific to coding or to RE."""
+    for mode, extra in (("coding", {}), ("re", {"notes_root": str(tmp_path / "n")})):
+        loop = skippy_agent.AgentLoop(
+            "t", box, mode=mode, memory_root=str(tmp_path / "p"), **extra
+        )
+        offered = {t["function"]["name"] for t in loop.tools()}
+        assert {"record_decision", "recall_project"} <= offered, mode
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_model_is_not_recorded_as_project_history(box, tmp_path, monkeypatch):
+    """Found live: the endpoint was down, so the run failed at step zero and memory
+    recorded "Model unavailable: RemoteProtocolError ..." as if it were something
+    learned about the code. It is an ops event, and in a bounded context it displaces
+    real history."""
+    import skippy_llm
+    import skippy_memory
+
+    async def unreachable(*args, **kwargs):
+        raise skippy_llm.ModelError("Role 'heavy' unreachable after 3 attempts.")
+
+    monkeypatch.setattr(skippy_llm, "query_message", unreachable)
+    store = str(tmp_path / "projects")
+    outcome = await skippy_agent.run_task("Do the thing", box, memory_root=store)
+
+    assert outcome.status == "failed"
+    assert outcome.session_id == ""
+    memory = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    assert memory.sessions() == []
+    assert memory.opening_context() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_that_touched_files_is_recorded(box, tmp_path, routed_llm, repo):
+    """The other half: an aborted run that half-edited a file is exactly what the next
+    session must know about, however it ended."""
+    import skippy_memory
+
+    store = str(tmp_path / "projects")
+    routed_llm.load([
+        fl.tool_call("apply_patch", call_id="c1", edits=[
+            {"path": "calc/ops.py", "search": "a + b", "replace": "a + b  # half done"}
+        ]),
+        # Then nothing useful, until the step ceiling.
+        fl.tool_call("read_file", call_id="c2", path="README.md"),
+    ])
+    outcome = await skippy_agent.run_task("Refactor", box, max_steps=2, memory_root=store)
+
+    assert outcome.status == "max_steps"
+    assert outcome.session_id
+    memory = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    assert "calc/ops.py" in memory.opening_context()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_that_changed_nothing_is_still_recorded(box, tmp_path, routed_llm):
+    """"Looked into this and there was nothing to change" saves the next session the
+    same investigation."""
+    import skippy_memory
+
+    store = str(tmp_path / "projects")
+    routed_llm.load([finish("Checked the retry path; it already handles this correctly.")])
+    outcome = await skippy_agent.run_task("Check retries", box, memory_root=store)
+
+    assert outcome.session_id
+    memory = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    assert "already handles this" in memory.opening_context()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_that_produced_nothing_is_not_history(box, tmp_path, routed_llm):
+    """Stopping a run immediately is not a fact about the project."""
+    import skippy_memory
+
+    store = str(tmp_path / "projects")
+    loop = skippy_agent.AgentLoop("Do the thing", box, memory_root=store)
+    loop.cancel()
+    outcome = await loop.run()
+
+    assert outcome.status == "cancelled"
+    assert outcome.session_id == ""
+    memory = skippy_memory.open_project(root=store, workspace_roots=list(box.roots))
+    assert memory.sessions() == []

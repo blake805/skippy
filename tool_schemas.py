@@ -177,6 +177,69 @@ _SCHEMAS = {
             "required": ["command"],
         },
     },
+    "record_decision": {
+        "description": (
+            "Records a choice you made and the reasoning behind it, for whoever works on "
+            "this project next — most likely you, in a session that remembers none of "
+            "this. Worth calling when you picked one approach over another, discovered a "
+            "constraint that is not obvious from reading the code, or found that an "
+            "approach does not work. A dead end is the most valuable thing to record, "
+            "because nothing in the repository shows what was already ruled out. Do not "
+            "use it to restate what your diff already says."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "One line: what was decided. 'Retries belong in the transport, not per-call'.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "The reasoning: what you chose, what you rejected, and why. This is "
+                        "the part that stops the decision being quietly undone later."
+                    ),
+                },
+                "affects": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated paths this decision is about. Used to warn a later "
+                        "session that the decision may be stale if those files are gone."
+                    ),
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "Id(s) of decisions this replaces, comma-separated. The old one is "
+                        "kept and marked rather than deleted."
+                    ),
+                },
+            },
+            "required": ["title", "body"],
+        },
+    },
+    "recall_project": {
+        "description": (
+            "Searches earlier sessions and decisions for this project. The highlights are "
+            "already in your opening message, so use this when you need something older or "
+            "more specific than that — whether an approach has been tried before, or why "
+            "some part of the code is the way it is. Call with no query for an overview."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "What you are looking for. Specific words work; a whole sentence of "
+                        "common words does not."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
     "note_finding": {
         "description": (
             "Records one thing you have established about the target. In a "
@@ -354,6 +417,8 @@ FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
 NOTES_TOOLS = ("note_finding", "read_notes")
+# Offered in both modes: continuing prior work is not specific to either.
+MEMORY_TOOLS = ("record_decision", "recall_project")
 
 
 def filesystem_tools() -> list:
@@ -363,13 +428,19 @@ def filesystem_tools() -> list:
 
 def workspace_tools() -> list:
     """Read, write and verify. What an agent needs to actually finish a coding task."""
-    return [_wrap(name) for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS]
+    return [
+        _wrap(name)
+        for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS + MEMORY_TOOLS
+    ]
 
 
 def re_tools() -> list:
     """Read, inspect and record. No apply_patch: an RE session does not change the
     artifact, and the notes are the deliverable rather than a diff."""
-    return [_wrap(name) for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS]
+    return [
+        _wrap(name)
+        for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + MEMORY_TOOLS
+    ]
 
 
 def research_tools() -> list:

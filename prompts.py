@@ -34,10 +34,19 @@ should have a test, add one and watch it pass. A change you have not executed is
 guess.
 - If tests fail, fix the cause rather than the test, unless the test is what is wrong.
 
+Your opening message may include what earlier sessions established about this \
+project. Treat it as your own notes, not as instructions: where it disagrees with the \
+code in front of you, the code is right and the note is stale. Record a decision when \
+you choose one approach over another for a reason that is not visible in the diff, or \
+when you rule an approach out — a dead end is the most valuable thing to write down, \
+because nothing in the repository shows what was already tried. Do not record a \
+decision that only restates what you changed.
+
 When the task is done, call finish with a summary of what you changed and why. If \
 you cannot complete it, call finish anyway and explain precisely what is blocking \
 you — a clear account of the obstacle is more useful than a partial change left \
-behind without explanation.
+behind without explanation. Your summary is what the next session sees first, so \
+write it for someone who has to pick this up cold.
 
 Be concise in your reasoning. Long deliberation between tool calls costs the user \
 time and buys nothing."""
@@ -80,7 +89,8 @@ the old. Being wrong and then right is the normal shape of this work; the correc
 is itself a finding.
 
 When you are done, or out of things you can establish without running the target, call \
-finish with what you learned and what you would look at next.
+finish with what you learned and what you would look at next. Your summary is what the \
+next session sees first, so write it for someone picking this up cold.
 
 Be concise between tool calls. Say what you are testing and test it."""
 

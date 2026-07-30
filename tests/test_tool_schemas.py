@@ -14,6 +14,7 @@ import pytest
 import skippy_edit
 import skippy_exec
 import skippy_fs
+import skippy_memory
 import skippy_re
 import tool_schemas
 
@@ -27,11 +28,13 @@ IMPLEMENTED = {
     "run_command": skippy_exec.run_command,
     "note_finding": skippy_re.note_finding,
     "read_notes": skippy_re.read_notes,
+    "record_decision": skippy_memory.record_decision,
+    "recall_project": skippy_memory.recall_project,
 }
 
 # Arguments the dispatcher supplies. The model never sees these, so a schema that
 # declared one would be describing a parameter it cannot fill.
-INJECTED = ("sandbox", "pack", "journal_dir", "mode")
+INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory")
 
 # Tools that accept their required arguments with Python defaults and check them in
 # the body, so an omission comes back as a message naming the field and its legal
@@ -40,6 +43,7 @@ INJECTED = ("sandbox", "pack", "journal_dir", "mode")
 # something the model can act on; "Bad arguments" is not.
 SELF_VALIDATING = {
     "note_finding": {"kind", "title", "body", "confidence"},
+    "record_decision": {"title", "body"},
 }
 
 
@@ -109,19 +113,29 @@ def test_a_self_validating_tool_actually_rejects_what_it_calls_required(name, fi
     declared = set(tool_schemas._SCHEMAS[name]["parameters"].get("required", []))
     assert fields <= declared, f"{name}: {fields - declared} not declared required"
 
-    valid = {
-        "kind": "structure",
-        "title": "Header is 32 bytes",
-        "body": "Load commands start at 0x20.",
-        "evidence": "otool -h reports sizeofcmds 0x20",
-        "confidence": "confirmed",
-    }
-    pack = skippy_re.open_pack(str(tmp_path / "notes"), target="t")
-    assert IMPLEMENTED[name](pack, **valid).ok, "the baseline call should succeed"
+    if name == "note_finding":
+        valid = {
+            "kind": "structure",
+            "title": "Header is 32 bytes",
+            "body": "Load commands start at 0x20.",
+            "evidence": "otool -h reports sizeofcmds 0x20",
+            "confidence": "confirmed",
+        }
+        first = skippy_re.open_pack(str(tmp_path / "notes"), target="t")
+    else:
+        valid = {
+            "title": "Retries belong in the transport",
+            "body": "Per-call retries duplicated the backoff logic.",
+        }
+        first = skippy_memory.open_project(
+            root=str(tmp_path / "projects"), workspace_roots=[str(tmp_path)]
+        )
+
+    assert IMPLEMENTED[name](first, **valid).ok, "the baseline call should succeed"
 
     for field in fields:
         without = dict(valid, **{field: ""})
-        result = IMPLEMENTED[name](pack, **without)
+        result = IMPLEMENTED[name](first, **without)
         assert not result.ok, f"{name} accepted a call with no '{field}'"
 
 
@@ -176,3 +190,20 @@ def test_apply_patch_describes_its_all_or_nothing_behaviour():
     assert "nothing is written" in description
     assert "one call" in description
     assert "byte-for-byte" in description
+
+
+def test_the_memory_tools_are_offered_in_both_modes():
+    """Continuing prior work is not specific to coding or to reverse engineering."""
+    coding = {t["function"]["name"] for t in tool_schemas.workspace_tools()}
+    re_mode = {t["function"]["name"] for t in tool_schemas.re_tools()}
+    assert {"record_decision", "recall_project"} <= coding
+    assert {"record_decision", "recall_project"} <= re_mode
+
+
+def test_record_decision_asks_for_reasoning_and_warns_off_restating_the_diff():
+    """Without the warning it writes "changed ops.py to add retry", which the diff
+    already says and which is worth nothing to a later session."""
+    description = tool_schemas._SCHEMAS["record_decision"]["description"].lower()
+    assert "reasoning" in description
+    assert "dead end" in description or "ruled out" in description
+    assert "diff already says" in description

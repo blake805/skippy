@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 import skippy_edit
 import skippy_exec
 import skippy_fs
+import skippy_memory
 import skippy_re
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
 
@@ -34,10 +35,15 @@ _SYNC_TOOLS = {
     "apply_patch": skippy_edit.apply_patch,
     "note_finding": skippy_re.note_finding,
     "read_notes": skippy_re.read_notes,
+    "record_decision": skippy_memory.record_decision,
+    "recall_project": skippy_memory.recall_project,
 }
 
 # These take a `pack` the loop opens, and only exist when there is one.
 _NOTES_TOOLS = ("note_finding", "read_notes")
+
+# These take the project memory the loop opens, for the same reason.
+_MEMORY_TOOLS = ("record_decision", "recall_project")
 
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,
@@ -58,7 +64,7 @@ def _expected(name: str) -> str:
         return ""
     params = [
         p for p in inspect.signature(handler).parameters
-        if p not in ("sandbox", "journal_dir", "mode", "pack")
+        if p not in ("sandbox", "journal_dir", "mode", "pack", "memory")
     ]
     return ", ".join(params)
 
@@ -70,6 +76,7 @@ async def dispatch(
     journal_dir: Optional[str] = None,
     mode: str = skippy_exec.DEFAULT_MODE,
     notes_pack: Optional[Any] = None,
+    memory: Optional[Any] = None,
 ) -> ToolResult:
     """Run one tool. Never raises."""
     args: Dict[str, Any] = dict(args or {})
@@ -101,7 +108,7 @@ async def dispatch(
     # Never model-controlled. `mode` belongs here for the same reason as the sandbox:
     # a model in RE mode that could request the coding table could execute the
     # artifact it was asked to analyse, which is the one thing the split prevents.
-    for injected in ("sandbox", "journal_dir", "mode", "pack"):
+    for injected in ("sandbox", "journal_dir", "mode", "pack", "memory"):
         args.pop(injected, None)
     if name == "apply_patch" and journal_dir:
         args["journal_dir"] = journal_dir
@@ -117,6 +124,15 @@ async def dispatch(
                 "This looks like a coding task; record what you found in your finish summary.",
             )
         first = notes_pack
+    elif name in _MEMORY_TOOLS:
+        if memory is None:
+            return ToolResult(
+                False,
+                f"'{name}' needs project memory, which is unavailable for this run "
+                "(the memory root may not be mounted). Put anything worth keeping in "
+                "your finish summary instead.",
+            )
+        first = memory
     else:
         first = sandbox
 
