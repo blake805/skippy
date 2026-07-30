@@ -18,6 +18,7 @@ import logging
 from typing import Any, Dict, Optional
 
 import skippy_edit
+import skippy_exec
 import skippy_fs
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
 
@@ -34,6 +35,7 @@ _SYNC_TOOLS = {
 
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,
+    "run_command": skippy_exec.run_command,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a

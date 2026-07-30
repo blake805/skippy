@@ -111,6 +111,29 @@ rewritten, and CRLF line endings are preserved. Pre-images go to
 [ADR 0009](docs/adr/0009-atomic-multi-file-patching.md) has the details, including
 the three data-destroying bugs this replaced.
 
+### How it checks its own work
+
+`run_command` runs a single test runner, linter, type checker, build tool or
+read-only git command, without a shell. This is what makes the difference between code
+that looks right and code that has been run: in the live run for
+[ADR 0011](docs/adr/0011-command-execution.md) the model wrote a test file with a
+missing import, ran the suite, read its own failure, fixed the cause and re-ran to
+green. Before this existed, that broken file would have shipped with a confident
+summary.
+
+Be clear about what the allowlist does. `pytest` executes `conftest.py`, and the agent
+can write `conftest.py`, so **"may run pytest" and "may execute arbitrary code" are the
+same permission.** The allowlist is accident prevention — no `rm -rf`, no
+`git push --force`, no `curl | sh` — not containment, and there is deliberately no
+approval-gated shell tool, because asking permission for the loud path while the quiet
+one is open is theatre. Real containment means running the whole thing in a VM.
+
+What is guaranteed: no shell interpretation, a bounded timeout that kills the entire
+process tree, bounded output that keeps the head and the tail, no stdin, and an
+allowlisted environment so a repo's test suite is never handed your API keys. Extend
+the program list per machine with `SKIPPY_EXTRA_COMMANDS`; installers and anything that
+fetches are excluded by default.
+
 ### Why transcripts are append-only
 
 `mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
@@ -131,6 +154,7 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_sandbox.py` | The path boundary every filesystem tool goes through |
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
+| `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
 | `prompts.py` | The system prompt, and the fold-summary extraction prompt |
@@ -185,3 +209,8 @@ be mounted before the backend starts.
   LAN only.
 - Web content (search results, fetched pages) and any decompiled or third-party source is
   untrusted input to the agent loop. Keep human-approval gates on destructive tools.
+- The command allowlist stops accidents, not a determined agent. Anything that can run
+  `pytest` can run arbitrary code, because it can also write `conftest.py`. Treat the
+  workspace roots as the real blast radius, and run against repos you can restore from
+  git. If you ever point Skippy at code you do not trust, put the whole process in a VM;
+  no setting in this repo substitutes for that.
