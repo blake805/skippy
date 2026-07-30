@@ -99,7 +99,17 @@ class ServerManager: ObservableObject {
         is405BRunning = true
         
         // 4. Boot FastAPI Backend
-        processBackend = runCommand("\(enter) && python skippy_factory.py")
+        //
+        // The roots are listed one repository at a time rather than as the containing
+        // directory. They are the agent's blast radius, so adding one should be a
+        // deliberate edit here — and naming each repo separately also means the
+        // multi-root guard makes `run_command` demand an explicit cwd, instead of
+        // quietly running a test suite from a directory that spans two projects.
+        let roots = [
+            "$HOME/skippy-workspaces/fixture-app",
+            "$HOME/skippy-workspaces/fixture-lib",
+        ].joined(separator: ":")
+        processBackend = runCommand("\(enter) && SKIPPY_WORKSPACE_ROOTS=\"\(roots)\" python skippy_factory.py")
         isBackendRunning = true
     }
     
