@@ -28,18 +28,25 @@ from tests.fake_llm import FakeLLM  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def isolated_env(monkeypatch):
+def isolated_env(monkeypatch, tmp_path):
     """Clear SKIPPY_* overrides so a developer's shell cannot change results.
 
     The redirections above are re-applied, because dropping them would point a
     test at the real NAS.
+
+    The memory root is per-test rather than a shared /tmp path. Since project memory
+    began recording every run, a shared root meant each agent-loop test appended a
+    session record to the same project and then read the accumulated pile back as
+    opening context — so the prompt a test built depended on how many times the suite
+    had been run before.
     """
     for key in list(os.environ):
         if key.startswith("SKIPPY_"):
             monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", "/tmp/skippy_test_memory")
-    monkeypatch.setenv("SKIPPY_WORKSPACES_ROOT", "/tmp/skippy_test_workspaces")
-    monkeypatch.setenv("SKIPPY_CHROMA_PATH", "/tmp/skippy_test_memory/chroma_db")
+    memory = tmp_path / "skippy_memory"
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(memory))
+    monkeypatch.setenv("SKIPPY_WORKSPACES_ROOT", str(tmp_path / "skippy_workspaces"))
+    monkeypatch.setenv("SKIPPY_CHROMA_PATH", str(memory / "chroma_db"))
 
 
 @pytest.fixture(scope="session")

@@ -134,6 +134,45 @@ allowlisted environment so a repo's test suite is never handed your API keys. Ex
 the program list per machine with `SKIPPY_EXTRA_COMMANDS`; installers and anything that
 fetches are excluded by default.
 
+### Project memory across sessions
+
+A run's record is written automatically when it ends, and the next run on the same
+workspace roots opens with the relevant history already in context:
+
+```text
+## What you already know about this project (skippy)
+Conventions established here:
+- test command: python -m pytest -q
+
+Decisions from earlier sessions:
+- [0003] Retries belong in the transport [MAY BE OUT OF DATE: net/client.py no longer exists]
+
+Recent sessions, newest first:
+- 2026-07-29T21:31 [finished] Moved retries into the transport (touched net/pool.py)
+- 2026-07-28T16:02 [max_steps] Got halfway through the auth migration; refresh path unfinished
+```
+
+Three choices worth knowing about:
+
+- **Recall is not optional.** The history goes in the opening message rather than
+  waiting on the model to call a tool. A tool the model may call is one it mostly will
+  not — RE mode had to announce its note pack for the same reason. `recall_project`
+  exists for older or more specific questions than the opening block covers.
+- **Stale memory says so.** Every entry records the commit it was written at and the
+  paths it concerns; a path that no longer exists gets marked. This is the difference
+  between memory that helps and memory that hurts: "retries live in `client.py`" is
+  confidently wrong after a refactor, and a misinformed session is worse off than a
+  blind one. Superseded decisions are dropped from the opening block and marked in
+  recall.
+- **Failed runs are recorded too.** A run that ran out of steps halfway through a
+  migration is the most useful thing for the next session to know, so the record is
+  written on every terminal outcome, not just success.
+
+Sessions are JSON and decisions are markdown under `sessions_root()/projects/<id>`,
+keyed by the basenames of your workspace roots, so nothing has to be named by hand.
+Recall is deterministic keyword scoring — no embedding backend required, which is also
+what keeps it testable. See [ADR 0013](docs/adr/0013-project-memory.md).
+
 ### Reverse-engineering mode
 
 ```python
@@ -193,6 +232,7 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
 | `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
 | `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings that outlive the session |
+| `skippy_memory.py` | Project memory: sessions and decisions, carried into the next run and marked when stale |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
 | `prompts.py` | The system prompt, and the fold-summary extraction prompt |

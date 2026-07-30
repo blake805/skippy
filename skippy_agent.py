@@ -25,6 +25,7 @@ import prompts
 import skippy_dispatch
 import skippy_exec
 import skippy_llm
+import skippy_memory
 import skippy_paths
 import skippy_re
 import tool_schemas
@@ -92,6 +93,8 @@ class AgentOutcome:
     # run, which has no pack.
     findings: int = 0
     pack_id: str = ""
+    # Where this run was written down, so a caller can point at it.
+    session_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -119,6 +122,9 @@ class AgentLoop:
         mode: str = skippy_exec.DEFAULT_MODE,
         notes_root: Optional[str] = None,
         target: str = "",
+        memory: Optional[Any] = None,
+        memory_root: Optional[str] = None,
+        remember: bool = True,
     ):
         if not task or not str(task).strip():
             raise ValueError("An agent run needs a task.")
@@ -158,11 +164,34 @@ class AgentLoop:
                 root, target=target or "", title=self.task[:80]
             )
 
+        # Opened by the loop, keyed by the workspace roots, so that working on the same
+        # repos tomorrow lands on the same memory without anyone naming it.
+        self.memory = memory
+        if self.memory is None and remember:
+            try:
+                self.memory = skippy_memory.open_project(
+                    root=memory_root, workspace_roots=list(sandbox.roots)
+                )
+            except Exception:
+                # An unmounted NAS must not stop a run; it only costs continuity.
+                logger.warning("Project memory unavailable; running without it.", exc_info=True)
+
         system = prompts.RE_SYSTEM if self.mode == "re" else prompts.AGENT_SYSTEM
         self.transcript = skippy_llm.Transcript(system=system)
         opening = "Workspace roots:\n" + "\n".join(
             f"- {sandbox.relative(root)} ({root})" for root in sandbox.roots
         )
+        # Put in the opening message rather than left to a tool the model may call.
+        # A tool it may call is a tool it mostly will not, and continuing prior work is
+        # the whole point of keeping the record.
+        if self.memory is not None:
+            try:
+                prior = self.memory.opening_context()
+            except Exception:
+                logger.warning("Could not read project memory.", exc_info=True)
+                prior = ""
+            if prior:
+                opening += f"\n\n{prior}"
         if self.notes_pack is not None:
             findings = len(self.notes_pack.finding_files())
             opening += f"\n\nNote pack: {self.notes_pack.pack_id} ({findings} finding(s) so far)"
@@ -222,6 +251,11 @@ class AgentLoop:
                 files_changed=list(self.files_changed),
                 tool_calls=self.tool_calls,
             )
+        # Written for every terminal outcome, including the ones that failed. A run
+        # that ran out of steps halfway through a migration is the most useful thing
+        # the next session could know, and a save-on-success rule would discard it.
+        self._remember(outcome)
+
         await self.emit({
             "type": "agent_done",
             "status": outcome.status,
@@ -230,6 +264,40 @@ class AgentLoop:
             "files_changed": outcome.files_changed,
         })
         return outcome
+
+    def _remember(self, outcome: AgentOutcome) -> None:
+        if self.memory is None:
+            return
+        # `failed` and `cancelled` mean the run did not really happen — the endpoint was
+        # unreachable, or someone stopped it. When such a run also produced nothing,
+        # there is no history in it, and recording it actively hurts: a live run with a
+        # dead endpoint wrote "Model unavailable: RemoteProtocolError ..." into project
+        # memory as though it were something learned about the code, and in a context
+        # this small that displaces real history.
+        #
+        # `max_steps` and `stopped_without_finish` are different: the model ran, called
+        # tools and did not get there. That is worth knowing, whether or not it wrote
+        # anything. And any run that touched the tree is kept regardless of how it
+        # ended, because a half-applied edit is exactly what the next session must know.
+        did_not_run = outcome.status in ("failed", "cancelled")
+        produced = outcome.files_changed or outcome.findings
+        if did_not_run and not produced:
+            logger.info("Not recording a %s run that produced nothing.", outcome.status)
+            return
+        try:
+            outcome.session_id = self.memory.record_session(
+                task=self.task,
+                status=outcome.status,
+                summary=outcome.summary,
+                files_changed=outcome.files_changed,
+                findings=outcome.findings,
+                steps=outcome.steps,
+                mode=self.mode,
+            )
+        except Exception:
+            # Losing the record of a run is bad; losing the run itself because
+            # recording it failed would be worse. The work is already on disk.
+            logger.warning("Could not record the session in project memory.", exc_info=True)
 
     def _outcome(self, status: str, summary: str) -> AgentOutcome:
         return AgentOutcome(
@@ -345,7 +413,7 @@ class AgentLoop:
         else:
             result = await skippy_dispatch.dispatch(
                 name, args, self.sandbox, journal_dir=self.journal_dir,
-                mode=self.mode, notes_pack=self.notes_pack,
+                mode=self.mode, notes_pack=self.notes_pack, memory=self.memory,
             )
 
         # apply_patch is the only tool that reports files, and it reports them the
@@ -471,10 +539,14 @@ async def run_task(
     mode: str = skippy_exec.DEFAULT_MODE,
     notes_root: Optional[str] = None,
     target: str = "",
+    memory: Optional[Any] = None,
+    memory_root: Optional[str] = None,
+    remember: bool = True,
 ) -> AgentOutcome:
     """Convenience entry point for one task."""
     loop = AgentLoop(
         task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir,
         role=role, mode=mode, notes_root=notes_root, target=target,
+        memory=memory, memory_root=memory_root, remember=remember,
     )
     return await loop.run()
