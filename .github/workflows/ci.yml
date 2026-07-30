@@ -29,6 +29,13 @@ jobs:
       - name: Run pytest
         run: python -m pytest
 
+      # `python -m pytest` and the `pytest` console script disagree about how
+      # sys.executable spells itself: the former reports `python`, the latter
+      # `python3.11`. That difference hid a real gap in the command allowlist, which
+      # refused the most ordinary invocation there is. Cheap to keep checking.
+      - name: Run the execution tests through the console script
+        run: pytest tests/test_exec.py -q
+
   offline:
     name: Python tests (no network)
     runs-on: ubuntu-latest

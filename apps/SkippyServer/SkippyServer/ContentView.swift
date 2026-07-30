@@ -30,8 +30,14 @@ class ServerManager: ObservableObject {
     private var statsTimer: Timer?
     private var isFetchingStats = false // Safety lock to prevent thread pileups
     
+    // Where the checkout lives, in one place. It was spelled out in five separate
+    // strings before, which is why it stayed wrong for a while after the repo was
+    // renamed: four boot commands and a log path all had to agree.
+    static let repoDirName = "skippy"
+
     // The path for our permanent debug log
-    private let debugLogURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("shop-jarvis/skippy_server_debug.log")
+    private let debugLogURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("\(ServerManager.repoDirName)/skippy_server_debug.log")
     
     init() {
         startMonitoring()
@@ -78,21 +84,22 @@ class ServerManager: ObservableObject {
         // Face API to check each model's revision, which fails with a 401 and takes
         // the server down with it — and reaches the network at runtime besides.
         let offline = "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"
+        let enter = "cd ~/\(ServerManager.repoDirName) && source venv/bin/activate"
         
         // 1. Boot 30B Architect
-        process70B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --host 127.0.0.1 --port 8080")
+        process70B = runCommand("\(enter) && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --host 127.0.0.1 --port 8080")
         is70BRunning = true
         
         // 2. Boot 32B Compressor
-        processCompressor = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen2.5-Coder-32B-Instruct-4bit --host 127.0.0.1 --port 8082")
+        processCompressor = runCommand("\(enter) && \(offline) python -m mlx_lm.server --model mlx-community/Qwen2.5-Coder-32B-Instruct-4bit --host 127.0.0.1 --port 8082")
         isCompressorRunning = true
         
         // 3. Boot 480B Engineer
-        process405B = runCommand("cd ~/shop-jarvis && source venv/bin/activate && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --host 127.0.0.1 --port 8081")
+        process405B = runCommand("\(enter) && \(offline) python -m mlx_lm.server --model mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit --host 127.0.0.1 --port 8081")
         is405BRunning = true
         
         // 4. Boot FastAPI Backend
-        processBackend = runCommand("cd ~/shop-jarvis && source venv/bin/activate && python skippy_factory.py")
+        processBackend = runCommand("\(enter) && python skippy_factory.py")
         isBackendRunning = true
     }
     
@@ -219,7 +226,7 @@ struct ContentView: View {
                 // Debug Mode Toggle in Header
                 Toggle("Debug Mode", isOn: $manager.isDebugMode)
                     .toggleStyle(SwitchToggleStyle(tint: .orange))
-                    .help("Streams all terminal output to ~/shop-jarvis/skippy_server_debug.log")
+                    .help("Streams all terminal output to ~/\(ServerManager.repoDirName)/skippy_server_debug.log")
             }
             
             // Performance Progress Bars
