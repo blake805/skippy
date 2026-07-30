@@ -3,6 +3,10 @@
 Status: accepted
 Date: 2026-07-29
 Supersedes nothing. Follows 0010 (agent loop) and 0011 (command execution).
+Amended by [0015](0015-note-pack-identity.md) (pack identity is the target's path, not its
+basename), [0016](0016-loop-captured-evidence.md) (the loop logs the commands behind a
+finding) and [0017](0017-weakness-findings-and-handoff.md) (a `weakness` kind, and the route
+from a finding to a fix).
 
 ## Context
 

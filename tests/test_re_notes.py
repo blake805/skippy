@@ -112,7 +112,11 @@ def test_every_documented_confidence_level_is_accepted(pack, level):
 
 @pytest.mark.parametrize("kind", sorted(skippy_re.KINDS))
 def test_every_documented_kind_is_accepted(pack, kind):
-    assert record(pack, kind=kind, title=f"A {kind} finding").ok
+    # Some kinds carry an extra mandatory field — `weakness` needs a severity — so
+    # the fixture supplies whatever the kind under test requires. The point of the
+    # test is that no kind in the taxonomy is unusable, not that they are uniform.
+    extra = {"severity": "medium"} if kind in skippy_re.KINDS_REQUIRING_SEVERITY else {}
+    assert record(pack, kind=kind, title=f"A {kind} finding", **extra).ok
 
 
 def test_an_invented_kind_is_refused_and_the_real_ones_listed(pack):
@@ -402,3 +406,245 @@ def test_an_enormous_evidence_block_is_capped(pack):
     assert result.ok
     text = open(result.data["finding"]["path"], encoding="utf-8").read()
     assert len(text) < skippy_re.MAX_BODY_CHARS + skippy_re.MAX_EVIDENCE_CHARS + 2_000
+
+
+# --- one pack per target, not per filename ---
+#
+# The pack id used to be the slugified target, so two of our own products that both
+# ship a `firmware.bin` landed in one pack. That is the worst available failure,
+# because nothing looks wrong: the second session opens the first product's findings
+# as established prior knowledge and appends to them.
+
+def test_two_targets_with_the_same_basename_do_not_share_a_pack(notes_dir, tmp_path):
+    (tmp_path / "gate").mkdir()
+    (tmp_path / "sensor").mkdir()
+    gate = tmp_path / "gate" / "firmware.bin"
+    sensor = tmp_path / "sensor" / "firmware.bin"
+    gate.write_bytes(b"gate build")
+    sensor.write_bytes(b"sensor build")
+
+    first = open_pack(notes_dir, target=str(gate))
+    second = open_pack(notes_dir, target=str(sensor))
+    assert first.pack_id != second.pack_id
+
+    record(first, title="Gate header is 32 bytes")
+    # The whole point: the second investigation must not open the first one's work.
+    assert "Gate header" not in read_notes(second).content
+
+
+def test_the_same_target_reopens_the_same_pack(notes_dir):
+    """Accumulating across sessions is the reason packs are keyed by target at all."""
+    first = open_pack(notes_dir, target="/opt/products/gate/firmware.bin")
+    again = open_pack(notes_dir, target="/opt/products/gate/firmware.bin")
+    assert first.pack_id == again.pack_id
+
+
+def test_the_pack_id_still_reads_as_the_target(notes_dir):
+    """A directory of packs has to be navigable by eye, so the digest is a suffix
+    rather than the whole id."""
+    pack = open_pack(notes_dir, target="/opt/products/gate/firmware.bin")
+    assert pack.pack_id.startswith("firmware-bin-")
+
+
+def test_a_target_named_only_by_title_still_gets_a_pack(notes_dir):
+    assert open_pack(notes_dir, title="The mystery board").pack_id
+
+
+# --- the target can change underneath a pack ---
+
+def test_a_rebuilt_target_is_flagged_on_every_read_path(notes_dir, tmp_path):
+    """Same reasoning as marking a superseded finding: findings about bytes that have
+    since changed read as current, and the model has no way to notice by itself."""
+    target = tmp_path / "firmware.bin"
+    target.write_bytes(b"version one")
+
+    pack = open_pack(notes_dir, target=str(target))
+    result = record(pack, title="Header is 32 bytes")
+    assert not pack.target_changed
+
+    target.write_bytes(b"version two, rebuilt")
+    reopened = open_pack(notes_dir, target=str(target))
+    assert reopened.target_changed
+
+    # All three read paths, because the first version of the supersede banner only
+    # covered the index and handed retracted findings back unmarked everywhere else.
+    assert "have changed" in read_notes(reopened).content
+    assert "have changed" in read_notes(reopened, finding_id=result.data["finding"]["id"]).content
+    assert "have changed" in read_notes(reopened, kind="structure").content
+
+
+def test_an_unchanged_target_is_not_flagged(notes_dir, tmp_path):
+    target = tmp_path / "firmware.bin"
+    target.write_bytes(b"unchanged")
+    open_pack(notes_dir, target=str(target))
+    reopened = open_pack(notes_dir, target=str(target))
+    assert not reopened.target_changed
+    assert "have changed" not in read_notes(reopened).content
+
+
+def test_the_recorded_digest_is_never_refreshed(notes_dir, tmp_path):
+    """Refreshing it would silently adopt whatever bytes are there now, which is
+    exactly the event this exists to report."""
+    target = tmp_path / "firmware.bin"
+    target.write_bytes(b"version one")
+    first = open_pack(notes_dir, target=str(target))
+    original = first.meta["target_digest"]
+
+    target.write_bytes(b"version two")
+    reopened = open_pack(notes_dir, target=str(target))
+    assert reopened.meta["target_digest"] == original
+
+
+def test_a_target_that_is_not_a_file_is_not_an_error(notes_dir):
+    """A target may name a board or a device rather than a path, and that is normal."""
+    pack = open_pack(notes_dir, target="the ESP32 on the bench")
+    assert not pack.target_changed
+    assert record(pack, title="It boots").ok
+
+
+def test_a_large_target_is_fingerprinted_by_sampling(notes_dir, tmp_path, monkeypatch):
+    """A pack is opened before the first step of every run, so a flash image must not
+    be read end to end just to notice it is the same one."""
+    monkeypatch.setattr(skippy_re, "DIGEST_FULL_LIMIT", 1_024)
+    monkeypatch.setattr(skippy_re, "DIGEST_SAMPLE_BYTES", 256)
+    target = tmp_path / "flash.bin"
+    target.write_bytes(b"A" * 4_096)
+
+    pack = open_pack(notes_dir, target=str(target))
+    assert pack.meta["digest_method"] == "sha256-sampled"
+
+    # Sampling still has to notice a change at either end.
+    target.write_bytes(b"B" + b"A" * 4_095)
+    assert open_pack(notes_dir, target=str(target)).target_changed
+
+
+def test_digests_computed_differently_are_never_compared(notes_dir, tmp_path, monkeypatch):
+    """Comparing a sampled digest against a full one would report every target as
+    changed, which trains the reader to ignore the warning."""
+    target = tmp_path / "flash.bin"
+    target.write_bytes(b"A" * 4_096)
+    open_pack(notes_dir, target=str(target))
+
+    monkeypatch.setattr(skippy_re, "DIGEST_FULL_LIMIT", 1_024)
+    assert not open_pack(notes_dir, target=str(target)).target_changed
+
+
+# --- the loop's command log ---
+#
+# Findings are written when the model decides to write them, and the first live run
+# decided to write them all at the end. The commands are recorded mechanically so the
+# evidence survives regardless of how the run ends.
+
+def test_a_logged_command_is_a_plain_file_holding_its_output(pack):
+    record_ = pack.log_command("otool -h target", output="magic 0xfeedfacf", cwd="/opt",
+                               exit_code=0, ok=True)
+    text = open(record_["path"], encoding="utf-8").read()
+    assert "otool -h target" in text
+    assert "magic 0xfeedfacf" in text
+    assert "exit_code: 0" in text
+
+
+def test_commands_are_numbered_in_the_order_they_ran(pack):
+    for index in range(3):
+        pack.log_command(f"strings -n {index} target", output=str(index))
+    ids = [os.path.basename(p).split("-", 1)[0] for p in pack.command_files()]
+    assert ids == ["0001", "0002", "0003"]
+
+
+def test_a_blank_command_is_not_logged(pack):
+    assert pack.log_command("") == {}
+    assert pack.command_files() == []
+
+
+def test_enormous_command_output_is_capped(pack):
+    """An objdump region is exactly the case that matters, and exactly the one that
+    would otherwise fill the memory root."""
+    record_ = pack.log_command("objdump -d target", output="x" * 200_000)
+    text = open(record_["path"], encoding="utf-8").read()
+    assert len(text) < skippy_re.MAX_COMMAND_OUTPUT_CHARS + 2_000
+
+
+def test_the_command_count_is_reported_alongside_the_findings(pack):
+    pack.log_command("file target", output="Mach-O 64-bit executable")
+    record(pack, title="It is a Mach-O")
+    result = read_notes(pack)
+    assert result.data["commands"] == 1
+    assert "Commands logged: 1" in result.content
+
+
+def test_a_stray_file_in_the_commands_directory_is_ignored(pack):
+    pack.log_command("file target", output="x")
+    with open(os.path.join(pack.commands_dir, "scratch.txt"), "w", encoding="utf-8") as handle:
+        handle.write("not a command")
+    assert len(pack.command_files()) == 1
+
+
+# --- weaknesses carry a severity ---
+
+def test_a_weakness_without_a_severity_is_refused(pack):
+    result = record(pack, kind="weakness", title="Stack buffer is unchecked")
+    assert not result.ok
+    assert "severity" in result.summary
+    # The refusal has to name the options, or the model guesses again.
+    for level in skippy_re.SEVERITY:
+        assert level in result.summary
+
+
+def test_the_advice_in_the_severity_refusal_actually_works(pack):
+    """Same rule as the evidence refusal: a message recommending an action that is
+    then rejected leaves the model alternating between two refusals."""
+    refusal = record(pack, kind="weakness", title="Unchecked copy").summary
+    for level in skippy_re.SEVERITY:
+        if level not in refusal:
+            continue
+        followed = record(pack, kind="weakness", title=f"Unchecked copy ({level})",
+                          severity=level)
+        assert followed.ok, f"the refusal offers '{level}' but rejects it: {followed.summary}"
+
+
+def test_an_invented_severity_is_refused_as_a_misspelling(pack):
+    """Reported as a bad value rather than as a missing one, which is a different fix."""
+    result = record(pack, kind="weakness", title="x", severity="sev1")
+    assert not result.ok
+    assert "sev1" in result.summary
+
+
+def test_a_weakness_still_needs_evidence(pack):
+    """A weakness drives a change to our own code, so it is the last kind that should
+    be recordable on a hunch."""
+    assert not record(pack, kind="weakness", severity="high", evidence="").ok
+
+
+def test_severity_and_confidence_are_recorded_separately(pack):
+    """A speculative critical and a confirmed critical are different work, and showing
+    severity alone is how a guess acquires a deadline."""
+    result = record(pack, kind="weakness", title="Unchecked length field",
+                    severity="critical", confidence="speculative")
+    assert result.ok
+    text = open(result.data["finding"]["path"], encoding="utf-8").read()
+    assert "severity: critical" in text
+    assert "confidence: speculative" in text
+
+
+@pytest.mark.parametrize("level", skippy_re.SEVERITY)
+def test_every_documented_severity_is_accepted(pack, level):
+    assert record(pack, kind="weakness", title=f"A {level} weakness", severity=level).ok
+
+
+def test_weaknesses_lead_the_index_worst_first(pack):
+    record(pack, kind="weakness", title="Minor logging leak", severity="low")
+    record(pack, kind="weakness", title="Unauthenticated firmware update", severity="critical")
+    record(pack, kind="structure", title="Header is 32 bytes")
+
+    content = read_notes(pack).content
+    assert content.index("## Weaknesses") < content.index("## Findings")
+    assert content.index("Unauthenticated firmware update") < content.index("Minor logging leak")
+
+
+def test_a_superseded_weakness_leaves_the_weakness_list(pack):
+    first = record(pack, kind="weakness", title="Suspected overflow", severity="high")
+    record(pack, kind="weakness", title="Not an overflow after all; bounds are checked",
+           severity="low", supersedes=first.data["finding"]["id"])
+
+    weaknesses = read_notes(pack).content.split("## Findings")[0]
+    assert "Suspected overflow" not in weaknesses

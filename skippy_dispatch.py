@@ -36,13 +36,14 @@ _SYNC_TOOLS = {
     "read_notes": skippy_re.read_notes,
     "record_decision": skippy_memory.record_decision,
     "recall_project": skippy_memory.recall_project,
+    "resolve_work_item": skippy_memory.resolve_work_item,
 }
 
 # These take a `pack` the loop opens, and only exist when there is one.
 _NOTES_TOOLS = ("note_finding", "read_notes")
 
 # These take the project memory the loop opens, for the same reason.
-_MEMORY_TOOLS = ("record_decision", "recall_project")
+_MEMORY_TOOLS = ("record_decision", "recall_project", "resolve_work_item")
 
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,

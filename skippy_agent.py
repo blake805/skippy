@@ -55,6 +55,12 @@ NUDGE_LIMIT = 2
 REPEAT_LIMIT = 3
 REPEAT_WINDOW = 6
 
+# Inspection commands run since the last recorded finding before the loop says
+# something. The prompt already asks for record-as-you-go and the first live RE run
+# ignored it, batching five findings into the last five steps of eighteen; a count the
+# model can see is a different message from an instruction it has already read past.
+RE_RECORD_NUDGE_AFTER = 6
+
 FINISH_SCHEMA = {
     "type": "function",
     "function": {
@@ -93,6 +99,12 @@ class AgentOutcome:
     # run, which has no pack.
     findings: int = 0
     pack_id: str = ""
+    # Commands the loop logged into the pack. Reported separately from findings
+    # because it is the part that survives a run dying mid-investigation, and a run
+    # with evidence but no conclusions is a different thing from one with neither.
+    commands_logged: int = 0
+    # Work items raised from `weakness` findings, for a later coding session.
+    work_items: List[str] = field(default_factory=list)
     # Where this run was written down, so a caller can point at it.
     session_id: str = ""
 
@@ -154,6 +166,8 @@ class AgentLoop:
         self._nudges = 0
         self._recent_calls: List[str] = []
         self._folds = 0
+        self._commands_since_finding = 0
+        self.work_items: List[str] = []
 
         # RE mode gets a pack keyed by the target, so a second session on the same
         # artifact accumulates onto the first instead of starting over. The loop opens
@@ -205,6 +219,11 @@ class AgentLoop:
                 # Said here rather than left to the prompt, because the single most
                 # wasteful thing an RE session can do is re-derive last week's work.
                 opening += ". Call read_notes before starting; this target has been looked at before."
+            if self.notes_pack.target_changed:
+                # In the opening message as well as on every read path. Findings about
+                # bytes that have since changed are worse than no findings, and the
+                # model has no way to notice on its own.
+                opening += f"\n\nWARNING: {self.notes_pack.target_changed}"
         if extra_context:
             opening += f"\n\n{extra_context}"
         self.transcript.append({"role": "user", "content": f"{opening}\n\nTask: {self.task}"})
@@ -286,7 +305,10 @@ class AgentLoop:
         # anything. And any run that touched the tree is kept regardless of how it
         # ended, because a half-applied edit is exactly what the next session must know.
         did_not_run = outcome.status in ("failed", "cancelled")
-        produced = outcome.files_changed or outcome.findings
+        # A logged command counts as having produced something: an RE run killed before
+        # it concluded anything still left the evidence trail behind, and that is the
+        # trail the next session picks up.
+        produced = outcome.files_changed or outcome.findings or outcome.commands_logged
         if did_not_run and not produced:
             logger.info("Not recording a %s run that produced nothing.", outcome.status)
             return
@@ -314,6 +336,8 @@ class AgentLoop:
             tool_calls=self.tool_calls,
             findings=len(self.notes_pack.finding_files()) if self.notes_pack else 0,
             pack_id=self.notes_pack.pack_id if self.notes_pack else "",
+            commands_logged=len(self.notes_pack.command_files()) if self.notes_pack else 0,
+            work_items=list(self.work_items),
         )
 
     async def _loop(self) -> AgentOutcome:
@@ -377,6 +401,10 @@ class AgentLoop:
 
                 result = await self._run_tool(call)
                 observation = await self._observe(name, result)
+                if self.notes_pack is not None:
+                    note = self._record_re_artifacts(call, result)
+                    if note:
+                        observation = f"{observation}\n{note}"
                 self._answer(call, result, observation)
 
             if finish is not None:
@@ -386,11 +414,19 @@ class AgentLoop:
                         self.files_changed.append(path)
                 return self._outcome("finished", summary)
 
+            nudge = self._recording_nudge()
+            if nudge:
+                self.transcript.append({"role": "user", "content": nudge})
+
         # What survived the run is mode-specific, and reporting the wrong one makes a
         # productive run look empty: an RE run never changes a file, so "files changed:
         # none" is both true and actively misleading about work that is sitting on disk.
         if self.notes_pack is not None:
-            kept = f"Findings recorded: {len(self.notes_pack.finding_files())} in pack {self.notes_pack.pack_id}"
+            kept = (
+                f"Findings recorded: {len(self.notes_pack.finding_files())} in pack "
+                f"{self.notes_pack.pack_id}, with "
+                f"{len(self.notes_pack.command_files())} command(s) logged"
+            )
         else:
             kept = f"Files changed: {', '.join(self.files_changed) or 'none'}"
         return self._outcome(
@@ -446,6 +482,103 @@ class AgentLoop:
         })
         await self.emit(event)
         return result
+
+    def _record_re_artifacts(self, call: dict, result: ToolResult) -> str:
+        """Write down what an RE tool call produced, and say so where it matters.
+
+        Both halves of this are here rather than in the tool because both must happen
+        whatever the model does next. ADR 0013 states the rule and this is the third
+        place it applies: anything that must happen has to be done by the loop.
+
+        Returns a line to append to the observation, or "" — used only where the model
+        needs to know something the tool itself could not tell it.
+        """
+        name = call["name"]
+
+        if name == "run_command":
+            # Only commands that actually ran. A rejected one has no output about the
+            # target, and logging refusals would bury the evidence in noise.
+            command = result.data.get("command")
+            if not command:
+                return ""
+            self._commands_since_finding += 1
+            try:
+                self.notes_pack.log_command(
+                    command=command,
+                    output=result.content,
+                    cwd=result.data.get("cwd", ""),
+                    exit_code=result.data.get("exit_code"),
+                    ok=result.ok,
+                )
+            except OSError:
+                # The command already ran and the model already has its output. Losing
+                # the log entry costs durability, not the investigation.
+                logger.warning("Could not log a command to the note pack.", exc_info=True)
+            return ""
+
+        if name != "note_finding" or not result.ok:
+            return ""
+
+        self._commands_since_finding = 0
+        finding = result.data.get("finding") or {}
+        if finding.get("kind") not in skippy_re.KINDS_REQUIRING_SEVERITY:
+            return ""
+
+        if self.memory is None:
+            # Told to the model, because the finding is safely on disk but the thing
+            # that makes it actionable — a later coding session seeing it — did not
+            # happen, and its finish summary is then the only route to a human.
+            return (
+                "NOTE: project memory is unavailable, so this weakness was not raised as "
+                "a work item for a later coding session. Repeat it in your finish summary."
+            )
+
+        args = call.get("arguments") or {}
+        try:
+            item = self.memory.add_work_item(
+                title=str(args.get("title") or finding.get("id") or "").strip(),
+                body=str(args.get("body") or "").strip(),
+                severity=finding.get("severity", ""),
+                confidence=finding.get("confidence", ""),
+                pack=self.notes_pack.pack_id,
+                finding=finding.get("id", ""),
+                target=str(self.notes_pack.meta.get("target") or ""),
+            )
+        except OSError:
+            logger.warning("Could not raise a work item for a weakness.", exc_info=True)
+            return ""
+
+        if item.get("id"):
+            self.work_items.append(item["id"])
+        return (
+            f"Raised work item {item.get('id')} in project memory, so a later coding "
+            "session on these repos will see this weakness without being told."
+        )
+
+    def _recording_nudge(self) -> str:
+        """Say something when a run has been inspecting for a while and recording nothing.
+
+        The command log means an early death no longer loses the *evidence*, but it
+        cannot capture a conclusion, and the first live RE run established that the
+        model batches findings at the end when left to itself. So this counts commands
+        and quotes the number back: the prompt already asks for record-as-you-go, and
+        the useful new information is how far past that the run has drifted.
+
+        Resets on firing, so it recurs at the same interval rather than every step. A
+        nudge repeated every step is one the model learns to read past.
+        """
+        if self.notes_pack is None or self._commands_since_finding < RE_RECORD_NUDGE_AFTER:
+            return ""
+        count = self._commands_since_finding
+        self._commands_since_finding = 0
+        return (
+            f"You have run {count} inspection commands without recording a finding. Each "
+            "command and its output is already saved to the note pack, so the evidence is "
+            "safe — but your conclusions are not, and a run that stops here leaves nobody "
+            "anything to read. Record what you have established now, at whatever "
+            "confidence is honest, before inspecting anything further. Use kind "
+            "'question' for what you do not understand yet."
+        )
 
     def _answer(self, call: dict, result: ToolResult, observation: Optional[str] = None) -> None:
         """Append the `tool` message that answers one call. Every call gets one."""

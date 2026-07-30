@@ -177,12 +177,16 @@ Conventions established here:
 Decisions from earlier sessions:
 - [0003] Retries belong in the transport [MAY BE OUT OF DATE: net/client.py no longer exists]
 
+Open weaknesses found in earlier reverse-engineering sessions:
+- [0001] [critical, confirmed] Firmware update accepts unsigned images
+  evidence: finding 0004 in pack firmware-bin-a3f81c2e
+
 Recent sessions, newest first:
 - 2026-07-29T21:31 [finished] Moved retries into the transport (touched net/pool.py)
 - 2026-07-28T16:02 [max_steps] Got halfway through the auth migration; refresh path unfinished
 ```
 
-Three choices worth knowing about:
+Four choices worth knowing about:
 
 - **Recall is not optional.** The history goes in the opening message rather than
   waiting on the model to call a tool. A tool the model may call is one it mostly will
@@ -197,6 +201,10 @@ Three choices worth knowing about:
 - **Failed runs are recorded too.** A run that ran out of steps halfway through a
   migration is the most useful thing for the next session to know, so the record is
   written on every terminal outcome, not just success.
+- **It carries work across modes.** A weakness recorded in an RE session becomes a work
+  item here, so the coding session that can actually fix it opens knowing about it. The
+  item points at the finding rather than restating it, `resolve_work_item` closes it, and
+  the resolution is a new record rather than an edit.
 
 Sessions are JSON and decisions are markdown under `sessions_root()/projects/<id>`,
 keyed by the basenames of your workspace roots, so nothing has to be named by hand.
@@ -214,20 +222,31 @@ outcome = await skippy_agent.run_task(
 )
 ```
 
-RE mode differs from coding mode in three things, and nothing else:
+RE mode differs from coding mode in four things, and nothing else:
 
 - **The notes are the deliverable.** A coding task leaves a diff and the repo remembers
   it; an RE task changes nothing, so anything not written down is lost when the
   transcript folds. `note_finding` writes one markdown file per finding under
-  `notes_root()`, keyed by target, so next month's session accumulates onto this one
-  instead of re-deriving it. The loop says how many findings already exist and tells the
-  model to read them first.
+  `notes_root()`, in a pack keyed by the target's resolved path, so next month's session
+  accumulates onto this one instead of re-deriving it — and two products that both ship a
+  `firmware.bin` get two packs rather than one confusing one. If the target's bytes have
+  changed since the pack was started, every read of it says so.
 - **Evidence and confidence are mandatory.** A finding with no evidence is refused:
   "the header is 32 bytes" is worthless later, "`otool -h` reports sizeofcmds 0x20" can
   be rechecked. Confidence is `speculative` / `likely` / `confirmed`, recorded
   separately, because the thing that ruins an investigation is a guess getting cited as
   fact by everything built on it. Corrections supersede rather than overwrite, and a
   superseded finding is marked as such on every path that reads it.
+  The loop also logs every inspection command it runs and what the command printed, so a
+  run that dies at step nine leaves the evidence rather than nothing, and a finding can be
+  checked against the output it came from. Conclusions are still the model's to write;
+  after six commands with nothing recorded, it gets told so.
+- **Findings can name work.** A `weakness` finding carries a severity — `low` through
+  `critical`, alongside its confidence, because a speculative critical and a confirmed one
+  are different work. Recording one raises a work item in project memory, which is how the
+  next coding session on the same repos opens knowing what needs fixing. Finding it in RE
+  mode and fixing it in coding mode is the workflow; there is deliberately no
+  report generator.
 - **It cannot run the artifact.** There is no `apply_patch`, and `run_command` switches
   to an inspection-only allowlist: `file`, `strings`, `nm`, `otool`, `objdump`,
   `dwarfdump`, `xxd`, `c++filt` and friends, with no interpreter, build tool or test
@@ -244,7 +263,10 @@ x86/x86-64 but not Xtensa, RISC-V or MIPS, so ESP32, RISC-V and MIPS targets can
 disassembled at all. Running the target under a debugger is a separate need and wants a
 VM rather than another entry in the allowlist; the refusal says so, and the model
 records the question instead. See
-[ADR 0012](docs/adr/0012-reverse-engineering-mode.md).
+[ADR 0012](docs/adr/0012-reverse-engineering-mode.md),
+[0015](docs/adr/0015-note-pack-identity.md),
+[0016](docs/adr/0016-loop-captured-evidence.md) and
+[0017](docs/adr/0017-weakness-findings-and-handoff.md).
 
 ### Why transcripts are append-only
 
@@ -267,8 +289,8 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
 | `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
-| `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings that outlive the session |
-| `skippy_memory.py` | Project memory: sessions and decisions, carried into the next run and marked when stale |
+| `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings, and the command log behind them |
+| `skippy_memory.py` | Project memory: sessions, decisions and work items, carried into the next run and marked when stale |
 | `skippy_tasks.py` | Runs a task for a connected client: one at a time, cancellable, events follow the client |
 | `skippy_cursor.py` | Bridge to the editor: routes patches through it and brings diagnostics back |
 | `cursor_client/` | The sideloaded VS Code-compatible extension |
