@@ -165,9 +165,20 @@ from ADR 0013 feeding the same run.
 
 `/ws/factory` has no authentication. `client_id` is a query parameter, so anything that
 can reach the port can register as `cursor` and answer RPCs — or impersonate the editor.
-That is acceptable while the bind is loopback, and dropping `run_task` removes the worst
-of what impersonation would buy. It has to be solved before the port is reachable from
-anywhere else, which is the remote-access work.
+Dropping `run_task` removes the worst of what impersonation would buy. It has to be
+solved before the port is reachable from anywhere else, which is the remote-access work.
+
+> **Correction.** This section originally said the missing authentication was
+> "acceptable while the bind is loopback." The bind was not loopback: `skippy_factory.py`
+> passed `host="0.0.0.0"`, and the SkippyServer boot line is `python skippy_factory.py`,
+> so the deployed hub listened on every interface. Worse than editor impersonation, any
+> message on that socket which is not a reply, a greeting or a cancel starts an agent
+> run — so anything on the local network could edit the workspace roots and execute
+> commands, and `apply_patch` followed by the interpreter walks around the `run_command`
+> allowlist entirely. The default is now `127.0.0.1`, overridable through
+> `SKIPPY_BIND_HOST` with a warning naming what the exposure is, because remote access
+> is a real requirement and the answer there is a private interface rather than a public
+> one. The reasoning above is now true rather than assumed.
 
 Workspace roots still come from `SKIPPY_WORKSPACE_ROOTS` rather than from the editor's
 open folders. `get_workspace_roots` is implemented on both sides and unused; wiring it up

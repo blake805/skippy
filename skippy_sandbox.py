@@ -125,6 +125,29 @@ class Sandbox:
         # The separator matters: without it, root "/a/b" would accept "/a/bad".
         return any(path == root or path.startswith(root + os.sep) for root in self.roots)
 
+    def _bases(self, path: str) -> List[str]:
+        """Which directories a relative path could be interpreted from, in order.
+
+        `relative()` prefixes the root's name when there are several roots, so the paths
+        every discovery tool prints back — grep, glob_files, list_dir — look like
+        `repo-name/src/thing.py`. Joining those onto `primary` gives
+        `<primary>/repo-name/src/thing.py`, which does not exist for any root including
+        the primary one. So with more than one root, no file the agent found could be
+        read using the name it was shown: a live run called glob_files, got one match,
+        and then failed to read that exact path five times before giving up.
+
+        The invariant being restored is that `resolve(relative(p))` is `p`. A leading
+        segment naming a root means the rest is relative to that root; anything else
+        keeps the old meaning of relative-to-primary, which is what single-root setups
+        and hand-written paths rely on.
+        """
+        head, _, _ = path.replace(os.sep, "/").partition("/")
+        # Several roots can share a basename (~/a/proj and ~/b/proj), which already
+        # makes `relative()` ambiguous. Offer every candidate and let existence on
+        # disk decide, rather than silently picking the first.
+        named = [root for root in self.roots if os.path.basename(root) == head]
+        return [os.path.dirname(root) for root in named] + [self.primary]
+
     def resolve(self, path: str, must_exist: bool = False) -> str:
         """Return an absolute, symlink-resolved path, or raise SandboxError."""
         if path is None or not str(path).strip():
@@ -138,7 +161,16 @@ class Sandbox:
 
         raw = os.path.expanduser(raw)
         if not os.path.isabs(raw):
-            raw = os.path.join(self.primary, raw)
+            candidates = [os.path.join(base, raw) for base in self._bases(raw)]
+            # The first that exists wins; failing that, the first that is inside a root,
+            # so a path being created still resolves and still gets range-checked.
+            raw = next(
+                (c for c in candidates if os.path.exists(c)),
+                next(
+                    (c for c in candidates if self._within_roots(os.path.realpath(c))),
+                    candidates[-1],
+                ),
+            )
 
         try:
             real = os.path.realpath(raw)

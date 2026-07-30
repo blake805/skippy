@@ -224,6 +224,102 @@ def test_repo_root_for_never_walks_past_a_root(box, roots):
     assert box.repo_root_for(box.resolve("src/main.py")) is None
 
 
+# --- the paths the agent is shown must be paths it can use again ---
+#
+# `relative()` prefixes the root's name when there are several roots, so every
+# discovery tool prints `repo_a/src/main.py`. `resolve()` joined relative paths onto
+# the primary root, making that `<repo_a>/repo_a/src/main.py` — which exists under no
+# root, including the primary one. With more than one root, nothing the agent found
+# could be read back under the name it was given.
+#
+# A live run is what surfaced it: glob_files reported one match for **/retry.py, and
+# read_file on that exact path failed as "does not exist" five times before the agent
+# gave up and reported itself blocked. Nothing caught it earlier because the tests
+# checked `relative()` and `resolve()` separately and never composed them.
+
+def test_a_displayed_path_can_be_resolved_again(box, roots):
+    """The invariant: resolve(relative(p)) is p, for every root."""
+    first, second, _ = roots
+    for real in (str(first / "src" / "main.py"), str(second / "lib.py")):
+        shown = box.relative(real)
+        assert box.resolve(shown, must_exist=True) == real, shown
+
+
+def test_every_discovered_path_is_readable(box, roots):
+    """The end-to-end shape of the live failure, without the model."""
+    import skippy_fs
+
+    found = skippy_fs.glob_files(box, "**/*.py")
+    assert found.ok
+    listed = [line.strip() for line in found.content.splitlines() if line.strip()]
+    assert listed, "the fixture should match something"
+    for path in listed:
+        assert skippy_fs.read_file(box, path).ok, f"glob offered {path!r} but it cannot be read"
+
+
+def test_a_path_in_the_secondary_root_resolves(box, roots):
+    _, second, _ = roots
+    assert box.resolve("repo_b/lib.py", must_exist=True) == str(second / "lib.py")
+
+
+def test_an_unprefixed_path_still_means_the_primary_root(box, roots):
+    """Hand-written and single-root paths keep their old meaning."""
+    first, _, _ = roots
+    assert box.resolve("src/main.py", must_exist=True) == str(first / "src" / "main.py")
+
+
+def test_one_root_displays_and_resolves_without_a_prefix(tmp_path):
+    root = tmp_path / "only"
+    (root / "src").mkdir(parents=True)
+    target = root / "src" / "main.py"
+    target.write_text("x\n")
+
+    box = Sandbox([str(root)])
+    assert box.relative(str(target)) == os.path.join("src", "main.py")
+    assert box.resolve(box.relative(str(target)), must_exist=True) == str(target)
+
+
+def test_a_file_that_does_not_exist_yet_still_resolves_into_its_root(box, roots):
+    """apply_patch creates files, so this cannot depend on existence."""
+    _, second, _ = roots
+    assert box.resolve("repo_b/new_module.py") == str(second / "new_module.py")
+
+
+def test_roots_sharing_a_basename_resolve_to_the_one_that_has_the_file(tmp_path):
+    """`relative()` renders both as `proj/...`, so existence is what disambiguates."""
+    for parent in ("one", "two"):
+        (tmp_path / parent / "proj").mkdir(parents=True)
+    (tmp_path / "two" / "proj" / "only_here.py").write_text("x\n")
+
+    box = Sandbox([str(tmp_path / "one" / "proj"), str(tmp_path / "two" / "proj")])
+    resolved = box.resolve("proj/only_here.py", must_exist=True)
+    assert resolved == str(tmp_path / "two" / "proj" / "only_here.py")
+
+
+def test_a_root_name_prefix_cannot_be_used_to_escape(box, roots):
+    """The prefix is a convenience, not a new way out of the sandbox."""
+    _, _, parent = roots
+    (parent / "secret.txt").write_text("do not read me\n")
+    for bad in ("repo_b/../secret.txt", "repo_b/../../etc/passwd", "repo_a/../repo_b/../secret.txt"):
+        with pytest.raises(SandboxError):
+            box.resolve(bad)
+
+
+def test_a_directory_named_after_a_root_inside_the_primary_still_works(tmp_path):
+    """The prefix must not shadow a real directory that happens to share the name."""
+    first = tmp_path / "alpha"
+    second = tmp_path / "beta"
+    # A real ./beta inside alpha, colliding with the second root's name.
+    (first / "beta").mkdir(parents=True)
+    (first / "beta" / "inner.py").write_text("inner\n")
+    second.mkdir()
+
+    box = Sandbox([str(first), str(second)])
+    # Exists under the primary and not under the named root, so it resolves there
+    # rather than failing.
+    assert box.resolve("beta/inner.py", must_exist=True) == str(first / "beta" / "inner.py")
+
+
 # --- cap_text ---
 
 def test_cap_text_keeps_both_ends():
