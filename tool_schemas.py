@@ -447,6 +447,100 @@ _SCHEMAS = {
 }
 
 
+# A raw flash dump has no header saying what it is, and an ESP32 image is exactly that.
+# Shared between both tools because getting it right on one and not the other would mean
+# a function that disassembles and then refuses to decompile.
+_ARCH_PARAM = {
+    "type": "string",
+    "description": (
+        "Only for a raw dump with no recognisable container, where nothing declares the "
+        "architecture: 'xtensa' for ESP32, or arm, x86, mips, riscv. Leave this out for "
+        "an ELF, Mach-O or PE — those say what they are, and a value that disagrees with "
+        "the file is refused rather than obeyed."
+    ),
+}
+
+_BITS_PARAM = {
+    "type": "integer",
+    "description": "Word size for a raw dump: 8, 16, 32 or 64. Ignored for a real container.",
+}
+
+_SCHEMAS["disassemble_function"] = {
+    "description": (
+        "Disassemble one function of the target artifact, with rizin's analysis of its "
+        "arguments, locals and control flow. Covers x86-64, ARM, AArch64, MIPS, RISC-V "
+        "and Xtensa (ESP32). Prefer this over `objdump` through run_command: it returns "
+        "the one function you asked about instead of a region, and it handles "
+        "architectures the system objdump cannot read at all."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "symbol": {
+                "type": "string",
+                "description": (
+                    "The function to read: a symbol name as it appears in the binary, or "
+                    "a hex address like 0x100003f40. Leading underscores and `sym.` "
+                    "prefixes are handled for you. Use list_symbols if you do not know "
+                    "the name; for a stripped target, find an address with run_command "
+                    "first and pass that."
+                ),
+            },
+            "arch": _ARCH_PARAM,
+            "bits": _BITS_PARAM,
+        },
+        "required": ["symbol"],
+    },
+}
+
+_SCHEMAS["decompile"] = {
+    "description": (
+        "Decompile one function of the target artifact to C, using the Ghidra "
+        "decompiler. Much faster to read than disassembly for working out what a "
+        "routine does. The output is a reconstruction rather than the original source, "
+        "so a finding based on it alone is 'likely' rather than 'confirmed'. On Xtensa "
+        "and RISC-V the parameter list specifically is unreliable and the tool says so."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "symbol": {
+                "type": "string",
+                "description": (
+                    "The function to decompile: a symbol name as it appears in the "
+                    "binary, or a hex address. Same resolution as disassemble_function."
+                ),
+            },
+            "arch": _ARCH_PARAM,
+            "bits": _BITS_PARAM,
+        },
+        "required": ["symbol"],
+    },
+}
+
+_SCHEMAS["list_symbols"] = {
+    "description": (
+        "The named functions in the target artifact, with their addresses. Use this to "
+        "find something worth reading before disassembling, and to avoid guessing at "
+        "symbol names. Returns nothing useful on a stripped binary, which is itself "
+        "worth knowing."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "contains": {
+                "type": "string",
+                "description": (
+                    "Optional filter: only symbols whose name contains this, "
+                    "case-insensitively. 'verify', 'crypt', 'update'."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+
 def _wrap(name: str) -> dict:
     schema = _SCHEMAS[name]
     return {
@@ -463,6 +557,10 @@ FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
 NOTES_TOOLS = ("note_finding", "read_notes")
+# RE mode only, and not because coding mode would be harmed by them: they read the
+# session's target artifact, and a coding session has a repository rather than a target.
+# See ADR 0018 for why these are structured tools instead of an allowlisted `rizin`.
+DISASSEMBLY_TOOLS = ("list_symbols", "disassemble_function", "decompile")
 # Offered in both modes: continuing prior work is not specific to either.
 MEMORY_TOOLS = ("record_decision", "recall_project")
 # Coding mode only. A weakness is raised in RE mode and discharged by changing code,
@@ -490,7 +588,8 @@ def re_tools() -> list:
     artifact, and the notes are the deliverable rather than a diff."""
     return [
         _wrap(name)
-        for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + MEMORY_TOOLS
+        for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + DISASSEMBLY_TOOLS
+        + MEMORY_TOOLS
     ]
 
 

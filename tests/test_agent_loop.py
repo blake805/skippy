@@ -7,10 +7,14 @@ of steps must never be reported as a success. And not getting stuck, because the
 failure mode of an unattended loop is burning forty steps repeating itself.
 """
 
+import os
+from unittest import mock
+
 import pytest
 
 import skippy_agent
-from skippy_sandbox import Sandbox
+import skippy_dispatch
+from skippy_sandbox import Sandbox, ToolResult
 from tests import fake_llm as fl
 
 
@@ -870,6 +874,144 @@ async def test_recording_a_finding_resets_the_count(box, routed_llm, tmp_path, r
     )
 
     assert not [
+        m for m in routed_llm.last_messages()
+        if m.get("role") == "user" and "without recording a finding" in (m.get("content") or "")
+    ]
+
+
+# --- the disassembly tools are RE-only, and their output is evidence too ---
+
+def test_the_disassembly_tools_are_offered_only_in_re_mode(box, tmp_path):
+    """They read the session's target artifact, and a coding session has a repository
+    rather than a target. Offering them there would be a tool that cannot work."""
+    coding = skippy_agent.AgentLoop("Fix it", box)
+    re_loop = skippy_agent.AgentLoop(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes")
+    )
+    for tool in ("disassemble_function", "decompile", "list_symbols"):
+        assert tool in tool_names(re_loop)
+        assert tool not in tool_names(coding)
+
+
+@pytest.mark.asyncio
+async def test_a_disassembly_is_logged_to_the_pack_like_any_other_evidence(
+    box, routed_llm, tmp_path, repo
+):
+    """ADR 0016 says the loop keeps the evidence. A function's disassembly is evidence
+    exactly as much as an `objdump` region is, and that it arrives through a structured
+    tool rather than `run_command` would be a poor reason for the record to have a hole
+    in it."""
+    import skippy_re
+
+    (repo / "sample.bin").write_bytes(b"\x00\x01\x02\x03")
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call("disassemble_function", call_id="c1", symbol="verify_image"),
+        finish("Looked at one function.", call_id="c2"),
+    ])
+
+    async def fake_disassemble(pack, symbol, arch="", bits=None):
+        return ToolResult(
+            True, f"Disassembled {symbol} at 0x1000.",
+            "0x1000  push rbp\n0x1001  mov rbp, rsp",
+            data={"command": "rizin -N -q -c 's 0x1000; af; pdf' sample.bin",
+                  "symbol": symbol},
+        )
+
+    with mock.patch.dict(skippy_dispatch._ASYNC_TOOLS,
+                         {"disassemble_function": fake_disassemble}):
+        outcome = await skippy_agent.run_task(
+            "Analyse it", box, mode="re", notes_root=notes, target="sample.bin"
+        )
+
+    assert outcome.commands_logged == 1
+    pack = skippy_re.open_pack(notes, target="sample.bin")
+    logged = "\n".join(open(p, encoding="utf-8").read() for p in pack.command_files())
+    assert "push rbp" in logged
+    # The invocation is recorded too, so a reader can reproduce it by hand.
+    assert "rizin -N" in logged
+    # Named for what was asked, not for the rizin command line: an absolute path plus a
+    # `-c` script makes both the filename and the pack index unreadable.
+    assert any(
+        "disassemble-function-verify-image" in os.path.basename(p)
+        for p in pack.command_files()
+    )
+
+
+@pytest.mark.asyncio
+async def test_listing_symbols_is_not_logged_as_evidence(box, routed_llm, tmp_path, repo):
+    """Navigation, not evidence. Logging it would pad the record without adding to it,
+    and a session that only listed symbols has established nothing to record."""
+    import skippy_re
+
+    (repo / "sample.bin").write_bytes(b"\x00\x01")
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call("list_symbols", call_id="c1"),
+        finish("done", call_id="c2"),
+    ])
+
+    async def fake_list(pack, contains=""):
+        return ToolResult(True, "2 symbol(s).", "0x1000  main\n0x1100  verify")
+
+    with mock.patch.dict(skippy_dispatch._ASYNC_TOOLS, {"list_symbols": fake_list}):
+        outcome = await skippy_agent.run_task(
+            "Analyse it", box, mode="re", notes_root=notes, target="sample.bin"
+        )
+
+    assert outcome.commands_logged == 0
+    assert skippy_re.open_pack(notes, target="sample.bin").command_files() == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_disassembly_is_not_logged(box, routed_llm, tmp_path, repo):
+    """Same rule as a refused command: it says nothing about the artifact."""
+    import skippy_re
+
+    (repo / "sample.bin").write_bytes(b"\x00\x01")
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call("disassemble_function", call_id="c1", symbol="nope"),
+        finish("done", call_id="c2"),
+    ])
+
+    async def fake_fail(pack, symbol, arch="", bits=None):
+        return ToolResult(False, "'nope' is not in this binary's 12 symbols.")
+
+    with mock.patch.dict(skippy_dispatch._ASYNC_TOOLS,
+                         {"disassemble_function": fake_fail}):
+        outcome = await skippy_agent.run_task(
+            "Analyse it", box, mode="re", notes_root=notes, target="sample.bin"
+        )
+
+    assert outcome.commands_logged == 0
+    assert skippy_re.open_pack(notes, target="sample.bin").command_files() == []
+
+
+@pytest.mark.asyncio
+async def test_reading_functions_without_recording_still_gets_nudged(
+    box, routed_llm, tmp_path, repo
+):
+    """The nudge counts inspection, and reading functions is inspection. A session that
+    decompiled six routines and recorded nothing is the exact drift ADR 0016 is about."""
+    (repo / "sample.bin").write_bytes(b"\x00\x01")
+    script = [
+        fl.tool_call("decompile", call_id=f"c{n}", symbol=f"fn_{n}")
+        for n in range(skippy_agent.RE_RECORD_NUDGE_AFTER + 1)
+    ]
+    routed_llm.load(script + [finish("done", call_id="cf")])
+
+    async def fake_decompile(pack, symbol, arch="", bits=None):
+        return ToolResult(True, f"Decompiled {symbol}.", "int f(void) { return 0; }",
+                          data={"command": f"rizin -N ... {symbol}", "symbol": symbol})
+
+    with mock.patch.dict(skippy_dispatch._ASYNC_TOOLS, {"decompile": fake_decompile}):
+        await skippy_agent.run_task(
+            "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"),
+            target="sample.bin",
+        )
+
+    assert [
         m for m in routed_llm.last_messages()
         if m.get("role") == "user" and "without recording a finding" in (m.get("content") or "")
     ]

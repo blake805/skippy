@@ -22,6 +22,7 @@ import skippy_cursor
 import skippy_fs
 import skippy_memory
 import skippy_re
+import skippy_rizin
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
 
 logger = logging.getLogger("skippy_dispatch")
@@ -39,8 +40,13 @@ _SYNC_TOOLS = {
     "resolve_work_item": skippy_memory.resolve_work_item,
 }
 
-# These take a `pack` the loop opens, and only exist when there is one.
-_NOTES_TOOLS = ("note_finding", "read_notes")
+# These take a `pack` the loop opens, and only exist when there is one. The disassembly
+# tools are here for a second reason as well as the first: the pack is where the target
+# artifact is recorded, so taking the pack is what stops a tool call from naming its own
+# target and reading a file the session was never pointed at.
+_NOTES_TOOLS = (
+    "note_finding", "read_notes", "list_symbols", "disassemble_function", "decompile",
+)
 
 # These take the project memory the loop opens, for the same reason.
 _MEMORY_TOOLS = ("record_decision", "recall_project", "resolve_work_item")
@@ -50,6 +56,11 @@ _ASYNC_TOOLS = {
     "run_command": skippy_exec.run_command,
     # Async because it may route the write through the attached editor.
     "apply_patch": skippy_cursor.apply_patch,
+    # Async because each starts a rizin process. Never allowlisted for `run_command`:
+    # rizin's -c is a command language with a shell escape in it (ADR 0018).
+    "list_symbols": skippy_rizin.list_symbols,
+    "disassemble_function": skippy_rizin.disassemble_function,
+    "decompile": skippy_rizin.decompile,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
@@ -126,10 +137,16 @@ async def dispatch(
     # pack as their first argument where every other tool takes the sandbox.
     if name in _NOTES_TOOLS:
         if notes_pack is None:
+            tail = (
+                "This looks like a coding task; record what you found in your finish summary."
+                if name in ("note_finding", "read_notes")
+                else "This looks like a coding task, which has a repository rather than a "
+                     "target artifact to read."
+            )
             return ToolResult(
                 False,
                 f"'{name}' needs a note pack, which only reverse-engineering mode opens. "
-                "This looks like a coding task; record what you found in your finish summary.",
+                + tail,
             )
         first = notes_pack
     elif name in _MEMORY_TOOLS:

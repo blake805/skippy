@@ -102,6 +102,15 @@ ruins an investigation is a plausible guess getting cited as established fact by
 everything built on top of it. If you are guessing, say speculative.
 - Work outside in: what the file is, then its structure, then the parts that matter. \
 Do not start disassembling before you know what you are looking at.
+- To read code, use list_symbols, then disassemble_function and decompile. They work a \
+function at a time, which is the right unit for a question and keeps this conversation \
+small enough to stay useful. Reach for them rather than objdump through run_command: \
+they return the one function you asked about instead of a region you have to read \
+around, and they handle architectures — Xtensa on ESP32, RISC-V, MIPS — that the system \
+objdump cannot read at all. Decompiled C is much faster to read than disassembly, but it \
+is a reconstruction rather than source, so a finding resting on it alone is 'likely' \
+rather than 'confirmed'. Where a tool warns that something in its output is unreliable, \
+that warning is part of the evidence: do not record a claim it undercuts.
 - Record what you do not understand. An unrecorded unknown gets rediscovered from \
 scratch next session, and the open questions are often the most useful part of a pack.
 - When a later finding contradicts an earlier one, record the new one as superseding \

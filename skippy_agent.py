@@ -61,6 +61,12 @@ REPEAT_WINDOW = 6
 # model can see is a different message from an instruction it has already read past.
 RE_RECORD_NUDGE_AFTER = 6
 
+# RE tools whose output is evidence about the artifact, so the loop logs it to the pack
+# and counts it towards the recording nudge. `list_symbols` is navigation rather than
+# evidence and is deliberately absent: logging it would pad the record without adding to
+# it, and a session that only listed symbols has not established anything to record.
+RE_INSPECTION_TOOLS = ("disassemble_function", "decompile")
+
 FINISH_SCHEMA = {
     "type": "function",
     "function": {
@@ -514,6 +520,34 @@ class AgentLoop:
                 # The command already ran and the model already has its output. Losing
                 # the log entry costs durability, not the investigation.
                 logger.warning("Could not log a command to the note pack.", exc_info=True)
+            return ""
+
+        if name in RE_INSPECTION_TOOLS:
+            # A disassembly is evidence exactly as much as an `objdump` region is, and
+            # the reason for logging it is the same: it is what a later reader checks a
+            # finding against. That these arrive through a structured tool rather than
+            # `run_command` is an implementation detail of ADR 0018, and it would be a
+            # poor reason for the record to have a hole in it.
+            if not result.ok:
+                return ""
+            self._commands_since_finding += 1
+            # Logged under a readable label rather than the full rizin invocation: the
+            # label names the file and the pack index, and an absolute path plus a `-c`
+            # script makes both unreadable. The exact invocation goes in the body, where
+            # it is what a person retypes to check the finding.
+            symbol = str(result.data.get("symbol") or "").strip()
+            label = f"{name} {symbol}".strip()
+            invocation = result.data.get("command") or ""
+            body = f"$ {invocation}\n\n{result.content}" if invocation else result.content
+            try:
+                self.notes_pack.log_command(
+                    command=label,
+                    output=body,
+                    exit_code=0,
+                    ok=True,
+                )
+            except OSError:
+                logger.warning("Could not log a tool result to the note pack.", exc_info=True)
             return ""
 
         if name != "note_finding" or not result.ok:
