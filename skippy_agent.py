@@ -65,7 +65,7 @@ RE_RECORD_NUDGE_AFTER = 6
 # and counts it towards the recording nudge. `list_symbols` is navigation rather than
 # evidence and is deliberately absent: logging it would pad the record without adding to
 # it, and a session that only listed symbols has not established anything to record.
-RE_INSPECTION_TOOLS = ("disassemble_function", "decompile")
+RE_INSPECTION_TOOLS = ("disassemble_function", "decompile", "extract_artifact")
 
 FINISH_SCHEMA = {
     "type": "function",
@@ -465,9 +465,15 @@ class AgentLoop:
                 cursor=self.cursor,
             )
 
-        # apply_patch is the only tool that reports files, and it reports them the
-        # same way whether or not the write was a dry run.
-        if result.ok and result.data.get("files") and not result.data.get("dry_run"):
+        # Named rather than inferred from the shape of `data`. This used to key off the
+        # presence of a `files` entry, which quietly assumed no other tool would ever use
+        # that word — and one did, for a count rather than a list.
+        if (
+            name == "apply_patch"
+            and result.ok
+            and result.data.get("files")
+            and not result.data.get("dry_run")
+        ):
             for report in result.data["files"]:
                 path = report.get("path")
                 if path and path not in self.files_changed:
@@ -535,8 +541,10 @@ class AgentLoop:
             # label names the file and the pack index, and an absolute path plus a `-c`
             # script makes both unreadable. The exact invocation goes in the body, where
             # it is what a person retypes to check the finding.
-            symbol = str(result.data.get("symbol") or "").strip()
-            label = f"{name} {symbol}".strip()
+            subject = str(
+                result.data.get("symbol") or result.data.get("quarantine") or ""
+            ).strip()
+            label = f"{name} {subject}".strip()
             invocation = result.data.get("command") or ""
             body = f"$ {invocation}\n\n{result.content}" if invocation else result.content
             try:

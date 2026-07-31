@@ -640,14 +640,32 @@ def _present(view: Dict[str, Any], decompile_it: bool) -> ToolResult:
     )
 
 
-def _target_of(pack: Any) -> str:
-    """The artifact this pack is about.
+def _target_of(pack: Any, file: str = "") -> str:
+    """The artifact to read: the pack's target, or a file extracted from it.
 
-    Taken from the pack rather than accepted as an argument, for the same reason the
-    sandbox and the mode are injected: a tool call that could name its own target
-    could read a file the session was never pointed at, and the pack's whole identity
-    is which artifact it concerns.
+    The target is taken from the pack rather than accepted as an argument, for the same
+    reason the sandbox and the mode are injected: a call that could name its own target
+    could read a file the session was never pointed at, and the pack's identity is which
+    artifact it concerns.
+
+    `file` is the one exception, and it is narrow. Carving an image produces the
+    executables inside it, and the point of extracting them is to read them — a chain
+    that stopped at the container boundary would leave the interesting part unreachable.
+    So a file may be named, and it is resolved strictly inside the pack's quarantine by
+    `skippy_extract`, which refuses anything that escapes it after symlinks are
+    followed.
     """
+    if file:
+        import skippy_extract
+
+        try:
+            resolved = skippy_extract.resolve_in_quarantine(pack, file)
+        except skippy_extract.ExtractError as exc:
+            raise RizinError(str(exc)) from exc
+        if not os.path.isfile(resolved):
+            raise RizinError(f"'{file}' is not a file.")
+        return resolved
+
     target = str((getattr(pack, "meta", None) or {}).get("target") or "")
     if not target:
         raise RizinError(
@@ -664,10 +682,11 @@ def _target_of(pack: Any) -> str:
 
 
 async def _tool(
-    pack: Any, symbol: str, decompile_it: bool, arch: str = "", bits: Any = None
+    pack: Any, symbol: str, decompile_it: bool, arch: str = "", bits: Any = None,
+    file: str = "",
 ) -> ToolResult:
     try:
-        target = _target_of(pack)
+        target = _target_of(pack, file)
     except RizinError as exc:
         return ToolResult(False, str(exc))
     if not available():
@@ -687,18 +706,20 @@ async def _tool(
 
 
 async def disassemble_function(
-    pack: Any, symbol: str, arch: str = "", bits: Any = None
+    pack: Any, symbol: str, arch: str = "", bits: Any = None, file: str = ""
 ) -> ToolResult:
     """One function's instructions, with rizin's analysis of its arguments and locals."""
-    return await _tool(pack, symbol, decompile_it=False, arch=arch, bits=bits)
+    return await _tool(pack, symbol, decompile_it=False, arch=arch, bits=bits, file=file)
 
 
-async def decompile(pack: Any, symbol: str, arch: str = "", bits: Any = None) -> ToolResult:
+async def decompile(
+    pack: Any, symbol: str, arch: str = "", bits: Any = None, file: str = ""
+) -> ToolResult:
     """One function as C, via the Ghidra decompiler."""
-    return await _tool(pack, symbol, decompile_it=True, arch=arch, bits=bits)
+    return await _tool(pack, symbol, decompile_it=True, arch=arch, bits=bits, file=file)
 
 
-async def list_symbols(pack: Any, contains: str = "") -> ToolResult:
+async def list_symbols(pack: Any, contains: str = "", file: str = "") -> ToolResult:
     """The named functions in the target, optionally filtered.
 
     Here because the alternative is the model guessing symbol names, and a guess costs
@@ -706,7 +727,7 @@ async def list_symbols(pack: Any, contains: str = "") -> ToolResult:
     is needed to ask the next question — because this is navigation, not evidence.
     """
     try:
-        target = _target_of(pack)
+        target = _target_of(pack, file)
     except RizinError as exc:
         return ToolResult(False, str(exc))
     if not available():

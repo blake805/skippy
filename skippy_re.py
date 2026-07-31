@@ -199,6 +199,12 @@ class NotePack:
         self.dir = os.path.join(root, pack_id)
         self.findings_dir = os.path.join(self.dir, "findings")
         self.commands_dir = os.path.join(self.dir, "commands")
+        # Where extracted contents land. Under the pack rather than in a workspace
+        # root, because these bytes came out of a hostile blob by way of a stack of
+        # format parsers, and a workspace root is somewhere Skippy is allowed to write
+        # code. Belonging to the pack also makes them evidence: the tree that came out
+        # of an image is part of the record of what the image was.
+        self.quarantine_dir = os.path.join(self.dir, "quarantine")
         self.meta_path = os.path.join(self.dir, "pack.json")
         os.makedirs(self.findings_dir, exist_ok=True)
         os.makedirs(self.commands_dir, exist_ok=True)

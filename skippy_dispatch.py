@@ -22,6 +22,7 @@ import skippy_cursor
 import skippy_fs
 import skippy_memory
 import skippy_re
+import skippy_extract
 import skippy_rizin
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
 
@@ -46,6 +47,7 @@ _SYNC_TOOLS = {
 # target and reading a file the session was never pointed at.
 _NOTES_TOOLS = (
     "note_finding", "read_notes", "list_symbols", "disassemble_function", "decompile",
+    "extract_artifact", "list_extracted",
 )
 
 # These take the project memory the loop opens, for the same reason.
@@ -61,6 +63,10 @@ _ASYNC_TOOLS = {
     "list_symbols": skippy_rizin.list_symbols,
     "disassemble_function": skippy_rizin.disassemble_function,
     "decompile": skippy_rizin.decompile,
+    # Async because each starts a container. Extraction is the one RE operation that
+    # writes files, and it writes them into the pack rather than a workspace root.
+    "extract_artifact": skippy_extract.extract_artifact,
+    "list_extracted": skippy_extract.list_extracted,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a

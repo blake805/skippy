@@ -893,6 +893,50 @@ def test_the_disassembly_tools_are_offered_only_in_re_mode(box, tmp_path):
         assert tool not in tool_names(coding)
 
 
+def test_the_extraction_tools_are_offered_only_in_re_mode(box, tmp_path):
+    """Extraction writes into the pack's quarantine, which only an RE session has."""
+    coding = skippy_agent.AgentLoop("Fix it", box)
+    re_loop = skippy_agent.AgentLoop(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes")
+    )
+    for tool in ("extract_artifact", "list_extracted"):
+        assert tool in tool_names(re_loop)
+        assert tool not in tool_names(coding)
+
+
+@pytest.mark.asyncio
+async def test_an_extraction_is_logged_to_the_pack_as_evidence(box, routed_llm, tmp_path, repo):
+    """The tree that came out of an image is part of the record of what the image was, and
+    the container invocation beside it is what lets someone reproduce the carve."""
+    import skippy_re
+
+    (repo / "firmware.bin").write_bytes(b"\x00" * 64)
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        fl.tool_call("extract_artifact", call_id="c1"),
+        finish("Carved it.", call_id="c2"),
+    ])
+
+    async def fake_extract(pack, path="", depth=None):
+        return ToolResult(
+            True, "Extracted firmware.bin to quarantine/0001-firmware-bin: 3 file(s).",
+            "Formats identified: squashfs_v4_le, gzip",
+            data={"quarantine": "0001-firmware-bin", "file_count": 3,
+                  "command": "podman run --rm --network none ... unblob@sha256:abc"},
+        )
+
+    with mock.patch.dict(skippy_dispatch._ASYNC_TOOLS, {"extract_artifact": fake_extract}):
+        outcome = await skippy_agent.run_task(
+            "Analyse it", box, mode="re", notes_root=notes, target="firmware.bin"
+        )
+
+    assert outcome.commands_logged == 1
+    pack = skippy_re.open_pack(notes, target="firmware.bin")
+    logged = "\n".join(open(p, encoding="utf-8").read() for p in pack.command_files())
+    assert "squashfs_v4_le" in logged
+    assert "--network none" in logged
+
+
 @pytest.mark.asyncio
 async def test_a_disassembly_is_logged_to_the_pack_like_any_other_evidence(
     box, routed_llm, tmp_path, repo
