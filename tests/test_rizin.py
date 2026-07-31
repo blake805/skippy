@@ -32,6 +32,17 @@ needs_rizin = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def forget_the_architecture_cache():
+    """The supported-architecture list is cached per process, since it costs a
+    subprocess and cannot change while one is running. Across tests it can, because a
+    test may point the prefix somewhere else, and a cache surviving that would let one
+    test's fake build answer another test's question."""
+    skippy_rizin._ARCH_CACHE = None
+    yield
+    skippy_rizin._ARCH_CACHE = None
+
+
 @pytest.fixture
 def notes_dir(tmp_path):
     return str(tmp_path / "notes")
@@ -160,11 +171,53 @@ def test_the_environment_handed_to_rizin_is_built_not_inherited():
     assert env["PATH"] == "/usr/bin:/bin"
 
 
-def test_the_binaries_are_named_by_absolute_path():
-    """A Homebrew rizin earlier on PATH is built against system capstone and silently
-    has no Xtensa or RISC-V, so resolving by name could cost two architectures with no
-    error anywhere."""
-    assert os.path.isabs(skippy_rizin.tool_path("rizin"))
+def test_the_pinned_build_wins_over_anything_on_the_path(tmp_path, monkeypatch):
+    """A Homebrew rizin earlier on PATH is built against system capstone and silently has
+    no Xtensa or RISC-V, so resolving by name could cost two architectures with no error
+    anywhere. Checked with a stand-in binary rather than the real one, so this holds on a
+    machine that has no rizin at all."""
+    pinned = tmp_path / "bin"
+    pinned.mkdir()
+    fake = pinned / "rizin"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv(skippy_rizin.PREFIX_ENV, str(tmp_path))
+
+    found = skippy_rizin.tool_path("rizin")
+    assert found == str(fake)
+    assert os.path.isabs(found)
+
+
+def test_a_missing_build_says_where_it_belongs_and_why_brew_will_not_do(
+    tmp_path, monkeypatch
+):
+    """The failure a person has to act on, so it names the prefix and the reason the
+    obvious fix is the wrong one."""
+    monkeypatch.setenv(skippy_rizin.PREFIX_ENV, str(tmp_path / "nowhere"))
+    monkeypatch.setattr(skippy_rizin.shutil, "which", lambda name: None)
+    with pytest.raises(RizinError) as caught:
+        skippy_rizin.tool_path("rizin")
+    message = str(caught.value)
+    assert "ADR 0018" in message
+    assert "Homebrew" in message
+
+
+def test_the_tools_report_unavailable_rather_than_crashing_without_rizin(
+    notes_dir, tmp_path, monkeypatch
+):
+    """RE mode has to keep working on a machine with no rizin: the static allowlist still
+    answers plenty, and a crash would take the whole run down over a missing optional
+    dependency."""
+    target = tmp_path / "thing.bin"
+    target.write_bytes(b"\x00\x01\x02\x03")
+    pack = skippy_re.open_pack(notes_dir, target=str(target), title="no rizin")
+    monkeypatch.setattr(skippy_rizin, "available", lambda: False)
+
+    result = asyncio.run(skippy_rizin.disassemble_function(pack, "main"))
+    assert not result.ok
+    assert "not installed" in result.summary
+    # Says what still works, so the run continues instead of stopping here.
+    assert "run_command" in result.summary
 
 
 def test_only_the_rizin_binaries_can_be_asked_for():
