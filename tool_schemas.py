@@ -264,7 +264,10 @@ _SCHEMAS = {
                         "symbol: names, mangling, imports, exports. "
                         "hypothesis: a theory you have a reason for but have not confirmed. "
                         "question: something you do not understand yet, recorded so it is "
-                        "not rediscovered from scratch next session."
+                        "not rediscovered from scratch next session. "
+                        "weakness: something that should be fixed in our own code, which "
+                        "also needs 'severity' and becomes a work item a later coding "
+                        "session will see."
                     ),
                 },
                 "title": {
@@ -282,10 +285,12 @@ _SCHEMAS = {
                 "evidence": {
                     "type": "string",
                     "description": (
-                        "Where you saw this: an offset, a symbol name, the command you ran "
-                        "and the part of its output that shows it. Required for everything "
-                        "except a 'question'. 'The header is 32 bytes' is worthless in six "
-                        "months; 'otool -h reports sizeofcmds 0x20' can be rechecked."
+                        "Where you saw this, in whatever form it takes: the command you ran "
+                        "and the part of its output that shows it, an offset, a symbol name, "
+                        "or a file and byte range in an artifact you read — a flash dump or a "
+                        "decoded capture is evidence too. Required for everything except a "
+                        "'question'. 'The header is 32 bytes' is worthless in six months; "
+                        "'otool -h reports sizeofcmds 0x20' can be rechecked."
                     ),
                 },
                 "confidence": {
@@ -295,6 +300,18 @@ _SCHEMAS = {
                         "confirmed: you verified it. likely: strong inference, not verified. "
                         "speculative: a guess. Be honest here — a guess recorded as a fact "
                         "gets cited as one by everything that follows."
+                    ),
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": list(skippy_re.SEVERITY),
+                    "description": (
+                        "Required for kind 'weakness'. How urgently this should be fixed in "
+                        "our own code — not a CVSS score. This is a different judgment from "
+                        "'confidence': severity is how much it matters if it is real, "
+                        "confidence is how sure you are that it is. A speculative critical "
+                        "needs confirming before it needs fixing, and both numbers travel "
+                        "with the work item so whoever picks it up can tell which."
                     ),
                 },
                 "location": {
@@ -334,6 +351,35 @@ _SCHEMAS = {
                 },
             },
             "required": [],
+        },
+    },
+    "resolve_work_item": {
+        "description": (
+            "Closes out a weakness that an earlier reverse-engineering session found in "
+            "one of our products. Call it when your change actually addresses the item "
+            "your opening message listed — not when you have merely looked at it. Until "
+            "you do, it keeps arriving at the top of every future session on these "
+            "repos. If you conclude the weakness does not apply, resolve it anyway and "
+            "say why: 'this does not apply because...' is a useful record, and leaving "
+            "it open means someone re-investigates it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "item_id": {
+                    "type": "string",
+                    "description": "The work item id from your opening message, e.g. '3'.",
+                },
+                "how": {
+                    "type": "string",
+                    "description": (
+                        "What you changed that addresses it, or why it does not apply. A "
+                        "later session sees the item closed and has no other way to tell "
+                        "whether it was fixed, mitigated elsewhere, or ruled out."
+                    ),
+                },
+            },
+            "required": ["item_id", "how"],
         },
     },
     "apply_patch": {
@@ -419,6 +465,10 @@ EXEC_TOOLS = ("run_command",)
 NOTES_TOOLS = ("note_finding", "read_notes")
 # Offered in both modes: continuing prior work is not specific to either.
 MEMORY_TOOLS = ("record_decision", "recall_project")
+# Coding mode only. A weakness is raised in RE mode and discharged by changing code,
+# which RE mode cannot do — offering this there would let a session close an item it
+# has no way to have fixed.
+WORK_ITEM_TOOLS = ("resolve_work_item",)
 
 
 def filesystem_tools() -> list:
@@ -431,6 +481,7 @@ def workspace_tools() -> list:
     return [
         _wrap(name)
         for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS + MEMORY_TOOLS
+        + WORK_ITEM_TOOLS
     ]
 
 

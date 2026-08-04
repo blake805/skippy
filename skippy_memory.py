@@ -30,6 +30,14 @@ both give: they survive an unmounted NAS, they can be read by a person with no S
 running, and they diff. Vector search over them is a layer that can be added; making
 it the storage would mean an unavailable backend loses the work. Recall here is
 deterministic keyword scoring, which is also what makes it testable in CI.
+
+**Work items are how a weakness found in RE mode reaches the code.** A finding in a
+note pack exists to drive a fix in our own source, and those are two different
+sessions in two different modes with nothing joining them. Both modes already open the
+same project memory, keyed by the same workspace roots, so the join needs no new
+keyspace: the RE loop raises a work item as the weakness is recorded, and a later
+coding session opens with it already in front of it. Find it in RE mode, fix it in
+coding mode.
 """
 
 import json
@@ -41,19 +49,27 @@ import time
 from typing import Dict, List, Optional, Sequence
 
 import skippy_paths
+# For the severity vocabulary only. Severities belong with the findings that carry
+# them, and restating the ordered list here would be a second source of truth of
+# exactly the kind that goes stale quietly.
+import skippy_re
 from skippy_sandbox import ToolResult, cap_text
 
 logger = logging.getLogger("skippy_memory")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MAX_CONTEXT_CHARS = 6_000
 MAX_DECISION_BODY_CHARS = 4_000
 MAX_RECALL_CHARS = 12_000
+MAX_WORK_ITEM_BODY_CHARS = 4_000
 # How many past sessions to consider. Older ones stay on disk and are still
 # greppable by hand; they are just not worth the context they would cost.
 RECENT_SESSIONS = 8
 CONTEXT_DECISIONS = 6
+# Open work items carried into the opening block, worst first. This is a queue, and
+# the top of a queue is the part that should change what the session does.
+CONTEXT_WORK_ITEMS = 6
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 _WORD = re.compile(r"[a-z0-9_./-]{3,}")
@@ -138,9 +154,11 @@ class ProjectMemory:
         self.dir = os.path.join(root, project_id)
         self.sessions_dir = os.path.join(self.dir, "sessions")
         self.decisions_dir = os.path.join(self.dir, "decisions")
+        self.work_items_dir = os.path.join(self.dir, "work_items")
         self.meta_path = os.path.join(self.dir, "meta.json")
         os.makedirs(self.sessions_dir, exist_ok=True)
         os.makedirs(self.decisions_dir, exist_ok=True)
+        os.makedirs(self.work_items_dir, exist_ok=True)
 
         self.roots = [str(r) for r in (workspace_roots or [])]
         self.meta = _read_json(self.meta_path, None) or {
@@ -310,6 +328,151 @@ class ProjectMemory:
                 ids.update(p.strip() for p in str(target).split(",") if p.strip())
         return ids
 
+    # -- work items -------------------------------------------------------
+
+    def _work_item_names(self) -> List[str]:
+        try:
+            return sorted(n for n in os.listdir(self.work_items_dir) if n.endswith(".md"))
+        except OSError:
+            return []
+
+    def _read_work_item_files(self) -> List[dict]:
+        found = []
+        for name in self._work_item_names():
+            path = os.path.join(self.work_items_dir, name)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            found.append({"path": path, "front": _parse_front(text), "text": text})
+        return found
+
+    def next_work_item_id(self) -> str:
+        highest = 0
+        for name in self._work_item_names():
+            head = name.split("-", 1)[0]
+            if head.isdigit():
+                highest = max(highest, int(head))
+        return f"{highest + 1:04d}"
+
+    def add_work_item(
+        self,
+        title: str,
+        body: str,
+        severity: str = "",
+        confidence: str = "",
+        pack: str = "",
+        finding: str = "",
+        target: str = "",
+    ) -> dict:
+        """Raise one thing that needs fixing in our own code.
+
+        Written by the RE loop as a weakness is recorded, not called by the model. The
+        model's job was the judgment that something is wrong and how urgent it is; the
+        handoff to the next session is plumbing, and plumbing left to the model is
+        plumbing that mostly does not happen.
+
+        `pack` and `finding` are carried so the coding session can read the evidence
+        rather than trusting this summary of it, and `severity` travels with
+        `confidence` because a speculative critical and a confirmed critical are
+        different work.
+        """
+        item_id = self.next_work_item_id()
+        path = os.path.join(self.work_items_dir, f"{item_id}-{slugify(title, 'work-item')}.md")
+
+        front = {
+            "id": item_id,
+            "title": title,
+            "recorded": _now(),
+            "commit": head_commit(self.primary_root),
+        }
+        for key, value in (
+            ("severity", severity), ("confidence", confidence),
+            ("pack", pack), ("finding", finding), ("target", target),
+        ):
+            if value:
+                front[key] = value
+
+        lines = ["---"]
+        lines += [f"{key}: {_yaml_scalar(value)}" for key, value in front.items()]
+        lines += ["---", "", f"# {title}", "",
+                  cap_text(str(body).strip(), MAX_WORK_ITEM_BODY_CHARS), ""]
+        if pack and finding:
+            lines += [
+                "",
+                f"Evidence is in note pack `{pack}`, finding {finding}. Read it before "
+                "changing anything: this is a summary, and the finding is the record.",
+                "",
+            ]
+
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        os.replace(tmp, path)
+        return {"id": item_id, "path": path, "title": title, "severity": severity}
+
+    def add_resolution(self, resolves: str, how: str) -> dict:
+        """Mark a work item done, by writing a new record rather than editing it.
+
+        Same shape as superseding a finding or a decision, and for the same reason:
+        what was recorded at the time stays recorded, and how something was fixed is
+        worth as much later as the fact that it was.
+        """
+        item_id = self.next_work_item_id()
+        path = os.path.join(self.work_items_dir, f"{item_id}-resolved-{slugify(resolves, 'item')}.md")
+
+        front = {
+            "id": item_id,
+            "title": f"Resolved work item {resolves}",
+            "resolves": resolves,
+            "recorded": _now(),
+            "commit": head_commit(self.primary_root),
+        }
+        lines = ["---"]
+        lines += [f"{key}: {_yaml_scalar(value)}" for key, value in front.items()]
+        lines += ["---", "", f"# Resolved work item {resolves}", "",
+                  cap_text(str(how).strip(), MAX_WORK_ITEM_BODY_CHARS), ""]
+
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        os.replace(tmp, path)
+        return {"id": item_id, "path": path, "resolves": resolves}
+
+    def resolved_ids(self) -> set:
+        """Derived from the resolution records, so no work item is ever rewritten."""
+        ids = set()
+        for item in self._read_work_item_files():
+            target = item["front"].get("resolves")
+            if target:
+                ids.update(p.strip() for p in str(target).split(",") if p.strip())
+        return ids
+
+    def work_items(self) -> List[dict]:
+        """The open work items, worst first.
+
+        Resolutions live in the same directory because they are the same kind of
+        append-only record, and are told apart by carrying `resolves`. Resolved items
+        are excluded here and still reachable through `recall`, the same treatment a
+        superseded decision gets.
+        """
+        resolved = self.resolved_ids()
+        items = []
+        for entry in self._read_work_item_files():
+            front = entry["front"]
+            if front.get("resolves") or front.get("id") in resolved:
+                continue
+            items.append(entry)
+        items.sort(
+            key=lambda e: (
+                skippy_re.severity_rank(e["front"].get("severity")),
+                e["front"].get("id", ""),
+            ),
+            reverse=True,
+        )
+        return items
+
     # -- staleness --------------------------------------------------------
 
     def stale_paths(self, entry: dict) -> List[str]:
@@ -348,7 +511,8 @@ class ProjectMemory:
         """
         sessions = self.sessions()
         decisions = self.decisions()
-        if not sessions and not decisions and not self.meta.get("conventions"):
+        work_items = self.work_items()
+        if not sessions and not decisions and not work_items and not self.meta.get("conventions"):
             return ""
 
         blocks = [f"## What you already know about this project ({self.project_id})"]
@@ -359,6 +523,38 @@ class ProjectMemory:
                 "Conventions established here:\n"
                 + "\n".join(f"- {key}: {value}" for key, value in sorted(conventions.items()))
             )
+
+        # Ahead of the decisions and the session history, because this is the only part
+        # of the block that is a request rather than background. A weakness found in an
+        # RE session has no other route into the code: the artifact was not ours to
+        # change, so nothing in the repository shows it was ever noticed.
+        if work_items:
+            lines = [
+                "Open weaknesses found while reverse-engineering these products, worst "
+                "first. Each names the note pack and finding holding the evidence — read "
+                "that before changing code, because the line below is a summary:"
+            ]
+            for entry in work_items[:CONTEXT_WORK_ITEMS]:
+                front = entry["front"]
+                where = ""
+                if front.get("pack") and front.get("finding"):
+                    where = f" [pack {front['pack']}, finding {front['finding']}]"
+                lines.append(
+                    f"- [{front.get('id')}] {front.get('severity', '?')}, "
+                    f"{front.get('confidence', '?')}: {front.get('title')}{where}"
+                )
+            if len(work_items) > CONTEXT_WORK_ITEMS:
+                lines.append(
+                    f"- ... and {len(work_items) - CONTEXT_WORK_ITEMS} more; "
+                    "recall_project will list them."
+                )
+            lines.append(
+                "Severity is how urgently it should be fixed. Confidence is how sure the "
+                "session that found it was that it is real — a speculative one may need "
+                "confirming before it needs fixing. Call resolve_work_item when one is "
+                "dealt with, so it stops arriving here."
+            )
+            blocks.append("\n".join(lines))
 
         superseded = self.superseded_ids()
         live = [d for d in decisions if d["front"].get("id") not in superseded]
@@ -433,6 +629,23 @@ class ProjectMemory:
             # being hidden: how a decision was reached and then reversed is often the
             # answer to why the code looks the way it does.
             scored.append((score - (2 if superseded & {item["front"].get("id")} else 0), header + text))
+
+        # Every file in the directory, resolutions included. Searching only the items
+        # would mean "how was this fixed" had no answer anywhere, since the resolution
+        # record is the only place the fix is described.
+        resolved = self.resolved_ids()
+        for entry in self._read_work_item_files():
+            text = entry["text"]
+            score = sum(1 for term in terms if term in text.lower())
+            if not score:
+                continue
+            # A resolved item ranks below its own resolution: both match a query about
+            # the weakness, and the useful one is the account of the fix. Neither is
+            # hidden — "this was already found and dealt with" is the answer to a lot
+            # of questions, and the alternative is fixing it twice.
+            is_resolved = entry["front"].get("id") in resolved
+            header = "> RESOLVED by a later record.\n\n" if is_resolved else ""
+            scored.append((score - (2 if is_resolved else 0), header + text))
 
         for record in self.sessions(limit=40):
             blob = json.dumps(record).lower()
@@ -558,6 +771,53 @@ def record_decision(
 def recall_project(memory: ProjectMemory, query: str = "") -> ToolResult:
     """Search earlier sessions and decisions for this project."""
     return memory.recall(query)
+
+
+def resolve_work_item(memory: ProjectMemory, item_id: str = "", how: str = "") -> ToolResult:
+    """Close out a weakness raised by an earlier reverse-engineering session.
+
+    Model-called, because whether a fix actually addresses the weakness is a judgment
+    and nothing the loop can observe. Raising the item is plumbing and is done by the
+    loop; deciding it is dealt with is not.
+
+    Refuses an unknown id by listing the open ones, so a model that guessed a number
+    can correct on the next step rather than retrying — a refusal the model cannot act
+    on costs real budget.
+    """
+    item_id = str(item_id or "").strip().lstrip("#")
+    how = str(how or "").strip()
+    if not item_id:
+        return ToolResult(False, "resolve_work_item needs the 'item_id' of the work item.")
+    if not how:
+        return ToolResult(
+            False,
+            "resolve_work_item needs 'how': what you changed that addresses it. Without "
+            "that, a later session sees the item closed and has no way to tell whether "
+            "the weakness was fixed, mitigated elsewhere, or judged not to apply.",
+        )
+
+    open_items = memory.work_items()
+    known = {entry["front"].get("id") for entry in open_items}
+    if item_id not in known and item_id.zfill(4) in known:
+        item_id = item_id.zfill(4)
+    if item_id not in known:
+        return ToolResult(
+            False,
+            f"No open work item '{item_id}' in this project. Open ids: "
+            f"{', '.join(sorted(i for i in known if i)) or '(none)'}.",
+        )
+
+    try:
+        record = memory.add_resolution(item_id, how)
+    except OSError as exc:
+        return ToolResult(False, f"Could not record the resolution: {exc}")
+
+    return ToolResult(
+        True,
+        f"Work item {item_id} marked resolved. It will not appear in later sessions.",
+        "",
+        {"resolution": record, "project": memory.project_id},
+    )
 
 
 def open_project(

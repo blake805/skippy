@@ -734,6 +734,270 @@ async def test_an_re_run_out_of_steps_reports_findings_not_files(box, tmp_path, 
     assert outcome.pack_id
 
 
+# --- the loop records the evidence; the model records the conclusions ---
+#
+# ADR 0013's rule, third application: anything that must happen has to be done by the
+# loop. The prompt asked the first live RE run to record findings as it went and it
+# batched all five into the last five steps of eighteen, so a run dying at step nine
+# would have left nothing at all.
+
+def re_command(command, call_id="c1"):
+    return fl.tool_call("run_command", call_id=call_id, command=command)
+
+
+@pytest.mark.asyncio
+async def test_every_inspection_command_is_logged_without_being_asked(
+    box, routed_llm, tmp_path, repo
+):
+    import skippy_re
+
+    (repo / "sample.bin").write_bytes(b"\x00MAGICSTRING\x00" + b"\xff" * 32)
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        re_command("strings -n 6 sample.bin"),
+        re_command("file sample.bin", call_id="c2"),
+        finish("Looked at it.", call_id="c3"),
+    ])
+    outcome = await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=notes, target="sample.bin"
+    )
+
+    assert outcome.commands_logged == 2
+    pack = skippy_re.open_pack(notes, target="sample.bin")
+    logged = "\n".join(open(p, encoding="utf-8").read() for p in pack.command_files())
+    # The command and its output, so a person can recheck a finding against what the
+    # tool actually printed rather than against the model's account of it.
+    assert "strings -n 6 sample.bin" in logged
+    assert "MAGICSTRING" in logged
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_records_nothing_still_leaves_the_evidence(
+    box, routed_llm, tmp_path, repo
+):
+    """The durability argument, stated exactly. This run establishes things and dies
+    before writing a single finding, which is the case that previously lost everything.
+    """
+    import skippy_re
+
+    (repo / "sample.bin").write_bytes(b"\x00MAGICSTRING\x00")
+    notes = str(tmp_path / "notes")
+    routed_llm.load([re_command("strings -n 6 sample.bin")] * 4)
+    outcome = await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=notes, target="sample.bin", max_steps=2
+    )
+
+    assert outcome.status == "max_steps"
+    assert outcome.findings == 0
+    assert outcome.commands_logged >= 1
+    # Reported in the prose too, so the run does not read as having produced nothing.
+    assert "command(s) logged" in outcome.summary
+    pack = skippy_re.open_pack(notes, target="sample.bin")
+    assert "MAGICSTRING" in open(pack.command_files()[0], encoding="utf-8").read()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_command_is_not_logged(box, routed_llm, tmp_path):
+    """A rejected command produced no output about the target, and logging refusals
+    would bury the evidence in noise."""
+    import skippy_re
+
+    notes = str(tmp_path / "notes")
+    routed_llm.load([
+        re_command("python -m pytest"),
+        finish("Cannot run it.", call_id="c2"),
+    ])
+    await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=notes, target="x.bin"
+    )
+    assert skippy_re.open_pack(notes, target="x.bin").command_files() == []
+
+
+@pytest.mark.asyncio
+async def test_a_coding_run_logs_no_commands(box, routed_llm):
+    """There is no pack in coding mode, and the diff is already the durable record."""
+    outcome = await run(box, [
+        fl.tool_call("run_command", command="python -m pytest -q"),
+        finish(call_id="c2"),
+    ], routed_llm)
+    assert outcome.commands_logged == 0
+
+
+@pytest.mark.asyncio
+async def test_the_loop_says_something_when_findings_lag_behind_commands(
+    box, routed_llm, tmp_path, repo
+):
+    """The command log keeps the evidence but cannot capture a conclusion, so the loop
+    counts and quotes the number back. The prompt already asks for record-as-you-go;
+    what is new here is how far past that the run has drifted."""
+    (repo / "sample.bin").write_bytes(b"\x00DATA\x00")
+    script = [
+        re_command(f"strings -n {n} sample.bin", call_id=f"c{n}")
+        for n in range(skippy_agent.RE_RECORD_NUDGE_AFTER + 1)
+    ]
+    routed_llm.load(script + [finish("done", call_id="cf")])
+    await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"),
+        target="sample.bin",
+    )
+
+    nudges = [
+        m["content"] for m in routed_llm.last_messages()
+        if m.get("role") == "user" and "without recording a finding" in (m.get("content") or "")
+    ]
+    assert nudges, "the loop never mentioned that nothing had been recorded"
+    # Has to name a way out, or it is a complaint rather than an instruction.
+    assert "question" in nudges[0]
+
+
+@pytest.mark.asyncio
+async def test_recording_a_finding_resets_the_count(box, routed_llm, tmp_path, repo):
+    """A run that is recording as it goes must never be nudged; a nudge that fires
+    anyway is noise the model learns to read past."""
+    (repo / "sample.bin").write_bytes(b"\x00DATA\x00")
+    script = []
+    for n in range(skippy_agent.RE_RECORD_NUDGE_AFTER + 2):
+        script.append(re_command(f"strings -n {n} sample.bin", call_id=f"c{n}"))
+        script.append(fl.tool_call(
+            "note_finding", call_id=f"f{n}", kind="structure",
+            title=f"Observation {n}", body="Something specific.",
+            evidence=f"strings -n {n} printed it", confidence="likely",
+        ))
+    routed_llm.load(script + [finish("done", call_id="cf")])
+    await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"),
+        target="sample.bin",
+    )
+
+    assert not [
+        m for m in routed_llm.last_messages()
+        if m.get("role") == "user" and "without recording a finding" in (m.get("content") or "")
+    ]
+
+
+# --- a weakness found in RE mode becomes work in coding mode ---
+
+def weakness_call(call_id="c1", severity="critical", **kwargs):
+    args = {
+        "kind": "weakness",
+        "title": "Firmware update accepts unsigned images",
+        "body": "The updater checks a CRC and no signature.",
+        "evidence": "strings shows no verify call; no signature section in the header",
+        "confidence": "confirmed",
+        "severity": severity,
+    }
+    args.update(kwargs)
+    return fl.tool_call("note_finding", call_id=call_id, **args)
+
+
+@pytest.mark.asyncio
+async def test_a_weakness_becomes_a_work_item_a_coding_session_opens_with(
+    box, routed_llm, tmp_path
+):
+    """The workflow this exists for: find it in RE mode, fix it in coding mode. Both
+    modes open the same project memory from the same workspace roots, which is what
+    lets the handoff work with no new keyspace."""
+    notes = str(tmp_path / "notes")
+    routed_llm.load([weakness_call(), finish("Recorded a weakness.", call_id="c2")])
+    outcome = await skippy_agent.run_task(
+        "Audit the updater", box, mode="re", notes_root=notes,
+        target="/opt/products/gate/firmware.bin",
+    )
+    assert outcome.work_items
+
+    # A fresh coding loop sharing nothing with the RE run but the workspace roots.
+    coding = skippy_agent.AgentLoop("Harden the updater", box)
+    opening = coding.transcript.messages[1]["content"]
+    assert "unsigned images" in opening
+    assert "critical" in opening
+    # Names where the evidence is, rather than standing in for it.
+    assert outcome.pack_id in opening
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_told_the_handoff_happened(box, routed_llm, tmp_path):
+    routed_llm.load([weakness_call(), finish("done", call_id="c2")])
+    await skippy_agent.run_task(
+        "Audit it", box, mode="re", notes_root=str(tmp_path / "notes"), target="x.bin"
+    )
+    assert any("work item" in o for o in routed_llm.observations())
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_finding_raises_no_work_item(box, routed_llm, tmp_path):
+    """Only a weakness has somewhere else to go. Turning every finding into a work
+    item would make the coding session's opening block useless."""
+    routed_llm.load([
+        fl.tool_call("note_finding", call_id="c1", kind="structure",
+                     title="Header is 32 bytes", body="Load commands at 0x20.",
+                     evidence="otool -h reports sizeofcmds 0x20", confidence="confirmed"),
+        finish("done", call_id="c2"),
+    ])
+    outcome = await skippy_agent.run_task(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes"), target="x.bin"
+    )
+    assert outcome.work_items == []
+    assert skippy_agent.AgentLoop("Fix something", box).transcript.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_weakness_without_project_memory_still_records_and_says_so(
+    box, routed_llm, tmp_path
+):
+    """An unmounted memory root costs the handoff, not the finding. But the model has
+    to be told, because its finish summary is then the only route to a person."""
+    import skippy_re
+
+    notes = str(tmp_path / "notes")
+    routed_llm.load([weakness_call(), finish("done", call_id="c2")])
+    outcome = await skippy_agent.run_task(
+        "Audit it", box, mode="re", notes_root=notes, target="x.bin", remember=False
+    )
+
+    assert outcome.work_items == []
+    assert outcome.findings == 1
+    assert "unsigned images" in skippy_re.read_notes(
+        skippy_re.open_pack(notes, target="x.bin")
+    ).content
+    assert any("not raised as a work item" in o for o in routed_llm.observations())
+
+
+def test_resolving_a_work_item_is_offered_only_in_coding_mode(box, tmp_path):
+    """A weakness is discharged by changing code, which RE mode cannot do. Offering it
+    there would let a session close an item it had no way to have fixed."""
+    coding = skippy_agent.AgentLoop("Fix it", box)
+    re_loop = skippy_agent.AgentLoop(
+        "Analyse it", box, mode="re", notes_root=str(tmp_path / "notes")
+    )
+    assert "resolve_work_item" in tool_names(coding)
+    assert "resolve_work_item" not in tool_names(re_loop)
+
+
+# --- the target can change underneath a pack ---
+
+def test_a_changed_target_warns_in_the_opening_message(box, tmp_path):
+    """The model has no way to notice on its own, and findings about bytes that have
+    since changed are worse than no findings."""
+    import skippy_re
+
+    target = tmp_path / "firmware.bin"
+    target.write_bytes(b"version one")
+    notes = str(tmp_path / "notes")
+
+    first = skippy_agent.AgentLoop("Look at it", box, mode="re", notes_root=notes,
+                                   target=str(target))
+    skippy_re.note_finding(
+        first.notes_pack, kind="structure", title="Payload starts at 0x40",
+        body="The header is 64 bytes.", evidence="xxd -l 64", confidence="confirmed",
+    )
+
+    target.write_bytes(b"version two, rebuilt with different bytes")
+    resumed = skippy_agent.AgentLoop("Look again", box, mode="re", notes_root=notes,
+                                     target=str(target))
+    assert "WARNING" in resumed.transcript.messages[1]["content"]
+    assert "have changed" in resumed.transcript.messages[1]["content"]
+
+
 @pytest.mark.asyncio
 async def test_a_coding_run_out_of_steps_still_reports_files(box, routed_llm):
     routed_llm.load([

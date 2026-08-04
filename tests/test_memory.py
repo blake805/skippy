@@ -413,3 +413,161 @@ def test_listing_projects_reports_what_is_there(store, tmp_path):
 
 def test_listing_a_missing_store_is_empty_not_an_error(tmp_path):
     assert skippy_memory.list_projects(str(tmp_path / "nope")) == []
+
+
+# --- work items: the RE-to-coding handoff ---
+#
+# A weakness is found while reading a built artifact and fixed by changing source, in
+# two different sessions in two different modes. Nothing in the repository records
+# that the weakness was ever noticed, so this is the only route from one to the other.
+
+def raise_item(memory, title="Firmware update is unauthenticated", **kwargs):
+    args = {
+        "body": "The updater accepts any image with a valid CRC and checks no signature.",
+        "severity": "critical",
+        "confidence": "confirmed",
+        "pack": "firmware-bin-1a2b3c4d",
+        "finding": "0007",
+        "target": "/opt/products/gate/firmware.bin",
+    }
+    args.update(kwargs)
+    return memory.add_work_item(title=title, **args)
+
+
+def test_a_weakness_reaches_the_next_session_without_being_asked_for(memory):
+    """The whole point. A tool the model may call is a tool it mostly will not, so the
+    item goes in the opening message rather than waiting to be searched for."""
+    raise_item(memory)
+    context = memory.opening_context()
+    assert "Firmware update is unauthenticated" in context
+    assert "critical" in context
+
+
+def test_the_opening_context_names_the_pack_and_finding(memory):
+    """So the coding session can read the evidence rather than trusting the summary."""
+    raise_item(memory)
+    context = memory.opening_context()
+    assert "firmware-bin-1a2b3c4d" in context
+    assert "0007" in context
+
+
+def test_severity_and_confidence_both_travel(memory):
+    """Severity alone would let a speculative critical arrive looking like a confirmed
+    one, which is the same failure the confidence field exists to prevent."""
+    raise_item(memory, title="Possible overflow in the parser",
+               severity="critical", confidence="speculative")
+    context = memory.opening_context()
+    assert "critical" in context and "speculative" in context
+
+
+def test_work_items_are_ordered_worst_first(memory):
+    raise_item(memory, title="Verbose logging", severity="low")
+    raise_item(memory, title="No signature check", severity="critical")
+    raise_item(memory, title="Weak session token", severity="medium")
+    titles = [item["front"]["title"] for item in memory.work_items()]
+    assert titles == ["No signature check", "Weak session token", "Verbose logging"]
+
+
+def test_an_item_with_no_severity_sorts_below_a_low_one(memory):
+    """"Nobody said" and "somebody said this is minor" are different claims."""
+    raise_item(memory, title="Unrated", severity="")
+    raise_item(memory, title="Rated low", severity="low")
+    titles = [item["front"]["title"] for item in memory.work_items()]
+    assert titles == ["Rated low", "Unrated"]
+
+
+def test_a_resolved_item_stops_arriving(memory):
+    item = raise_item(memory)
+    assert "unauthenticated" in memory.opening_context()
+
+    result = skippy_memory.resolve_work_item(
+        memory, item_id=item["id"], how="Added Ed25519 signature verification in updater.c."
+    )
+    assert result.ok
+    assert "unauthenticated" not in memory.opening_context()
+
+
+def test_resolving_never_modifies_the_original_record(memory):
+    """Same append-only rule as superseding a finding or a decision: what was recorded
+    at the time stays recorded, and how it was fixed is worth as much later."""
+    item = raise_item(memory)
+    before = open(item["path"], encoding="utf-8").read()
+    skippy_memory.resolve_work_item(memory, item_id=item["id"], how="Signed the images.")
+    assert open(item["path"], encoding="utf-8").read() == before
+
+
+def test_how_it_was_fixed_survives_in_recall(memory):
+    item = raise_item(memory)
+    skippy_memory.resolve_work_item(
+        memory, item_id=item["id"], how="Added Ed25519 verification in updater.c."
+    )
+    found = memory.recall("Ed25519")
+    assert found.ok
+    assert "updater.c" in found.content
+
+
+def test_a_resolved_item_is_still_findable_and_marked(memory):
+    """Hiding it would mean the next session investigates it again; showing it unmarked
+    would mean fixing it again."""
+    item = raise_item(memory)
+    skippy_memory.resolve_work_item(memory, item_id=item["id"], how="Signed the images.")
+    found = memory.recall("unauthenticated")
+    assert "RESOLVED" in found.content
+
+
+def test_resolving_needs_to_say_how(memory):
+    item = raise_item(memory)
+    result = skippy_memory.resolve_work_item(memory, item_id=item["id"], how="")
+    assert not result.ok
+    assert "how" in result.summary
+
+
+def test_resolving_an_unknown_item_lists_the_open_ones(memory):
+    """A refusal the model cannot act on costs real budget; naming the ids is what
+    makes this correctable on the next step."""
+    raise_item(memory)
+    result = skippy_memory.resolve_work_item(memory, item_id="0042", how="Fixed it.")
+    assert not result.ok
+    assert "0001" in result.summary
+
+
+def test_an_unpadded_item_id_still_resolves(memory):
+    """The model will write 1, not 0001."""
+    raise_item(memory)
+    assert skippy_memory.resolve_work_item(memory, item_id="1", how="Fixed it.").ok
+
+
+def test_resolving_the_same_item_twice_is_refused(memory):
+    item = raise_item(memory)
+    skippy_memory.resolve_work_item(memory, item_id=item["id"], how="Fixed it.")
+    assert not skippy_memory.resolve_work_item(memory, item_id=item["id"], how="Again.").ok
+
+
+def test_a_work_item_is_a_plain_file_a_person_can_read(memory):
+    item = raise_item(memory)
+    text = open(item["path"], encoding="utf-8").read()
+    assert item["path"].endswith(".md")
+    assert "# Firmware update is unauthenticated" in text
+    assert "checks no signature" in text
+    # Points at the record rather than standing in for it.
+    assert "firmware-bin-1a2b3c4d" in text
+
+
+def test_a_project_with_only_work_items_still_opens_with_context(memory):
+    """The handoff has to work for a repo whose first session is the RE one."""
+    raise_item(memory)
+    assert memory.opening_context().strip()
+
+
+def test_a_long_queue_is_truncated_and_says_so(memory):
+    for index in range(skippy_memory.CONTEXT_WORK_ITEMS + 4):
+        raise_item(memory, title=f"Weakness {index}", severity="medium")
+    context = memory.opening_context()
+    assert "and 4 more" in context
+
+
+def test_a_stray_file_in_the_work_items_directory_is_ignored(memory):
+    raise_item(memory)
+    with open(os.path.join(memory.work_items_dir, "scratch.txt"), "w") as handle:
+        handle.write("not a work item")
+    assert len(memory.work_items()) == 1

@@ -3,7 +3,10 @@
 Status: accepted
 Date: 2026-07-30
 Implements the schema accepted in [ADR 0003](0003-session-schema.md). Follows 0010
-(agent loop) and 0012 (RE mode).
+(agent loop) and 0012 (RE mode). Extended by
+[0017](0017-weakness-findings-and-handoff.md), which adds work items as a third record
+type; [0016](0016-loop-captured-evidence.md) applies the loop-not-prompt rule below to the
+one place this ADR named as still outstanding.
 
 ## Context
 
