@@ -101,7 +101,43 @@ its mode letter arrives in a cluster that may have no leading dash: `tar tf` lis
 
 ### Honest limits
 
-Static inspection only. Dynamic analysis — running the target under a debugger,
+The largest limits come first. The first version of this section discussed only the
+smaller ones, which made a partial list read as an exhaustive one — the worst way to
+be wrong about capability, because a reader who checks the limits and finds them
+survivable concludes the rest works.
+
+**No carving and no extraction.** There is no path from a firmware image to the files
+inside it. Nothing here recognises an embedded filesystem, locates a compressed
+region, or unpacks a container. A packed blob can be described from the outside —
+what `file` makes of it, entropy judged by eye in a hex dump, whatever strings
+survive — and that is the end of it. This is the largest gap, because it blocks the
+category of work the mode exists for: an image pulled off a device is a container
+first and code second, and everything below this line assumes you already have the
+code.
+
+**No decompiler, for any architecture.** Every tool in the inspection table returns
+disassembly, symbols or bytes. Reading a routine means reading instructions.
+
+**Three of the six architectures this shop builds for.** The six are x86-64, ARM
+Cortex-M, ARM/AArch64 Linux, Xtensa (ESP32), RISC-V and MIPS. The installed `objdump`
+is Apple LLVM 21, which registers the ARM family (`arm`, `thumb`, `aarch64`, `arm64`)
+along with x86 and x86-64, so the first three are covered. It has no Xtensa, no RISC-V
+and no MIPS target, so those three cannot be disassembled at all — not partially, not
+with worse output. There is no second disassembler installed to fall back to.
+
+The container-format position is better than the architecture position but is still
+uneven: `otool`, `lipo`, `codesign` and `dwarfdump` are Mach-O-only, and there is no
+`readelf`, so nothing here reads ELF program headers or section flags directly.
+`objdump`, `nm`, `size`, `strings` and `file` do handle ELF, so ELF work is possible
+rather than blocked.
+
+**Whole regions reach the model's context.** Everything goes through raw
+`run_command`, so asking for one function's disassembly means asking for an `objdump`
+region sized by the tool rather than by the question. ADR 0007 concluded that what
+makes the 480B affordable is keeping its context small and pre-digested. This mode
+does the opposite and leaves the compressor to absorb it, which treats the symptom.
+
+**Static inspection only.** Dynamic analysis — running the target under a debugger,
 watching syscalls — is a genuine need and is not solved here. The answer to it is the
 VM boundary that ADR 0011 already identifies as the only real containment, not another
 entry in the inspection table. The refusal message says so, so the model stops asking
@@ -120,6 +156,13 @@ provides for everything else.
 
 Verified against a real universal Mach-O (a renamed `/bin/echo`, so the answer was
 known but not visible to the model) on the 480B `heavy` role, budget 18 steps.
+
+Worth stating plainly what that did not establish. A universal Mach-O on macOS is the
+easiest case available and an exact fit for the tools that shipped: unstripped, native
+architecture, native container, and `otool` and `lipo` were written for it. Nothing
+here was exercised against an ELF, a stripped binary, a non-Apple architecture or a
+packed image, so the run demonstrates that the loop, the note pack and the allowlist
+work end to end — not that the mode handles a real target.
 
 It worked outside in as intended — `file`, then `otool -L`, `otool -h`, `lipo -info`,
 `nm`, `strings` — and reached a correct and specific conclusion: an implementation of

@@ -207,10 +207,10 @@ what keeps it testable. See [ADR 0013](docs/adr/0013-project-memory.md).
 
 ```python
 outcome = await skippy_agent.run_task(
-    "Work out the container format and where the payload starts",
+    "Identify this binary: what it links against, what it exports, and what it is",
     sandbox,
     mode="re",
-    target="/opt/samples/firmware.bin",
+    target="/opt/samples/mystery_tool",
 )
 ```
 
@@ -236,9 +236,15 @@ RE mode differs from coding mode in three things, and nothing else:
   `tar -tf` yes, `tar xf` no. The mode is set by the loop and stripped from the model's
   arguments, so it cannot ask for the coding table.
 
-Static inspection only. Running the target under a debugger is a real need and wants a
-VM, not another entry in the allowlist; the refusal says so, and the model records the
-question instead. See [ADR 0012](docs/adr/0012-reverse-engineering-mode.md).
+**What it cannot do yet**, since the example above is deliberately one that runs today.
+There is no carving or extraction, so there is no path from a firmware image to the
+files inside it — a packed blob can only be described from the outside. There is no
+decompiler for any architecture. And the installed `objdump` covers the ARM family and
+x86/x86-64 but not Xtensa, RISC-V or MIPS, so ESP32, RISC-V and MIPS targets cannot be
+disassembled at all. Running the target under a debugger is a separate need and wants a
+VM rather than another entry in the allowlist; the refusal says so, and the model
+records the question instead. See
+[ADR 0012](docs/adr/0012-reverse-engineering-mode.md).
 
 ### Why transcripts are append-only
 
