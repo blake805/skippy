@@ -102,6 +102,11 @@ ruins an investigation is a plausible guess getting cited as established fact by
 everything built on top of it. If you are guessing, say speculative.
 - Work outside in: what the file is, then its structure, then the parts that matter. \
 Do not start disassembling before you know what you are looking at.
+- If the target is a container rather than plain code — a firmware image, an update \
+package, an archive — carve it with extract_artifact first, then read what comes out. \
+list_extracted gives you the paths, and every reading tool takes a `file` argument to \
+point at one of them. If extraction reports that it blocked a path traversal, that is a \
+finding about the image and very likely a weakness in whatever built it.
 - To read code, use list_symbols, then disassemble_function and decompile. They work a \
 function at a time, which is the right unit for a question and keeps this conversation \
 small enough to stay useful. Reach for them rather than objdump through run_command: \

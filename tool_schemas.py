@@ -465,6 +465,17 @@ _BITS_PARAM = {
     "description": "Word size for a raw dump: 8, 16, 32 or 64. Ignored for a real container.",
 }
 
+# The other half of the carving chain: having pulled executables out of a firmware
+# image, the point is to read them.
+_FILE_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional. Read a file extracted from the target instead of the target itself — "
+        "a path as list_extracted shows it, relative to the extraction directory. Leave "
+        "this out to read the target."
+    ),
+}
+
 _SCHEMAS["disassemble_function"] = {
     "description": (
         "Disassemble one function of the target artifact, with rizin's analysis of its "
@@ -488,6 +499,7 @@ _SCHEMAS["disassemble_function"] = {
             },
             "arch": _ARCH_PARAM,
             "bits": _BITS_PARAM,
+            "file": _FILE_PARAM,
         },
         "required": ["symbol"],
     },
@@ -513,6 +525,7 @@ _SCHEMAS["decompile"] = {
             },
             "arch": _ARCH_PARAM,
             "bits": _BITS_PARAM,
+            "file": _FILE_PARAM,
         },
         "required": ["symbol"],
     },
@@ -533,6 +546,63 @@ _SCHEMAS["list_symbols"] = {
                 "description": (
                     "Optional filter: only symbols whose name contains this, "
                     "case-insensitively. 'verify', 'crypt', 'update'."
+                ),
+            },
+            "file": _FILE_PARAM,
+        },
+        "required": [],
+    },
+}
+
+
+_SCHEMAS["extract_artifact"] = {
+    "description": (
+        "Carve a firmware image or container into its parts, using unblob. Handles 30+ "
+        "archive, compression and filesystem formats, recursively, and reports what it "
+        "found. Use this when `file`, entropy or a magic number suggests the target is a "
+        "container rather than plain code — then read the executables it produces by "
+        "passing their paths to list_symbols, disassemble_function and decompile. "
+        "Extraction runs inside a container with no network and read-only input, so it "
+        "cannot modify the artifact or reach anything else."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": (
+                    "Optional. Extract a file that a previous extraction produced, for "
+                    "an image nested deeper than the recursion reached. Leave out to "
+                    "extract the target itself."
+                ),
+            },
+            "depth": {
+                "type": "integer",
+                "description": (
+                    "How many levels of nested container to unpack. Defaults to 4, which "
+                    "handles ordinary firmware; raise it if the parts you want are "
+                    "deeper, at the cost of time."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+_SCHEMAS["list_extracted"] = {
+    "description": (
+        "List what extraction has produced in this pack, including from earlier sessions "
+        "on the same target. Use it to find something worth reading after carving, and "
+        "to get the paths that the disassembly tools take."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": (
+                    "Optional. List one subdirectory instead of everything, for a large "
+                    "extracted filesystem."
                 ),
             },
         },
@@ -561,6 +631,9 @@ NOTES_TOOLS = ("note_finding", "read_notes")
 # session's target artifact, and a coding session has a repository rather than a target.
 # See ADR 0018 for why these are structured tools instead of an allowlisted `rizin`.
 DISASSEMBLY_TOOLS = ("list_symbols", "disassemble_function", "decompile")
+# RE mode only, same reason, and one more: extraction writes into the pack's quarantine,
+# which only an RE session has. See ADR 0019 for why this runs in a container.
+EXTRACTION_TOOLS = ("extract_artifact", "list_extracted")
 # Offered in both modes: continuing prior work is not specific to either.
 MEMORY_TOOLS = ("record_decision", "recall_project")
 # Coding mode only. A weakness is raised in RE mode and discharged by changing code,
@@ -589,7 +662,7 @@ def re_tools() -> list:
     return [
         _wrap(name)
         for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + DISASSEMBLY_TOOLS
-        + MEMORY_TOOLS
+        + EXTRACTION_TOOLS + MEMORY_TOOLS
     ]
 
 
