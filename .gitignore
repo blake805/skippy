@@ -24,3 +24,6 @@ uploads/
 xcuserdata/
 DerivedData/
 *.xcuserstate
+
+# Compiled benchmark targets (built by benchmarks/README.md, not committed)
+benchmarks/updater

@@ -247,6 +247,15 @@ RE mode differs from coding mode in four things, and nothing else:
   next coding session on the same repos opens knowing what needs fixing. Finding it in RE
   mode and fixing it in coding mode is the workflow; there is deliberately no
   report generator.
+- **It reads code a function at a time.** `list_symbols`, then `disassemble_function` or
+  `decompile`, each returning one function rather than a region — which is what keeps the
+  heavy model's context small enough to be affordable. Behind them are rizin and the
+  Ghidra decompiler as self-contained C++, so no JVM and no Ghidra install, covering
+  x86-64, ARM, AArch64, MIPS, RISC-V and Xtensa. rizin is deliberately *not* in the
+  command allowlist: its `-c` argument is a command language with a shell escape in it, so
+  it is only ever invoked with an argument vector Skippy builds, always with `-N` and
+  never with `-w`, and the symbol you ask for is resolved to an address before anything
+  reaches a command string.
 - **It cannot run the artifact.** There is no `apply_patch`, and `run_command` switches
   to an inspection-only allowlist: `file`, `strings`, `nm`, `otool`, `objdump`,
   `dwarfdump`, `xxd`, `c++filt` and friends, with no interpreter, build tool or test
@@ -255,18 +264,25 @@ RE mode differs from coding mode in four things, and nothing else:
   `tar -tf` yes, `tar xf` no. The mode is set by the loop and stripped from the model's
   arguments, so it cannot ask for the coding table.
 
-**What it cannot do yet**, since the example above is deliberately one that runs today.
-There is no carving or extraction, so there is no path from a firmware image to the
-files inside it — a packed blob can only be described from the outside. There is no
-decompiler for any architecture. And the installed `objdump` covers the ARM family and
-x86/x86-64 but not Xtensa, RISC-V or MIPS, so ESP32, RISC-V and MIPS targets cannot be
-disassembled at all. Running the target under a debugger is a separate need and wants a
-VM rather than another entry in the allowlist; the refusal says so, and the model
-records the question instead. See
+**What it cannot do yet.** There is no carving or extraction, so there is no path from a
+firmware image to the files inside it — a packed blob can be described from the outside
+and read as code once you know where the code is, but nothing here unpacks a container.
+Decompiled parameter lists are unreliable on Xtensa and RISC-V, where rz-ghidra cannot
+match the calling convention; the tool says so in its output rather than leaving you to
+find out. And running the target under a debugger is a separate need that wants a VM
+rather than another entry in the allowlist; the refusal says so, and the model records the
+question instead. See
 [ADR 0012](docs/adr/0012-reverse-engineering-mode.md),
 [0015](docs/adr/0015-note-pack-identity.md),
-[0016](docs/adr/0016-loop-captured-evidence.md) and
-[0017](docs/adr/0017-weakness-findings-and-handoff.md).
+[0016](docs/adr/0016-loop-captured-evidence.md),
+[0017](docs/adr/0017-weakness-findings-and-handoff.md) and
+[0018](docs/adr/0018-rizin-structured-tools.md).
+
+Disassembly needs the pinned rizin build, which is a source build rather than a Homebrew
+one: rizin gates its Xtensa and RISC-V plugins on a bundled capstone that the Homebrew
+bottle does not use, so `brew install rizin` silently lacks both. ADR 0018 records the
+commits and the one-line rz-ghidra build fix RISC-V needs. Without it the RE mode still
+works; the two tools report that they are unavailable and the static allowlist carries on.
 
 ### Why transcripts are append-only
 
@@ -290,6 +306,7 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
 | `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
 | `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings, and the command log behind them |
+| `skippy_rizin.py` | Function-scoped disassembly and decompilation, with rizin kept out of the allowlist |
 | `skippy_memory.py` | Project memory: sessions, decisions and work items, carried into the next run and marked when stale |
 | `skippy_tasks.py` | Runs a task for a connected client: one at a time, cancellable, events follow the client |
 | `skippy_cursor.py` | Bridge to the editor: routes patches through it and brings diagnostics back |
