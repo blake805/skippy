@@ -9,6 +9,7 @@ struct ContentView: View {
             set: { newPage in
                 app.page = newPage
                 if newPage == .voice { app.openVoice() }
+                if newPage == .memory { app.factory.requestMemory() }
             }
         )) {
             ChatView()
@@ -17,6 +18,9 @@ struct ContentView: View {
             VoiceView(voice: app.voice)
                 .tabItem { Label(SidebarPage.voice.rawValue, systemImage: SidebarPage.voice.systemImage) }
                 .tag(SidebarPage.voice)
+            MemoryView(factory: app.factory)
+                .tabItem { Label(SidebarPage.memory.rawValue, systemImage: SidebarPage.memory.systemImage) }
+                .tag(SidebarPage.memory)
             SettingsView()
                 .tabItem { Label(SidebarPage.settings.rawValue, systemImage: SidebarPage.settings.systemImage) }
                 .tag(SidebarPage.settings)

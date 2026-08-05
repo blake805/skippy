@@ -21,6 +21,7 @@ enum AgentMode: String, CaseIterable, Identifiable {
 enum SidebarPage: String, CaseIterable, Identifiable {
     case work = "Work"
     case voice = "Voice"
+    case memory = "Memory"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -29,6 +30,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         switch self {
         case .work: return "bubble.left.and.bubble.right"
         case .voice: return "waveform"
+        case .memory: return "brain"
         case .settings: return "gearshape"
         }
     }
@@ -96,6 +98,70 @@ struct PendingApproval: Identifiable, Equatable {
         self.detail = detail
         self.diff = diff
         self.files = files
+    }
+}
+
+/// A decision from project memory, as the memory browser shows it.
+struct MemoryDecision: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let recorded: String
+    let superseded: Bool
+    let stalePaths: [String]
+}
+
+/// A past session from project memory.
+struct MemorySession: Identifiable, Equatable {
+    let id: String
+    let recorded: String
+    let status: String
+    let task: String
+    let summary: String
+    let filesChanged: [String]
+    let mode: String
+}
+
+/// What the hub knows about this project, shaped for the memory browser.
+/// Identical parsing to the Mac's context rail, so the two stay in step.
+struct MemorySnapshot: Equatable {
+    let projectId: String
+    let conventions: [String: String]
+    let decisions: [MemoryDecision]
+    let sessions: [MemorySession]
+    let error: String?
+
+    /// Parse the hub's `{"type": "memory", ...}` payload. Tolerant of missing
+    /// fields: an older hub or an errored snapshot still yields something.
+    init(payload: [String: Any]) {
+        projectId = payload["project_id"] as? String ?? ""
+        error = payload["error"] as? String
+        conventions = (payload["conventions"] as? [String: String])
+            ?? (payload["conventions"] as? [String: Any])?.compactMapValues { $0 as? String }
+            ?? [:]
+        decisions = (payload["decisions"] as? [[String: Any]] ?? []).map { raw in
+            MemoryDecision(
+                id: raw["id"] as? String ?? "",
+                title: raw["title"] as? String ?? "",
+                recorded: raw["recorded"] as? String ?? "",
+                superseded: raw["superseded"] as? Bool ?? false,
+                stalePaths: raw["stale_paths"] as? [String] ?? []
+            )
+        }
+        sessions = (payload["sessions"] as? [[String: Any]] ?? []).map { raw in
+            MemorySession(
+                id: raw["session_id"] as? String ?? "",
+                recorded: raw["recorded"] as? String ?? "",
+                status: raw["status"] as? String ?? "",
+                task: raw["task"] as? String ?? "",
+                summary: raw["summary"] as? String ?? "",
+                filesChanged: raw["files_changed"] as? [String] ?? [],
+                mode: raw["mode"] as? String ?? ""
+            )
+        }
+    }
+
+    var isEmpty: Bool {
+        conventions.isEmpty && decisions.isEmpty && sessions.isEmpty
     }
 }
 

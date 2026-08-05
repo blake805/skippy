@@ -18,6 +18,12 @@ final class VoiceClient: ObservableObject {
     @Published var metrics = VoiceMetrics()
     @Published var pushToTalk = false
     @Published var transmitting = false
+    /// How many bars the live waveform keeps; roughly one second of mic audio.
+    static let waveformBars = 48
+    /// Smoothed mic level, 0…1, for the orb's breathing.
+    @Published var level: Float = 0
+    /// Recent levels, newest last, for the live waveform.
+    @Published var waveform: [Float] = Array(repeating: 0, count: VoiceClient.waveformBars)
 
     private let socket = WebSocketSession()
     private var settings: SettingsStore
@@ -64,7 +70,9 @@ final class VoiceClient: ObservableObject {
     }
 
     func setPushToTalk(_ down: Bool) {
+        guard transmitting != down else { return }
         transmitting = down
+        if down { Haptics.tap() } else { Haptics.shift() }
         if down, !started { startAudio() }
     }
 
@@ -105,6 +113,10 @@ final class VoiceClient: ObservableObject {
             input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
                 guard let self else { return }
                 Task { @MainActor in
+                    // Metering runs whether or not we transmit: the orb and
+                    // waveform should breathe whenever the mic is hot, and a
+                    // dead display during push-to-talk-idle reads as "broken".
+                    self.meter(buffer)
                     if self.pushToTalk && !self.transmitting { return }
                     self.sendMic(buffer)
                 }
@@ -131,6 +143,24 @@ final class VoiceClient: ObservableObject {
         engine.stop()
         started = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// RMS of one mic buffer, smoothed into `level` and appended to the
+    /// waveform history. Attack is instant and decay eased, which is what
+    /// makes the orb feel like it is listening rather than flickering.
+    private func meter(_ buffer: AVAudioPCMBuffer) {
+        guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+        var sum: Float = 0
+        for index in 0..<Int(buffer.frameLength) {
+            let sample = channel[index]
+            sum += sample * sample
+        }
+        let rms = (sum / Float(buffer.frameLength)).squareRoot()
+        // Speech RMS on an iPhone mic sits around 0.02–0.2; scale into 0…1.
+        let scaled = min(rms * 6, 1)
+        level = scaled > level ? scaled : level * 0.82
+        waveform.removeFirst()
+        waveform.append(level)
     }
 
     private func sendMic(_ buffer: AVAudioPCMBuffer) {
@@ -162,7 +192,14 @@ final class VoiceClient: ObservableObject {
         let type = msg["type"] as? String ?? ""
         switch type {
         case "state":
-            state = msg["state"] as? String ?? state
+            let next = msg["state"] as? String ?? state
+            // Feel the turn-taking: a nudge when Skippy starts talking and a
+            // lighter one when it hands the floor back.
+            if next != state {
+                if next == "speaking" { Haptics.shift() }
+                else if next == "listening", state == "speaking" { Haptics.tap() }
+            }
+            state = next
             if state == "listening" { ensureListening() }
         case "transcript":
             transcript = msg["text"] as? String ?? ""

@@ -9,6 +9,8 @@ final class FactoryClient: ObservableObject {
     @Published var items: [TimelineItem] = []
     @Published var pendingApproval: PendingApproval?
     @Published var statusLine: String = "Disconnected"
+    /// What the hub knows about this project, for the memory browser.
+    @Published var memory: MemorySnapshot?
 
     private let socket = WebSocketSession()
     private var history: [[String: String]] = []
@@ -31,10 +33,18 @@ final class FactoryClient: ObservableObject {
 
     func connect() {
         socket.connect(to: settings.factoryURL)
-        // Announce so a reconnect mid-run does not look like a new task.
+        // Announce so a reconnect mid-run does not look like a new task, then
+        // ask where things stand: a run may have carried on while the phone
+        // was in a pocket, and the memory browser wants its data up front.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.socket.sendJSON(["type": "hello", "client": "SkippyMac"])
+            self?.socket.sendJSON(["type": "hello", "client": "SkippyPhone"])
+            self?.socket.sendJSON(["action": "status"])
+            self?.socket.sendJSON(["action": "memory"])
         }
+    }
+
+    func requestMemory() {
+        socket.sendJSON(["action": "memory"])
     }
 
     func disconnect() {
@@ -88,6 +98,7 @@ final class FactoryClient: ObservableObject {
             payload["task_id"] = taskId
         }
         socket.sendJSON(payload)
+        Haptics.tap()
         let noun = pending.kind == .code ? "edit" : "device write"
         let verb = approve ? (approveAll ? "Approved all edits" : "Approved \(noun)")
                            : "Denied \(noun)"
@@ -147,6 +158,14 @@ final class FactoryClient: ObservableObject {
         case "done":
             isRunning = false
             statusLine = connected ? "Ready" : "Disconnected"
+            // A finished run is new project history; refresh the browser.
+            requestMemory()
+        case "status":
+            // Reconnect answer: the hub says whether our run is still going.
+            isRunning = msg["running"] as? Bool ?? false
+            if isRunning { statusLine = "Running…" }
+        case "memory":
+            memory = MemorySnapshot(payload: msg)
         case "code_auth":
             let explanation = msg["explanation"] as? String ?? "Skippy wants to change your files."
             let diff = msg["diff"] as? String ?? ""
@@ -159,6 +178,8 @@ final class FactoryClient: ObservableObject {
                 diff: diff,
                 files: files
             )
+            // The one event that must be felt: Skippy is waiting on a human.
+            Haptics.attention()
         case "device_auth", "terminal_auth", "deployment_auth":
             let explanation = msg["explanation"] as? String
                 ?? msg["command"] as? String
@@ -170,6 +191,7 @@ final class FactoryClient: ObservableObject {
                 explanation: explanation,
                 detail: detail
             )
+            Haptics.attention()
         case "error":
             items.append(TimelineItem(kind: .error, text: msg["message"] as? String ?? "Error"))
         default:
