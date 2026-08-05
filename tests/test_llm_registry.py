@@ -39,12 +39,16 @@ def reply(content="", tool_calls=None, status=200):
 # --- registry resolution ---
 
 def test_default_roles_are_local_and_match_cached_weights():
-    assert set(skippy_llm.MODELS) == {"fast", "heavy", "compressor"}
-    for role in ("fast", "heavy", "compressor"):
+    assert set(skippy_llm.MODELS) == {"fast", "heavy", "compressor", "voice"}
+    for role in ("fast", "heavy", "compressor", "voice"):
         assert skippy_llm.endpoint(role).is_local
 
     assert "480B" in skippy_llm.endpoint("heavy").model
     assert "30B-A3B" in skippy_llm.endpoint("fast").model
+    # The voice role is chat-tuned, not the coder weights: the coder model
+    # answering out loud was stilted and loop-prone.
+    assert "Instruct-2507" in skippy_llm.endpoint("voice").model
+    assert "Coder" not in skippy_llm.endpoint("voice").model
 
 
 def test_compressor_shares_the_fast_server_but_not_the_32k_model():

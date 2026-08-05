@@ -12,8 +12,24 @@ openai-whisper
 kokoro-onnx
 soundfile
 
+# Realtime voice lane (/ws/voice). silero-vad pulls torch; skippy_voice falls
+# back to an energy detector without it, so it is optional in a pinch.
+silero-vad
+sounddevice  # tools/voice_client.py only
+
+# Optional, Apple Silicon only: MLX STT/TTS backends for the voice bake-off.
+# Install by hand (`pip install mlx-audio`) and select with SKIPPY_VOICE_STT /
+# SKIPPY_VOICE_TTS ("mlx:<model_id>"). Not listed here because this file must
+# also install on Linux.
+
 # Tools
 ddgs
+
+# RE device I/O (skippy_device). pyserial may already be present via platformio;
+# listed explicitly so a clean install has it. pyusb needs libusb on the host
+# (`brew install libusb` on macOS) for USB enumeration/transfers.
+pyserial
+pyusb
 
 # Misc
 numpy

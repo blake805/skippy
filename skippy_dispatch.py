@@ -17,9 +17,11 @@ import inspect
 import logging
 from typing import Any, Dict, Optional
 
+import skippy_device
 import skippy_exec
 import skippy_cursor
 import skippy_fs
+import skippy_git
 import skippy_memory
 import skippy_re
 import skippy_extract
@@ -53,6 +55,10 @@ _NOTES_TOOLS = (
 # These take the project memory the loop opens, for the same reason.
 _MEMORY_TOOLS = ("record_decision", "recall_project", "resolve_work_item")
 
+# Live hardware. First argument is the DeviceService the loop owns; they are
+# async because writes wait on a human approval and remote hosts go over RPC.
+_DEVICE_TOOLS = skippy_device.DEVICE_TOOLS
+
 _ASYNC_TOOLS = {
     "grep": skippy_fs.grep,
     "run_command": skippy_exec.run_command,
@@ -67,6 +73,20 @@ _ASYNC_TOOLS = {
     # writes files, and it writes them into the pack rather than a workspace root.
     "extract_artifact": skippy_extract.extract_artifact,
     "list_extracted": skippy_extract.list_extracted,
+    # Async for the subprocess, and git_commit for its approval wait.
+    "git_status": skippy_git.git_status,
+    "git_diff": skippy_git.git_diff,
+    "git_branch": skippy_git.git_branch,
+    "git_commit": skippy_git.git_commit,
+    "list_devices": skippy_device.list_devices,
+    "serial_open": skippy_device.serial_open,
+    "serial_io": skippy_device.serial_io,
+    "serial_close": skippy_device.serial_close,
+    "usb_transfer": skippy_device.usb_transfer,
+    "usb_control": skippy_device.usb_control,
+    "net_connect": skippy_device.net_connect,
+    "net_io": skippy_device.net_io,
+    "net_scan": skippy_device.net_scan,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
@@ -83,7 +103,7 @@ def _expected(name: str) -> str:
         return ""
     params = [
         p for p in inspect.signature(handler).parameters
-        if p not in ("sandbox", "journal_dir", "mode", "pack", "memory")
+        if p not in ("sandbox", "journal_dir", "mode", "pack", "memory", "service")
     ]
     return ", ".join(params)
 
@@ -97,6 +117,8 @@ async def dispatch(
     notes_pack: Optional[Any] = None,
     memory: Optional[Any] = None,
     cursor: Optional[Any] = None,
+    devices: Optional[Any] = None,
+    approver: Optional[Any] = None,
 ) -> ToolResult:
     """Run one tool. Never raises."""
     args: Dict[str, Any] = dict(args or {})
@@ -128,7 +150,10 @@ async def dispatch(
     # Never model-controlled. `mode` belongs here for the same reason as the sandbox:
     # a model in RE mode that could request the coding table could execute the
     # artifact it was asked to analyse, which is the one thing the split prevents.
-    for injected in ("sandbox", "journal_dir", "mode", "pack", "memory", "bridge", "writer"):
+    for injected in (
+        "sandbox", "journal_dir", "mode", "pack", "memory", "bridge", "writer",
+        "service", "approver",
+    ):
         args.pop(injected, None)
     if name == "apply_patch":
         if journal_dir:
@@ -137,6 +162,12 @@ async def dispatch(
         # undo step. The model is not told which happened and has no way to ask: it
         # would only be a choice it could get wrong.
         args["bridge"] = cursor
+        # The human-in-the-app gate. None means no gate (headless, or approvals
+        # turned off), and apply_patch writes as before.
+        args["approver"] = approver
+    if name == "git_commit":
+        # The same human gate as apply_patch: a commit is a write to history.
+        args["approver"] = approver
     if name == "run_command":
         args["mode"] = mode
     # The notes tools write to a pack rather than to the workspace, so they take the
@@ -164,6 +195,14 @@ async def dispatch(
                 "your finish summary instead.",
             )
         first = memory
+    elif name in _DEVICE_TOOLS:
+        if devices is None:
+            return ToolResult(
+                False,
+                f"'{name}' needs a device service, which only reverse-engineering mode "
+                "opens. This looks like a coding task.",
+            )
+        first = devices
     else:
         first = sandbox
 

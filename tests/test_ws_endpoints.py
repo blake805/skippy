@@ -60,7 +60,7 @@ def test_ping(client):
 def test_health_reports_every_role_and_the_cloud_flag(client):
     body = client.get("/health").json()
     assert body["cloud_allowed"] is False
-    assert set(body["roles"]) == {"fast", "heavy", "compressor"}
+    assert set(body["roles"]) == {"fast", "heavy", "compressor", "voice"}
     for role in body["roles"].values():
         assert role["local"] is True
         assert role["model"]
@@ -150,6 +150,248 @@ def test_an_approval_shaped_reply_is_not_treated_as_a_new_message(client):
         socket.send_json({"mode": "Agent", "text": "hello", "history": []})
         assert socket.receive_json()["type"] == "chat"
         assert socket.receive_json()["type"] == "done"
+
+
+def test_status_when_idle_reports_not_running_and_starts_nothing(client):
+    """The cockpit polls this on reconnect; it must never be mistaken for a task."""
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "status"})
+        reply = socket.receive_json()
+        assert reply["type"] == "status"
+        assert reply["running"] is False
+        # The socket answers the next real message normally: nothing was started.
+        socket.send_json({"mode": "Chat", "text": "", "history": []})
+        assert socket.receive_json()["type"] == "chat"
+        assert socket.receive_json()["type"] == "done"
+
+
+def test_memory_action_returns_the_project_snapshot(client, tmp_path, monkeypatch):
+    """The context rail's data: structured, not the model-facing prose block."""
+    import skippy_memory
+
+    repo = tmp_path / "a_repo"
+    repo.mkdir()
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(tmp_path / "memory"))
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    memory = skippy_memory.open_project(workspace_roots=[str(repo)])
+    memory.add_decision("Use wsproto", "The websockets backend races its own pings.")
+    memory.record_session(
+        task="wire the voice lane", status="done", summary="Voice lane is live.",
+        files_changed=["skippy_voice.py"], mode="coding",
+    )
+    memory.learn_convention("test_command", "pytest -q")
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "memory"})
+        reply = socket.receive_json()
+
+    assert reply["type"] == "memory"
+    assert reply["project_id"] == "a-repo"
+    assert reply["conventions"] == {"test_command": "pytest -q"}
+    assert [d["title"] for d in reply["decisions"]] == ["Use wsproto"]
+    assert reply["decisions"][0]["superseded"] is False
+    assert reply["sessions"][0]["summary"] == "Voice lane is live."
+    assert reply["sessions"][0]["files_changed"] == ["skippy_voice.py"]
+
+
+def test_memory_action_with_no_workspace_still_answers(client, tmp_path, monkeypatch):
+    """A misconfigured hub shows an empty rail, not a dead socket."""
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(tmp_path / "memory"))
+    monkeypatch.delenv("SKIPPY_WORKSPACE_ROOTS", raising=False)
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "memory"})
+        reply = socket.receive_json()
+
+    assert reply["type"] == "memory"
+    assert reply["project_id"] == "unscoped"
+    assert reply["decisions"] == []
+    assert reply["sessions"] == []
+
+
+def test_re_notes_lists_packs_and_then_their_findings(client, tmp_path, monkeypatch):
+    """The findings notebook: pack list first, then one pack's findings."""
+    import skippy_re
+
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(tmp_path / "memory"))
+    notes = str(tmp_path / "memory" / "notes")
+    os.makedirs(notes, exist_ok=True)
+
+    pack = skippy_re.open_pack(notes, target="acme-fob.bin", title="ACME key fob")
+    pack.add(
+        kind="structure", title="Header is 32 bytes",
+        body="The load command at +0x18 gives the first section offset 0x20.",
+        evidence="otool -l shows offset 0x20 at +0x18", confidence="confirmed",
+        location="+0x18",
+    )
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "re_notes"})
+        listing = socket.receive_json()
+        assert listing["type"] == "re_notes"
+        assert len(listing["packs"]) == 1
+        pack_id = listing["packs"][0]["pack_id"]
+        assert listing["packs"][0]["target"] == "acme-fob.bin"
+
+        socket.send_json({"action": "re_notes", "pack_id": pack_id})
+        detail = socket.receive_json()
+        assert detail["type"] == "re_notes"
+        assert detail["target"] == "acme-fob.bin"
+        assert detail["findings"][0]["title"] == "Header is 32 bytes"
+        assert detail["findings"][0]["confidence"] == "confirmed"
+        assert detail["findings"][0]["superseded"] is False
+
+
+def test_re_add_finding_writes_a_human_authored_finding(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(tmp_path / "memory"))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({
+            "action": "re_add_finding",
+            "target": "acme-fob.bin",
+            "kind": "constant",
+            "title": "Rolling code seed",
+            "body": "The seed is the little-endian u32 at +0x40.",
+            "evidence": "xxd +0x40 shows 0x11223344 matching the captured frame",
+            "confidence": "likely",
+            "location": "+0x40",
+        })
+        saved = socket.receive_json()
+        assert saved["type"] == "re_finding_saved"
+        assert saved["ok"] is True
+
+        socket.send_json({"action": "re_notes", "pack_id": saved["pack_id"]})
+        detail = socket.receive_json()
+        assert detail["findings"][0]["title"] == "Rolling code seed"
+        assert detail["findings"][0]["kind"] == "constant"
+
+
+def test_re_add_finding_still_refuses_evidence_free_assertions(client, tmp_path, monkeypatch):
+    """The dashboard is a human, but an unrecheckable finding is worthless anyway."""
+    monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(tmp_path / "memory"))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({
+            "action": "re_add_finding",
+            "target": "acme-fob.bin",
+            "kind": "structure",
+            "title": "Something I did not verify",
+            "body": "It is definitely like this.",
+            "confidence": "confirmed",
+        })
+        reply = socket.receive_json()
+        assert reply["type"] == "re_finding_saved"
+        assert "evidence" in reply["error"].lower()
+
+
+def test_re_devices_answers_even_with_no_hardware(client):
+    """The device panel: studio enumeration must return a list, empty is fine."""
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "re_devices", "host": "studio"})
+        reply = socket.receive_json()
+    assert reply["type"] == "re_devices"
+    assert isinstance(reply["devices"], list)
+
+
+def _seed_repo(path):
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    def run(*args):
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=t@example.com", *args],
+            cwd=path, capture_output=True, check=True,
+        )
+    run("init", "-q", "-b", "main")
+    run("config", "user.name", "Test")
+    run("config", "user.email", "t@example.com")
+    (path / "app.py").write_text("x = 1\n")
+    run("add", "-A")
+    run("commit", "-q", "-m", "initial")
+    return path
+
+
+def test_git_action_lists_repos_and_then_one_repo_in_full(client, tmp_path, monkeypatch):
+    """The repo panel's data: headline list first, then branch/changes/diffs."""
+    repo = _seed_repo(tmp_path / "proj")
+    (repo / "app.py").write_text("x = 2\n")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git"})
+        listing = socket.receive_json()
+        assert listing["type"] == "git"
+        assert len(listing["repos"]) == 1
+        assert listing["repos"][0]["name"] == "proj"
+        assert listing["repos"][0]["branch"] == "main"
+        assert listing["repos"][0]["changes"] == 1
+
+        socket.send_json({"action": "git", "repo": "proj"})
+        detail = socket.receive_json()
+        assert detail["type"] == "git"
+        assert detail["branch"] == "main"
+        assert "main" in detail["branches"]
+        assert detail["changes"][0]["path"] == "app.py"
+        assert "+x = 2" in detail["diff"]
+        assert detail["last_commit"]["subject"] == "initial"
+
+
+def test_git_action_with_no_roots_answers_with_a_reason(client, monkeypatch):
+    """A misconfigured hub shows an empty panel, not a dead socket."""
+    monkeypatch.delenv("SKIPPY_WORKSPACE_ROOTS", raising=False)
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git"})
+        reply = socket.receive_json()
+    assert reply["type"] == "git"
+    assert "workspace root" in reply["error"].lower()
+
+
+def test_git_commit_action_commits_from_the_panel_without_a_card(client, tmp_path, monkeypatch):
+    """A human-clicked commit is its own approval; it must not wait on a card."""
+    repo = _seed_repo(tmp_path / "proj")
+    (repo / "app.py").write_text("x = 3\n")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({
+            "action": "git_commit", "repo": "proj", "message": "bump x from the panel",
+        })
+        reply = socket.receive_json()
+        assert reply["type"] == "git_result"
+        assert reply["ok"] is True
+        assert reply["commit"]
+
+        socket.send_json({"action": "git", "repo": "proj"})
+        detail = socket.receive_json()
+        assert detail["changes"] == []
+        assert detail["last_commit"]["subject"] == "bump x from the panel"
+
+
+def test_git_commit_action_with_nothing_staged_reports_the_error(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git_commit", "repo": "proj", "message": "empty"})
+        reply = socket.receive_json()
+    assert reply["type"] == "git_result"
+    assert "nothing to commit" in reply["error"].lower()
+
+
+def test_git_branch_action_creates_and_reports_the_new_branch(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({
+            "action": "git_branch", "repo": "proj", "name": "feature/panel", "create": True,
+        })
+        reply = socket.receive_json()
+        assert reply["type"] == "git_result"
+        assert reply["ok"] is True
+
+        socket.send_json({"action": "git", "repo": "proj"})
+        detail = socket.receive_json()
+        assert detail["branch"] == "feature/panel"
 
 
 def test_disconnect_deregisters_the_client(client):

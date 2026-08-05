@@ -666,3 +666,123 @@ async def test_losing_the_before_snapshot_does_not_cost_the_patch(box, repo):
     )
     assert result.ok
     assert "a + b + 8" in (repo / "calc" / "ops.py").read_text()
+
+
+# --- the in-app approval gate ---
+
+def approver_that(status, scope=None, seen=None):
+    """A CodeApprover wired to answer without a socket, recording what it saw."""
+    approver = skippy_cursor.CodeApprover(hub=None, client_id="")
+
+    async def respond(payload):
+        if seen is not None:
+            seen.append(payload)
+        reply = {"status": status}
+        if scope:
+            reply["scope"] = scope
+        return reply
+
+    approver._test_approver = respond
+    return approver
+
+
+@pytest.mark.asyncio
+async def test_a_declined_edit_writes_nothing_anywhere(box, repo):
+    before = (repo / "calc" / "ops.py").read_text()
+    result = await skippy_cursor.apply_patch(
+        box,
+        [{"path": "calc/ops.py", "search": "a + b", "replace": "a + b + 9"}],
+        bridge=None,
+        approver=approver_that("DENY"),
+    )
+    assert result.ok is False
+    assert result.data.get("declined") is True
+    # The file is untouched — decline must never fall through to a silent write,
+    # the same guarantee the editor-refusal path already makes.
+    assert (repo / "calc" / "ops.py").read_text() == before
+
+
+@pytest.mark.asyncio
+async def test_the_card_shows_the_real_diff_before_any_write(box):
+    seen = []
+    await skippy_cursor.apply_patch(
+        box,
+        [{"path": "calc/ops.py", "search": "a + b", "replace": "a + b + 1"}],
+        bridge=None,
+        approver=approver_that("APPROVE", seen=seen),
+    )
+    assert len(seen) == 1
+    card = seen[0]
+    assert card["type"] == "code_auth"
+    # The human sees the actual change, not just a filename.
+    assert "a + b + 1" in card["diff"]
+    assert card["files"]
+
+
+@pytest.mark.asyncio
+async def test_an_approved_edit_is_written(box, repo):
+    result = await skippy_cursor.apply_patch(
+        box,
+        [{"path": "calc/ops.py", "search": "a + b", "replace": "a + b + 2"}],
+        bridge=None,
+        approver=approver_that("APPROVE"),
+    )
+    assert result.ok
+    assert "a + b + 2" in (repo / "calc" / "ops.py").read_text()
+
+
+@pytest.mark.asyncio
+async def test_approve_all_stops_asking_for_the_rest_of_the_run(box, repo):
+    seen = []
+    approver = approver_that("APPROVE", scope="all", seen=seen)
+    for replacement in ("a + b + 3", "a + b + 4", "a + b + 5"):
+        result = await skippy_cursor.apply_patch(
+            box,
+            [{"path": "calc/ops.py", "search": "return a + b", "replace": f"return {replacement}"}],
+            bridge=None,
+            approver=approver,
+        )
+        assert result.ok
+    # Only the first edit raised a card; "approve all" latched the gate off.
+    assert len(seen) == 1
+    assert "a + b + 5" in (repo / "calc" / "ops.py").read_text()
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_edit_is_rejected_before_the_human_is_bothered(box):
+    seen = []
+    result = await skippy_cursor.apply_patch(
+        box,
+        [{"path": "../../etc/passwd", "action": "create", "content": "x"}],
+        bridge=None,
+        approver=approver_that("APPROVE", seen=seen),
+    )
+    assert result.ok is False
+    # No point asking someone to approve a patch that cannot apply.
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_the_gate_can_be_turned_off_entirely(monkeypatch):
+    monkeypatch.setenv("SKIPPY_CODE_APPROVAL", "off")
+    assert skippy_cursor.build_code_approver(FakeHub(), "skippy-mac") is None
+    monkeypatch.setenv("SKIPPY_CODE_APPROVAL", "app")
+    assert skippy_cursor.build_code_approver(FakeHub(), "skippy-mac") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_disconnected_app_fails_open_rather_than_wedging_the_run(box, repo):
+    """A code edit is undoable; a phone that dropped off Wi-Fi must not block work.
+
+    (Contrast the device gate, which fails closed because bricking hardware is not
+    undoable.) The write proceeds and the warning is logged.
+    """
+    approver = skippy_cursor.CodeApprover(hub=FakeHub(connected=False), client_id="skippy-mac")
+    result = await skippy_cursor.apply_patch(
+        box,
+        [{"path": "calc/ops.py", "search": "a + b", "replace": "a + b + 6"}],
+        bridge=None,
+        approver=approver,
+    )
+    assert result.ok
+    assert "a + b + 6" in (repo / "calc" / "ops.py").read_text()

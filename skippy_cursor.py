@@ -34,6 +34,7 @@ cases against both.
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import skippy_edit
@@ -42,6 +43,16 @@ from skippy_sandbox import Sandbox, ToolResult, cap_text
 logger = logging.getLogger("skippy_cursor")
 
 CURSOR_CLIENT_ID = "cursor"
+
+# How long the human has to answer a code-edit approval card before it fails.
+# Generous, like the device-write gate in ADR 0005: the person may be reading a
+# large diff, or across the room, and a premature timeout is worse than a wait.
+CODE_APPROVAL_TIMEOUT = 600.0
+
+# The diff shown in an approval card is bounded — a 40,000-line generated-file
+# rewrite is not something a human reads, and shipping it to a phone over a
+# cellular link is worse. The full diff still reaches the transcript.
+MAX_APPROVAL_DIFF_CHARS = 40_000
 
 # A workspace edit legitimately takes far longer than a query for the open file list,
 # so timeouts are per action rather than one global value. The old global 10 seconds
@@ -126,6 +137,91 @@ class CursorBridge:
 
     async def apply_patches(self, edits: List[dict]) -> dict:
         return await self.call("apply_patches", {"edits": edits})
+
+
+class CodeApprover:
+    """The in-app approval gate for code edits.
+
+    The Cursor extension applies hub edits silently by default (its own
+    `confirmPatches` is off), so without this gate a coding run edits the tree
+    with no human in the loop — fine for a trusted local agent, wrong for the
+    "brainstorm in the app, approve in the app" flow the desktop is built for.
+
+    This shows the unified diff on the run's own socket and waits, reusing the
+    exact `request_authorization` channel device writes travel (ADR 0005). It
+    is the twin of `DeviceService.approve_write`, and returns the same way: a
+    failed `ToolResult` means declined, `None` means proceed.
+
+    Two deliberate differences from the device gate. Code edits are undoable and
+    a disconnected app must not wedge the workflow, so a missing socket fails
+    *open* (write, log a warning) rather than closed. And "approve all for this
+    task" latches the gate off for the rest of the run, because approving every
+    line of a fifteen-file refactor one card at a time is how a good feature
+    becomes one nobody uses.
+    """
+
+    def __init__(
+        self,
+        hub: Any = None,
+        client_id: str = "",
+        timeout: float = CODE_APPROVAL_TIMEOUT,
+    ):
+        self.hub = hub
+        self.client_id = client_id
+        self.timeout = timeout
+        self.enabled = True
+        self._test_approver = None  # tests install an async (payload)->reply here
+
+    async def approve(self, summary: str, diff: str, files: Sequence[dict]) -> Optional[ToolResult]:
+        if not self.enabled:
+            return None
+        payload = {
+            "type": "code_auth",
+            "explanation": summary or "Skippy wants to change your files.",
+            "diff": cap_text(diff or "", MAX_APPROVAL_DIFF_CHARS),
+            "files": list(files or []),
+        }
+        reply = await self._request(payload)
+        status = str(reply.get("status", "")).upper()
+        if status == "APPROVE":
+            if str(reply.get("scope", "")).lower() == "all":
+                # The rest of this run writes without asking again.
+                self.enabled = False
+            return None
+        reason = reply.get("reason") or "you declined the change in the app"
+        return ToolResult(
+            False,
+            f"The edit was not applied: {reason}.",
+            data={"declined": True},
+        )
+
+    async def _request(self, payload: dict) -> dict:
+        override = self._test_approver
+        if override is not None:
+            return await override(payload)
+        if self.hub is None or not self.client_id:
+            logger.info("No client bound for code approval; applying without a gate.")
+            return {"status": "APPROVE"}
+        socket_ = getattr(self.hub, "active_connections", {}).get(self.client_id)
+        if socket_ is None:
+            logger.warning(
+                "Code approval requested but client '%s' is offline; applying "
+                "without a gate so the run is not wedged.", self.client_id,
+            )
+            return {"status": "APPROVE"}
+        return await self.hub.request_authorization(socket_, payload, timeout=self.timeout)
+
+
+def build_code_approver(hub: Any, client_id: str) -> Optional["CodeApprover"]:
+    """A gate for this run, or None when approvals are turned off.
+
+    SKIPPY_CODE_APPROVAL=off disables the gate entirely (edits apply straight
+    through, the pre-gate behaviour). Any other value, or unset, means the app
+    is the approval surface.
+    """
+    if os.environ.get("SKIPPY_CODE_APPROVAL", "app").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    return CodeApprover(hub=hub, client_id=client_id)
 
 
 def format_diagnostics(entries: Any, limit: int = MAX_DIAGNOSTICS) -> str:
@@ -279,6 +375,7 @@ async def apply_patch(
     bridge: Optional[CursorBridge] = None,
     dry_run: bool = False,
     journal_dir: Optional[str] = None,
+    approver: Optional[CodeApprover] = None,
 ) -> ToolResult:
     """Apply an edit set, through the editor when one is attached.
 
@@ -286,7 +383,29 @@ async def apply_patch(
     refusal is usually the user declining the change, and in that case a silent local
     write would be the opposite of what they asked for — so the fallback happens only
     for a transport failure, and a declined edit is reported as a failure.
+
+    When an `approver` is present and this is not a dry run, the human is shown the
+    exact diff first and can decline before anything is written — whether the write
+    would go to the editor or to disk.
     """
+    if approver is not None and not dry_run:
+        # Stage the change without touching anything, so the card shows the real
+        # diff and a validation failure is reported now rather than after a
+        # pointless approval. The staged text is deterministic from these edits,
+        # so what is approved is exactly what gets written a moment later.
+        preview = await asyncio.to_thread(
+            skippy_edit.apply_patch, sandbox, edits, dry_run=True
+        )
+        if not preview.ok:
+            return preview
+        declined = await approver.approve(
+            preview.summary,
+            preview.data.get("diff", ""),
+            preview.data.get("files", []),
+        )
+        if declined is not None:
+            return declined
+
     local = None
     if bridge is None or not bridge.connected or dry_run:
         return await asyncio.to_thread(

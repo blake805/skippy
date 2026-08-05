@@ -81,7 +81,8 @@ async def settle(runner, client_id="phone", timeout=5.0):
     ("agent", "coding"),
     ("", "coding"),
     (None, "coding"),
-    ("Chat", "coding"),
+    ("Chat", "chat"),
+    ("chat", "chat"),
     ("RE", "re"),
     ("re", "re"),
     ("Reverse Engineering", "re"),
@@ -104,6 +105,35 @@ async def test_a_request_runs_the_agent_and_reports_its_summary(runner, socket, 
     assert "agent_start" in socket.types()
     assert socket.types()[-1] == "done"
     assert any("Added the feature" in text for text in socket.chats())
+
+
+@pytest.mark.asyncio
+async def test_history_from_the_client_reaches_the_model(runner, socket, routed_llm):
+    """A follow-up sent from the app carries its prior turns so the run continues
+    the thread. The runner only checks it is a list; the loop validates contents."""
+    routed_llm.load([finish("Continued.")])
+    await runner.start("phone", {
+        "text": "now the other file",
+        "mode": "Agent",
+        "history": [
+            {"role": "user", "content": "rename add to plus"},
+            {"role": "assistant", "content": "renamed it"},
+        ],
+    })
+    await settle(runner)
+
+    seen = [m.get("content") for m in routed_llm.last_messages()]
+    assert "rename add to plus" in seen
+    assert "renamed it" in seen
+
+
+@pytest.mark.asyncio
+async def test_a_non_list_history_is_ignored_rather_than_crashing(runner, socket, routed_llm):
+    routed_llm.load([finish("Done.")])
+    await runner.start("phone", {"text": "a task", "mode": "Agent", "history": "oops"})
+    await settle(runner)
+    assert socket.types()[-1] == "done"
+    assert any("Done" in text for text in socket.chats())
 
 
 @pytest.mark.asyncio
@@ -157,6 +187,72 @@ async def test_two_clients_can_work_at_the_same_time(hub, repo, routed_llm):
 
     assert phone.types()[-1] == "done"
     assert laptop.types()[-1] == "done"
+
+
+# --- the chat lane ---
+
+@pytest.mark.asyncio
+async def test_chat_answers_without_running_the_agent(runner, socket, routed_llm):
+    """A greeting is a conversation, not a task. No agent_start, no tool nudges,
+    no stopped_without_finish — one reply and a clean done."""
+    routed_llm.load([fl.text("Hey. What are we thinking about today?")])
+    await runner.start("phone", {"text": "hey skippy", "mode": "Chat"})
+    await settle(runner)
+
+    assert "agent_start" not in socket.types()
+    assert socket.types()[-1] == "done"
+    assert any("What are we thinking about" in text for text in socket.chats())
+
+
+@pytest.mark.asyncio
+async def test_chat_carries_the_conversation_history(runner, socket, routed_llm):
+    routed_llm.load([fl.text("Titanium, obviously.")])
+    await runner.start("phone", {
+        "text": "which one would you pick?",
+        "mode": "Chat",
+        "history": [
+            {"role": "user", "content": "aluminum or titanium for the bracket"},
+            {"role": "assistant", "content": "depends on the load"},
+        ],
+    })
+    await settle(runner)
+
+    seen = [m.get("content") for m in routed_llm.last_messages()]
+    assert "aluminum or titanium for the bracket" in seen
+    assert "depends on the load" in seen
+
+
+@pytest.mark.asyncio
+async def test_chat_works_with_no_workspace_roots(hub, socket, routed_llm):
+    """Talking to Skippy must not require a configured workspace: the conversation
+    is how a misconfiguration would be discovered."""
+    runner = TaskRunner(hub, roots_provider=lambda: [])
+    routed_llm.load([fl.text("Hello there.")])
+    await runner.start("phone", {"text": "hi", "mode": "Chat"})
+    await settle(runner)
+
+    assert any("Hello there" in text for text in socket.chats())
+    assert socket.types()[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_chat_failure_is_reported_as_a_reply(runner, socket, routed_llm):
+    routed_llm.load([fl.http_error(500), fl.http_error(500), fl.http_error(500)])
+    await runner.start("phone", {"text": "hi", "mode": "Chat"})
+    await settle(runner, timeout=30.0)
+
+    assert any("could not answer" in text for text in socket.chats())
+    assert socket.types()[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_chat_blocks_a_second_request_like_any_run(runner, socket, routed_llm):
+    routed_llm.load([fl.text("First answer."), fl.text("unused")])
+    await runner.start("phone", {"text": "hi", "mode": "Chat"})
+    if runner.is_running("phone"):
+        await runner.start("phone", {"text": "again", "mode": "Chat"})
+        assert any("still working" in text for text in socket.chats())
+    await settle(runner)
 
 
 # --- no workspace ---

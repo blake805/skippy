@@ -19,9 +19,10 @@ steps" is never reported as success, however much was accomplished.
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import prompts
+import skippy_device
 import skippy_dispatch
 import skippy_exec
 import skippy_llm
@@ -94,6 +95,30 @@ FINISH_SCHEMA = {
 }
 
 
+_HISTORY_ROLES = frozenset({"user", "assistant"})
+
+
+def _clean_history(history: Optional[Sequence[dict]]) -> List[dict]:
+    """Keep only well-formed user/assistant turns from a client-supplied history.
+
+    The history arrives over the wire from whatever client is connected, so it is
+    validated rather than trusted: a system turn here would fight the mode's own
+    system prompt, tool-call turns would arrive without their matching results and
+    break the transcript, and anything without text content is noise. Bad turns are
+    dropped, not raised on — a malformed history should degrade to a fresh run, not
+    fail one.
+    """
+    cleaned: List[dict] = []
+    for turn in history or []:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in _HISTORY_ROLES and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
 @dataclass
 class AgentOutcome:
     status: str  # finished | max_steps | stopped_without_finish | cancelled | failed
@@ -144,6 +169,9 @@ class AgentLoop:
         memory_root: Optional[str] = None,
         remember: bool = True,
         cursor: Optional[Any] = None,
+        history: Optional[Sequence[dict]] = None,
+        devices: Optional[Any] = None,
+        approver: Optional[Any] = None,
     ):
         if not task or not str(task).strip():
             raise ValueError("An agent run needs a task.")
@@ -190,6 +218,18 @@ class AgentLoop:
         # never sees a choice it could get wrong.
         self.cursor = cursor
 
+        # The in-app approval gate for code edits, when one is bound to this run.
+        # None means edits apply without a card (headless, or approvals off) — the
+        # gate lives entirely in the tool layer, invisible to the model.
+        self.approver = approver
+
+        # Live hardware. Only RE mode opens a device service; coding mode must not
+        # see these tools at all (re_tools vs workspace_tools), and a None here is
+        # what makes a hallucinated device call fail closed in dispatch.
+        self.devices = devices
+        if self.devices is None and self.mode == "re":
+            self.devices = skippy_device.DeviceService()
+
         # Opened by the loop, keyed by the workspace roots, so that working on the same
         # repos tomorrow lands on the same memory without anyone naming it.
         self.memory = memory
@@ -204,6 +244,12 @@ class AgentLoop:
 
         system = prompts.RE_SYSTEM if self.mode == "re" else prompts.AGENT_SYSTEM
         self.transcript = skippy_llm.Transcript(system=system)
+        # Prior conversation turns from the client, seeded before the opening so the
+        # model treats this run as a continuation. Kept ahead of the workspace/memory
+        # opening because that block is scoped to *this* run (roots, note pack, the
+        # task itself) and must remain the last thing the model reads.
+        for turn in _clean_history(history):
+            self.transcript.append(turn)
         opening = "Workspace roots:\n" + "\n".join(
             f"- {sandbox.relative(root)} ({root})" for root in sandbox.roots
         )
@@ -462,7 +508,7 @@ class AgentLoop:
             result = await skippy_dispatch.dispatch(
                 name, args, self.sandbox, journal_dir=self.journal_dir,
                 mode=self.mode, notes_pack=self.notes_pack, memory=self.memory,
-                cursor=self.cursor,
+                cursor=self.cursor, devices=self.devices, approver=self.approver,
             )
 
         # Named rather than inferred from the shape of `data`. This used to key off the
@@ -725,11 +771,15 @@ async def run_task(
     memory_root: Optional[str] = None,
     remember: bool = True,
     cursor: Optional[Any] = None,
+    history: Optional[Sequence[dict]] = None,
+    devices: Optional[Any] = None,
+    approver: Optional[Any] = None,
 ) -> AgentOutcome:
     """Convenience entry point for one task."""
     loop = AgentLoop(
         task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir,
         role=role, mode=mode, notes_root=notes_root, target=target,
         memory=memory, memory_root=memory_root, remember=remember, cursor=cursor,
+        history=history, devices=devices, approver=approver,
     )
     return await loop.run()

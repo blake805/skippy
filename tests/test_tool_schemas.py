@@ -14,6 +14,7 @@ import pytest
 import skippy_edit
 import skippy_exec
 import skippy_fs
+import skippy_git
 import skippy_memory
 import skippy_re
 import tool_schemas
@@ -26,6 +27,10 @@ IMPLEMENTED = {
     "glob_files": skippy_fs.glob_files,
     "apply_patch": skippy_edit.apply_patch,
     "run_command": skippy_exec.run_command,
+    "git_status": skippy_git.git_status,
+    "git_diff": skippy_git.git_diff,
+    "git_branch": skippy_git.git_branch,
+    "git_commit": skippy_git.git_commit,
     "note_finding": skippy_re.note_finding,
     "read_notes": skippy_re.read_notes,
     "record_decision": skippy_memory.record_decision,
@@ -34,7 +39,7 @@ IMPLEMENTED = {
 
 # Arguments the dispatcher supplies. The model never sees these, so a schema that
 # declared one would be describing a parameter it cannot fill.
-INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory")
+INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory", "approver")
 
 # Tools that accept their required arguments with Python defaults and check them in
 # the body, so an omission comes back as a message naming the field and its legal
@@ -149,6 +154,8 @@ def test_the_mutating_tools_are_not_in_the_read_only_set():
 def test_workspace_tools_include_read_write_and_verify():
     names = {t["function"]["name"] for t in tool_schemas.workspace_tools()}
     assert {"read_file", "grep", "apply_patch", "run_command"} <= names
+    # Version control is part of finishing coding work.
+    assert {"git_status", "git_diff", "git_branch", "git_commit"} <= names
 
 
 def test_wrapped_schemas_have_the_shape_the_api_expects():
@@ -162,7 +169,13 @@ def test_the_re_toolset_cannot_edit_and_can_record():
     # The artifact is not ours to change, and editing it would destroy the evidence
     # the findings cite.
     assert "apply_patch" not in names
+    # No history to write either: an RE session produces findings, not commits.
+    assert "git_commit" not in names
+    assert "git_branch" not in names
     assert {"note_finding", "read_notes", "read_file", "grep", "run_command"} <= names
+    # Live hardware is RE-only: probing a part on the bench is not a coding concern,
+    # and coding mode must not suddenly grow a way to talk to /dev.
+    assert {"list_devices", "serial_open", "serial_io", "net_scan"} <= names
 
 
 def test_note_finding_explains_why_evidence_is_required():

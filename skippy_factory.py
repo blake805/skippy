@@ -20,6 +20,7 @@ logger = logging.getLogger("skippy_factory")
 import skippy_llm
 import skippy_fs
 import skippy_tasks
+import skippy_voice
 from skippy_sandbox import SandboxError
 
 # Chroma, Whisper and Kokoro are all loaded on first use rather than at import.
@@ -211,6 +212,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Skippy Coding & RE Agent API", lifespan=lifespan)
 
+# The realtime speech-to-speech lane (/ws/voice). Lives in its own module with
+# its own engines and wire protocol; see skippy_voice's docstring for both.
+app.include_router(skippy_voice.router)
+
 # --- MULTI-CLIENT WEBSOCKET ENDPOINT ---
 @app.websocket("/ws/factory")
 async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
@@ -238,6 +243,65 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
             # launch an agent run with "hello" as the task.
             if data.get("type") == "hello":
                 logger.info("Client '%s' announced itself.", client_id)
+                continue
+
+            # Read-only queries for the app's cockpit. Answered inline — neither
+            # starts work, so neither goes through the runner's task lifecycle.
+            if data.get("action") == "status":
+                payload = runner.status(client_id)
+                payload["type"] = "status"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "memory":
+                # Off-thread: the snapshot stats decision paths on what may be a
+                # slow NAS mount, and this loop is the socket's only reader.
+                payload = await asyncio.to_thread(runner.memory_snapshot)
+                payload["type"] = "memory"
+                await websocket.send_json(payload)
+                continue
+
+            # RE dashboard queries. Read-only, answered inline. re_notes with a
+            # pack_id returns that pack's findings; without one, the pack list.
+            if data.get("action") == "re_notes":
+                payload = await asyncio.to_thread(
+                    runner.re_snapshot, str(data.get("pack_id") or "")
+                )
+                payload["type"] = "re_notes"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "re_devices":
+                payload = await runner.re_devices(str(data.get("host") or "studio"))
+                payload["type"] = "re_devices"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "re_add_finding":
+                payload = await asyncio.to_thread(runner.re_add_finding, data)
+                payload["type"] = "re_finding_saved"
+                await websocket.send_json(payload)
+                continue
+
+            # Repo panel queries and actions. `git` is read-only; `git_commit`
+            # and `git_branch` write, but only on the human's explicit click —
+            # the approval card gates the agent's commits, not these.
+            if data.get("action") == "git":
+                payload = await runner.git_snapshot(str(data.get("repo") or ""))
+                payload["type"] = "git"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "git_commit":
+                payload = await runner.git_commit_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "git_branch":
+                payload = await runner.git_branch_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
                 continue
 
             if data.get("action") == "cancel":
@@ -332,10 +396,18 @@ if __name__ == "__main__":
     import uvicorn
     # ws_max_size raised so base64-encoded photo attachments (e.g. iPhone JPGs)
     # fit in a single websocket message (default is 16MB).
+    #
+    # ws="wsproto" rather than the default websockets backend: the legacy
+    # websockets protocol asserts in _drain_helper when a ping/pong control
+    # frame written by its own read loop races an application data frame,
+    # which is exactly the traffic shape of /ws/voice — a heartbeating client
+    # receiving audio bursts. The first Core2 that connected crashed the
+    # endpoint this way. wsproto serializes writes and has no such race.
     uvicorn.run(
         "skippy_factory:app",
         host=bind_host(),
         port=int(os.environ.get("SKIPPY_PORT", "8000")),
         reload=False,
+        ws="wsproto",
         ws_max_size=100 * 1024 * 1024,
     )

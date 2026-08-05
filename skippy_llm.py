@@ -6,6 +6,7 @@ config change rather than a code change:
     fast        cheap turns, triage, routing
     heavy       the coding brain that drives the agent loop
     compressor  squeezes oversized tool output before it reaches a context window
+    voice       the conversational brain behind /ws/voice
 
 Every endpoint is an OpenAI-compatible ``/v1/chat/completions`` server, so a role
 can point at a local ``mlx_lm.server`` or at a hosted API with no other change.
@@ -34,6 +35,12 @@ logger = logging.getLogger("skippy_llm")
 DEFAULT_FAST_MODEL = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
 DEFAULT_HEAVY_MODEL = "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit"
 DEFAULT_COMPRESSOR_MODEL = DEFAULT_FAST_MODEL
+# The voice role gets a chat-tuned MoE rather than sharing the coder weights:
+# same 3B active parameters (so the same speed class), but tuned for
+# conversation — the coder model answering out loud was stilted and prone to
+# the repetition loop skippy_voice now guards against. Small max_tokens on
+# purpose: a spoken reply longer than this is a lecture.
+DEFAULT_VOICE_MODEL = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
@@ -106,6 +113,10 @@ def _build_registry() -> Dict[str, ModelEndpoint]:
         # neither fast nor compressor keeps a long shared prefix, so the contention
         # is not worth a third 16GB process. Point SKIPPY_COMP_URL at 8082 to split.
         "compressor": build("compressor", "SKIPPY_COMP", 8080, DEFAULT_COMPRESSOR_MODEL, 2048),
+        # 250 tokens is roughly thirty seconds of speech — already the ceiling
+        # of a tolerable spoken answer. At the earlier 600 the model regularly
+        # produced lectures the persona prompt had already forbidden.
+        "voice": build("voice", "SKIPPY_VOICE", 8083, DEFAULT_VOICE_MODEL, 250),
     }
 
 

@@ -8,6 +8,7 @@
 # The workspace tools (read, search, patch) live here alongside the research and
 # context half of the toolset. Terminal execution arrives with the agent runtime.
 
+import skippy_device
 import skippy_re
 
 _SCHEMAS = {
@@ -444,6 +445,324 @@ _SCHEMAS = {
             "required": ["edits"],
         },
     },
+    "git_status": {
+        "description": (
+            "Current branch, ahead/behind counts, and every changed file in a "
+            "workspace repository. Read-only. Call this before committing so you "
+            "know exactly what would be included."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": (
+                        "Which repository, by workspace-root name or any path inside "
+                        "it. Required when there is more than one repo."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    "git_diff": {
+        "description": (
+            "Unified diff of uncommitted changes in a workspace repository. "
+            "Read-only. Untracked files are named but not diffed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Which repository. Required with several repos."},
+                "path": {"type": "string", "description": "Limit the diff to one file or directory."},
+                "staged": {"type": "boolean", "description": "Show what is staged for commit instead of the working tree."},
+            },
+            "required": [],
+        },
+    },
+    "git_branch": {
+        "description": (
+            "Lists branches, creates one, or switches to one. Creating a branch "
+            "changes no files. Switching to an existing branch rewrites the working "
+            "tree, so it is refused while there are uncommitted changes — commit "
+            "first, then switch."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Which repository. Required with several repos."},
+                "name": {"type": "string", "description": "Branch to create or switch to. Omit it to list branches."},
+                "create": {"type": "boolean", "description": "Create `name` at HEAD and switch to it."},
+            },
+            "required": [],
+        },
+    },
+    "git_commit": {
+        "description": (
+            "Stages changes and commits them. The staged diff goes to the human for "
+            "approval first, exactly like a code edit — a deny leaves the tree as it "
+            "was. Commit when a coherent piece of work is done and verified, with a "
+            "message that says why, not just what."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The commit message. One line of why; wrap details after a blank line if needed.",
+                },
+                "repo": {"type": "string", "description": "Which repository. Required with several repos."},
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Files to include. Omit to commit every change in the repo, "
+                        "including new files."
+                    ),
+                },
+            },
+            "required": ["message"],
+        },
+    },
+    "list_devices": {
+        "description": (
+            "Lists serial ports and USB devices attached to a host. Call this before "
+            "opening anything — handles come from what this returns. host='studio' is "
+            "the machine running Skippy; host='macbook' (or any other) reaches a "
+            "connected device-bridge client on that machine."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Where the hardware is plugged in. Defaults to 'studio'.",
+                },
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["serial", "usb"]},
+                    "description": "Subset to list. Defaults to both.",
+                },
+            },
+            "required": [],
+        },
+    },
+    "serial_open": {
+        "description": (
+            "Opens a serial port returned by list_devices and returns a handle for "
+            "serial_io / serial_close. Does not write anything to the device."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "string", "description": "Device path, e.g. /dev/cu.usbserial-10."},
+                "baud": {"type": "integer", "description": "Baud rate. Defaults to 115200."},
+                "host": {"type": "string", "description": "Host that has the port. Defaults to 'studio'."},
+                "timeout": {"type": "number", "description": "Per-read timeout in seconds."},
+                "bytesize": {"type": "integer", "description": "Data bits, usually 8."},
+                "parity": {"type": "string", "description": "N, E, O, M, or S. Defaults to N."},
+                "stopbits": {"type": "number", "description": "1, 1.5, or 2. Defaults to 1."},
+            },
+            "required": ["port"],
+        },
+    },
+    "serial_io": {
+        "description": (
+            "Bounded write and/or read on an open serial handle. A non-empty write "
+            "requires human approval before any bytes leave; pure reads do not. "
+            "Payloads are hex by default (use write_encoding/encoding for base64 or utf8). "
+            "Use read_bytes, read_until_idle, or capture_seconds — not all three."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Handle from serial_open."},
+                "write": {"type": "string", "description": "Bytes to send, encoded per write_encoding."},
+                "write_encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to decode `write`. Defaults to hex.",
+                },
+                "read_bytes": {"type": "integer", "description": "Read exactly this many bytes (capped)."},
+                "read_until_idle": {
+                    "type": "number",
+                    "description": "Keep reading until this many seconds of silence after the last byte.",
+                },
+                "capture_seconds": {
+                    "type": "number",
+                    "description": "Capture everything heard for this many seconds (max 30).",
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to return the response body. Defaults to hex.",
+                },
+            },
+            "required": ["handle"],
+        },
+    },
+    "serial_close": {
+        "description": "Closes a serial handle from serial_open.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Handle from serial_open."},
+            },
+            "required": ["handle"],
+        },
+    },
+    "usb_transfer": {
+        "description": (
+            "Bulk or interrupt USB transfer to a device identified by vid/pid. "
+            "direction='out' requires human approval; direction='in' does not. "
+            "Data is hex by default."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "vid": {"type": "string", "description": "Vendor ID, e.g. '0x1234' or '1234'."},
+                "pid": {"type": "string", "description": "Product ID."},
+                "direction": {
+                    "type": "string",
+                    "enum": ["in", "out"],
+                    "description": "Transfer direction. out requires human approval.",
+                },
+                "endpoint": {"type": "integer", "description": "Endpoint address, e.g. 0x81."},
+                "data": {"type": "string", "description": "OUT payload, encoded per data_encoding."},
+                "data_encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to decode `data`. Defaults to hex.",
+                },
+                "length": {"type": "integer", "description": "IN length to request."},
+                "host": {
+                    "type": "string",
+                    "description": "Where the USB device is attached. Defaults to 'studio'.",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Transfer timeout in milliseconds.",
+                },
+            },
+            "required": ["vid", "pid", "direction"],
+        },
+    },
+    "usb_control": {
+        "description": (
+            "USB control transfer. A host-to-device data stage requires human approval; "
+            "device-to-host reads do not."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "vid": {"type": "string", "description": "Vendor ID."},
+                "pid": {"type": "string", "description": "Product ID."},
+                "request_type": {"type": "integer", "description": "bmRequestType."},
+                "request": {"type": "integer", "description": "bRequest."},
+                "value": {"type": "integer", "description": "wValue."},
+                "index": {"type": "integer", "description": "wIndex."},
+                "data": {"type": "string", "description": "Optional data-stage payload."},
+                "data_encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to decode `data`. Defaults to hex.",
+                },
+                "length": {"type": "integer", "description": "IN data-stage length."},
+                "host": {
+                    "type": "string",
+                    "description": "Where the USB device is attached. Defaults to 'studio'.",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Transfer timeout in milliseconds.",
+                },
+            },
+            "required": ["vid", "pid", "request_type", "request"],
+        },
+    },
+    "net_connect": {
+        "description": (
+            "Opens a TCP or UDP session to an address and returns a handle for net_io. "
+            "Connecting itself is not a write approval; sending bytes later is."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Hostname or IP."},
+                "port": {"type": "integer", "description": "TCP/UDP port number."},
+                "proto": {
+                    "type": "string",
+                    "enum": ["tcp", "udp"],
+                    "description": "Defaults to tcp.",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Which machine initiates the connection. Defaults to 'studio'.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Connect timeout in seconds.",
+                },
+            },
+            "required": ["address", "port"],
+        },
+    },
+    "net_io": {
+        "description": (
+            "Send and/or receive on a net_connect handle. A non-empty write requires "
+            "human approval; pure reads do not. Payloads default to hex."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Handle from net_connect."},
+                "write": {
+                    "type": "string",
+                    "description": "Bytes to send, encoded per write_encoding.",
+                },
+                "write_encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to decode `write`. Defaults to hex.",
+                },
+                "read_bytes": {
+                    "type": "integer",
+                    "description": "How many bytes to try to receive (capped).",
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to return the response body. Defaults to hex.",
+                },
+            },
+            "required": ["handle"],
+        },
+    },
+    "net_scan": {
+        "description": (
+            "TCP connect-scan a short list of ports on an address (max 256). "
+            "Read-only — no approval needed. ports is a comma list like '22,80,8000-8010'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "Hostname or IP to scan."},
+                "ports": {
+                    "type": "string",
+                    "description": "Comma-separated ports and ranges, e.g. '22,80,8000-8010'.",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Which machine runs the scan. Defaults to 'studio'.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Per-port timeout in seconds.",
+                },
+            },
+            "required": ["address"],
+        },
+    },
 }
 
 
@@ -626,6 +945,9 @@ def _wrap(name: str) -> dict:
 FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
+# Version control, coding mode only: an RE session does not change the artifact,
+# so it has no history to write. Commits gate through the code-approval card.
+GIT_TOOLS = ("git_status", "git_diff", "git_branch", "git_commit")
 NOTES_TOOLS = ("note_finding", "read_notes")
 # RE mode only, and not because coding mode would be harmed by them: they read the
 # session's target artifact, and a coding session has a repository rather than a target.
@@ -640,6 +962,8 @@ MEMORY_TOOLS = ("record_decision", "recall_project")
 # which RE mode cannot do — offering this there would let a session close an item it
 # has no way to have fixed.
 WORK_ITEM_TOOLS = ("resolve_work_item",)
+# Live hardware — RE only. See skippy_device / ADR 0015.
+DEVICE_TOOLS = skippy_device.DEVICE_TOOLS
 
 
 def filesystem_tools() -> list:
@@ -651,18 +975,19 @@ def workspace_tools() -> list:
     """Read, write and verify. What an agent needs to actually finish a coding task."""
     return [
         _wrap(name)
-        for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS + MEMORY_TOOLS
-        + WORK_ITEM_TOOLS
+        for name in FILESYSTEM_TOOLS + WRITE_TOOLS + EXEC_TOOLS + GIT_TOOLS
+        + MEMORY_TOOLS + WORK_ITEM_TOOLS
     ]
 
 
 def re_tools() -> list:
-    """Read, inspect and record. No apply_patch: an RE session does not change the
-    artifact, and the notes are the deliverable rather than a diff."""
+    """Read, inspect, probe live devices, and record. No apply_patch: an RE session
+    does not change the artifact, and the notes are the deliverable rather than a
+    diff. Device writes are separately gated by human approval."""
     return [
         _wrap(name)
         for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + DISASSEMBLY_TOOLS
-        + EXTRACTION_TOOLS + MEMORY_TOOLS
+        + EXTRACTION_TOOLS + MEMORY_TOOLS + DEVICE_TOOLS
     ]
 
 
