@@ -128,8 +128,8 @@ def test_endpointer_yields_one_utterance_with_preroll():
         events.extend(ep.feed(quiet_frame()))
 
     kinds = [kind for kind, _ in events]
-    assert kinds == ["speech_start", "utterance"]
-    pcm = events[1][1]
+    assert kinds == ["speech_start", "speech_confirmed", "utterance"]
+    pcm = events[-1][1]
     # Pre-roll: the utterance carries frames from before the VAD tripped.
     assert len(pcm) > 10 * FRAME_BYTES
 
@@ -143,13 +143,31 @@ def test_endpointer_discards_a_burst_too_short_to_be_speech():
     assert [kind for kind, _ in events] == ["speech_start"]
 
 
+def test_endpointer_confirms_sustained_speech_exactly_once():
+    ep = Endpointer(EnergyVAD(), silence_ms=200, min_speech_ms=100, barge_confirm_ms=150)
+    events = []
+    for _ in range(10):
+        events.extend(ep.feed(loud_frame()))
+    kinds = [kind for kind, _ in events]
+    assert kinds[0] == "speech_start"
+    assert kinds.count("speech_confirmed") == 1
+
+
+def test_a_transient_too_short_to_confirm_never_confirms():
+    ep = Endpointer(EnergyVAD(), silence_ms=200, min_speech_ms=100, barge_confirm_ms=150)
+    events = list(ep.feed(loud_frame()))  # one 32ms frame: a click, a pop
+    for _ in range(12):
+        events.extend(ep.feed(quiet_frame()))
+    assert [kind for kind, _ in events] == ["speech_start"]
+
+
 def test_endpointer_reframes_arbitrary_chunk_sizes():
     ep = make_endpointer()
     blob = loud_frame() * 10 + quiet_frame() * 12
     events = []
     for i in range(0, len(blob), 700):  # deliberately not frame-aligned
         events.extend(ep.feed(blob[i:i + 700]))
-    assert [kind for kind, _ in events] == ["speech_start", "utterance"]
+    assert [kind for kind, _ in events] == ["speech_start", "speech_confirmed", "utterance"]
 
 
 def test_energy_vad_noise_floor_does_not_learn_from_speech():
@@ -520,6 +538,54 @@ def test_the_turn_flag_covers_stt_and_clears_after(monkeypatch):
     asyncio.run(session._on_utterance(b"\x00" * FRAME_BYTES))
     assert seen["active_during_stt"] is True
     assert session._turn_active is False
+
+
+def test_a_short_blip_does_not_barge_in_but_sustained_speech_does(monkeypatch):
+    """The speaker-echo bug: on built-in speakers the mic hears Skippy's own
+    voice, and cancelling on the first VAD frame cut every reply off with
+    nobody talking. A reply in flight now survives transients; only speech
+    that persists past the confirm window interrupts it."""
+    session, _, _, sent = make_session(monkeypatch)
+    cancelled = []
+
+    async def fake_cancel():
+        cancelled.append(True)
+
+    session._cancel_response = fake_cancel
+    monkeypatch.setattr(VoiceSession, "_responding", lambda self: True)
+
+    async def flow():
+        await session.handle_audio(loud_frame())  # one frame: echo, a pop
+        assert cancelled == [], "one 32ms frame must not cancel the reply"
+        for _ in range(12):  # past the 250ms confirm window: a real barge-in
+            await session.handle_audio(loud_frame())
+        assert cancelled, "sustained speech must interrupt the reply"
+
+    asyncio.run(flow())
+    # The partial marker goes out with the barge-in, not before.
+    assert {"type": "partial", "text": ""} in sent["json"]
+
+
+def test_half_duplex_hardware_never_barges_in(monkeypatch):
+    """A Core2 cannot hear the user while it plays audio; what its mic picks
+    up mid-reply is the room. The endpointer is reset instead of cancelled."""
+    session, _, _, sent = make_session(monkeypatch)
+    session.duplex = False
+    cancelled = []
+
+    async def fake_cancel():
+        cancelled.append(True)
+
+    session._cancel_response = fake_cancel
+    monkeypatch.setattr(VoiceSession, "_responding", lambda self: True)
+
+    async def flow():
+        for _ in range(20):
+            await session.handle_audio(loud_frame())
+
+    asyncio.run(flow())
+    assert cancelled == []
+    assert sent["json"] == []
 
 
 def test_memory_search_admits_when_it_finds_nothing(monkeypatch):

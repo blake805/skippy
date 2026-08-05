@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import CoreAudio
 import os.log
 
 /// Capture-path telemetry, readable with:
@@ -24,7 +25,18 @@ final class VoiceClient: ObservableObject {
     private let player = AVAudioPlayerNode()
     private var outRate: Double = 24_000
     private var converter: AVAudioConverter?
+    /// The player's connection format: mono float at the input hardware rate.
+    /// Server audio is resampled into this before scheduling.
+    private var playerFormat: AVAudioFormat?
     private var started = false
+    /// True when playback can leak into the mic (anything but Bluetooth
+    /// headphones). While Skippy speaks, the mic is muted rather than
+    /// cancelled: Apple's voice-processing unit delivers pure silence on this
+    /// machine (its aggregate device chokes on virtual audio devices like
+    /// Background Music), so echo is kept out of the wire by not sending
+    /// during playback. On AirPods the earbuds cancel echo themselves and
+    /// voice barge-in stays fully live.
+    private var echoGate = true
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -71,12 +83,10 @@ final class VoiceClient: ObservableObject {
         if !started { startAudio() }
     }
 
-    private var tapCount = 0
     private var sentBytes = 0
 
     private func startAudio() {
         let session = AVCaptureDevice.authorizationStatus(for: .audio)
-        voiceLog.info("startAudio: auth=\(session.rawValue, privacy: .public) started=\(self.started, privacy: .public)")
         if session == .notDetermined {
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] ok in
                 if ok { Task { @MainActor in self?.startAudio() } }
@@ -89,44 +99,95 @@ final class VoiceClient: ObservableObject {
         }
 
         do {
-            let input = engine.inputNode
-            let format = input.outputFormat(forBus: 0)
-            voiceLog.info("startAudio: input format rate=\(format.sampleRate, privacy: .public) ch=\(format.channelCount, privacy: .public)")
-            let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
-                                      channels: 1, interleaved: true)!
-            converter = AVAudioConverter(from: format, to: target)
-            if converter == nil {
-                voiceLog.error("startAudio: AVAudioConverter is nil — capture cannot run")
-            }
-
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-                guard let self else { return }
-                Task { @MainActor in
-                    self.tapCount += 1
-                    if self.tapCount % 200 == 1 {
-                        voiceLog.info("tap fired: count=\(self.tapCount, privacy: .public) sentBytes=\(self.sentBytes, privacy: .public) connected=\(self.connected, privacy: .public)")
-                    }
-                    if self.pushToTalk && !self.transmitting { return }
-                    self.sendMic(buffer)
-                }
-            }
-
-            if player.engine == nil {
-                engine.attach(player)
-                let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: outRate,
-                                              channels: 1, interleaved: false)!
-                engine.connect(player, to: engine.mainMixerNode, format: outFormat)
-            }
-            try engine.start()
-            player.play()
-            started = true
-            state = "listening"
-            voiceLog.info("startAudio: engine running")
+            try startEngine()
         } catch {
             voiceLog.error("startAudio: engine failed: \(error.localizedDescription, privacy: .public)")
             state = "audio error: \(error.localizedDescription)"
         }
+    }
+
+    private enum AudioSetupError: Error, LocalizedError {
+        case deadInputFormat
+        var errorDescription: String? { "the input device reports no usable format" }
+    }
+
+    /// Build and start the raw capture/playback graph.
+    ///
+    /// Deliberately NOT Apple's voice-processing unit: on this Mac it starts
+    /// but captures pure digital silence (peakRms=0 across a full session) —
+    /// its aggregate device does not survive virtual audio devices such as
+    /// Background Music. Echo is handled by the gate in the tap instead.
+    private func startEngine() throws {
+        engine.stop()
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        if input.isVoiceProcessingEnabled {
+            try? input.setVoiceProcessingEnabled(false)
+        }
+        echoGate = !Self.outputIsBluetooth()
+
+        let format = input.outputFormat(forBus: 0)
+        voiceLog.info("startEngine: input rate=\(format.sampleRate, privacy: .public) ch=\(format.channelCount, privacy: .public) echoGate=\(self.echoGate, privacy: .public)")
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw AudioSetupError.deadInputFormat
+        }
+        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+                                  channels: 1, interleaved: true)!
+        converter = AVAudioConverter(from: format, to: target)
+        if converter == nil {
+            voiceLog.error("startEngine: AVAudioConverter is nil — capture cannot run")
+        }
+
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.pushToTalk && !self.transmitting { return }
+                // The echo gate: on speakers, what the mic hears while Skippy
+                // talks is mostly Skippy. Nothing is sent, so nothing can trip
+                // the hub's barge-in. Interrupt by button, or by voice on
+                // Bluetooth headphones where the earbuds cancel echo.
+                if self.echoGate && self.state == "speaking" { return }
+                self.sendMic(buffer)
+            }
+        }
+
+        let playback = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate,
+                                     channels: 1, interleaved: false)!
+        playerFormat = playback
+        if player.engine == nil { engine.attach(player) }
+        engine.connect(player, to: engine.mainMixerNode, format: playback)
+        engine.prepare()
+        try engine.start()
+        player.play()
+        started = true
+        state = "listening"
+        voiceLog.info("startEngine: running")
+    }
+
+    /// True when the default output is a Bluetooth device (AirPods and kin),
+    /// which cancel echo in their own hardware. Everything else — built-in
+    /// speakers, and virtual devices like Background Music that may feed them
+    /// — gets the gate.
+    private static func outputIsBluetooth() -> Bool {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        ) == noErr, deviceID != 0 else { return false }
+
+        var transport = UInt32(0)
+        size = UInt32(MemoryLayout<UInt32>.size)
+        address.mSelector = kAudioDevicePropertyTransportType
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
+            return false
+        }
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
     }
 
     private func stopAudio() {
@@ -161,7 +222,9 @@ final class VoiceClient: ObservableObject {
             return
         }
         guard let channel = out.int16ChannelData?[0] else { return }
-        let data = Data(bytes: channel, count: Int(out.frameLength) * 2)
+        let frames = Int(out.frameLength)
+        guard frames > 0 else { return }
+        let data = Data(bytes: channel, count: frames * 2)
         sentBytes += data.count
         socket.sendBinary(data)
     }
@@ -179,6 +242,9 @@ final class VoiceClient: ObservableObject {
             if reply.isEmpty { reply = text } else { reply += " " + text }
         case "audio_start":
             if let rate = msg["rate"] as? Int { outRate = Double(rate) }
+            // The route can change mid-session (AirPods in, AirPods out);
+            // re-decide the echo gate at every playback start.
+            echoGate = !Self.outputIsBluetooth()
             reply = ""
         case "audio_end":
             break
@@ -201,6 +267,8 @@ final class VoiceClient: ObservableObject {
 
     private func play(_ data: Data) {
         guard !data.isEmpty else { return }
+        if !started { startAudio() }
+        guard let playback = playerFormat else { return }
         let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: outRate,
                                    channels: 1, interleaved: true)!
         let frames = UInt32(data.count / 2)
@@ -212,14 +280,13 @@ final class VoiceClient: ObservableObject {
                 dst.update(from: src, count: Int(frames))
             }
         }
-        // Convert to float for the player node graph.
-        let floatFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: outRate,
-                                        channels: 1, interleaved: false)!
-        guard let floatBuf = AVAudioPCMBuffer(pcmFormat: floatFormat, frameCapacity: frames),
-              let converter = AVAudioConverter(from: format, to: floatFormat) else {
+        // Convert to the player's format: float, and the voice unit's sample
+        // rate rather than the server's, so the capacity scales by the ratio.
+        let capacity = AVAudioFrameCount(Double(frames) * playback.sampleRate / outRate) + 32
+        guard let floatBuf = AVAudioPCMBuffer(pcmFormat: playback, frameCapacity: capacity),
+              let converter = AVAudioConverter(from: format, to: playback) else {
             return
         }
-        floatBuf.frameLength = frames
         var error: NSError?
         var consumed = false
         converter.convert(to: floatBuf, error: &error) { _, status in
@@ -228,7 +295,7 @@ final class VoiceClient: ObservableObject {
             status.pointee = .haveData
             return buffer
         }
-        if !started { startAudio() }
+        guard error == nil, floatBuf.frameLength > 0 else { return }
         player.scheduleBuffer(floatBuf, completionHandler: nil)
         if !player.isPlaying { player.play() }
     }

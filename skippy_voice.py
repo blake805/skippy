@@ -57,6 +57,9 @@ the same rule skippy_factory follows, for the same CI reason.
   SKIPPY_VOICE_VAD          "auto" | "silero" | "energy" (default "auto")
   SKIPPY_VOICE_SILENCE_MS   trailing silence that ends an utterance (400)
   SKIPPY_VOICE_MIN_SPEECH_MS  shorter bursts are discarded as noise (250)
+  SKIPPY_VOICE_BARGE_MS     speech must persist this long to interrupt a reply
+                            in flight (250) — one VAD frame is as often the
+                            speaker leaking into the mic as it is the user
   SKIPPY_VOICE_OUT_RATE     output sample rate (default 16000; a full-duplex
                             desktop client may prefer 24000)
 """
@@ -328,16 +331,25 @@ class Endpointer:
     """Frames in, utterances out.
 
     Buffers incoming PCM into fixed VAD windows, tracks a speaking/idle state,
-    and yields events: ("speech_start", b"") the frame speech begins, and
-    ("utterance", pcm) once trailing silence closes it. Utterances shorter than
-    the minimum are dropped without an event — a cough is not a question.
+    and yields events: ("speech_start", b"") the frame speech begins,
+    ("speech_confirmed", b"") once the speech has persisted long enough to be
+    a person rather than a transient, and ("utterance", pcm) once trailing
+    silence closes it. Utterances shorter than the minimum are dropped without
+    an event — a cough is not a question.
     """
 
-    def __init__(self, vad, silence_ms: Optional[int] = None, min_speech_ms: Optional[int] = None):
+    def __init__(
+        self,
+        vad,
+        silence_ms: Optional[int] = None,
+        min_speech_ms: Optional[int] = None,
+        barge_confirm_ms: Optional[int] = None,
+    ):
         self.vad = vad
         frame_ms = 1000 * FRAME_SAMPLES / IN_RATE
         self._silence_frames = max(1, int((silence_ms or _env_int("SKIPPY_VOICE_SILENCE_MS", 400)) / frame_ms))
         self._min_speech_frames = max(1, int((min_speech_ms or _env_int("SKIPPY_VOICE_MIN_SPEECH_MS", 250)) / frame_ms))
+        self._confirm_frames = max(1, int((barge_confirm_ms or _env_int("SKIPPY_VOICE_BARGE_MS", 250)) / frame_ms))
         self._pending = b""
         self._preroll: deque = deque(maxlen=PREROLL_FRAMES)
         self._utterance: List[bytes] = []
@@ -370,6 +382,8 @@ class Endpointer:
         if speech:
             self._speech_frames += 1
             self._silent_run = 0
+            if self._speech_frames == self._confirm_frames:
+                return [("speech_confirmed", b"")]
             return []
 
         self._silent_run += 1
@@ -938,9 +952,17 @@ class VoiceSession:
                         # Half-duplex hardware cannot be hearing the user while
                         # it plays audio; this is the room talking, not them.
                         self.endpointer.reset(keep_vad_state=True)
-                        continue
-                    await self._cancel_response()  # barge-in
+                    # Full duplex: not a barge-in yet. On built-in speakers a
+                    # single VAD frame is as often Skippy's own voice leaking
+                    # into the mic as it is the user; cancelling here cut
+                    # replies off mid-sentence with nobody talking. Barge-in
+                    # waits for speech_confirmed.
+                    continue
                 await self._send_json({"type": "partial", "text": ""})
+            elif event == "speech_confirmed":
+                if self._responding() and self.duplex:
+                    await self._cancel_response()  # barge-in
+                    await self._send_json({"type": "partial", "text": ""})
             elif event == "utterance":
                 await self._on_utterance(payload)
 
