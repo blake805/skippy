@@ -1,20 +1,148 @@
-# Skippy — Local Coding & Reverse-Engineering Agent
+# Skippy
 
-Skippy is a fully-local coding agent running on a Mac Studio (M3 Ultra, 512GB unified
-memory). The goal is Cursor-class capability — multi-file features in real repositories,
-project memory that survives across sessions, work spanning several repos at once, and a
-reverse-engineering mode — with no cloud LLM in the runtime path.
+Skippy is a fully-local AI workbench: a coding and reverse-engineering agent that
+runs on a Mac Studio (M3 Ultra, 512GB unified memory) with no cloud LLM in the
+runtime path, plus the apps and hardware that put it everywhere work happens —
+a native Mac client, an iPhone client, a Cursor/VS Code extension, a wireless
+voice puck, and a battery-powered bench probe that gives the agent physical
+hands on real hardware over Wi-Fi or Bluetooth.
 
-> **Status: mid-refactor.** The shop assembly line that used to live here is archived at
-> tag `shop-v1` and has been removed from `main`. The agent runtime that replaces it is
-> not installed yet, so the websocket endpoint currently accepts connections and replies
-> that the runtime is missing. See [ADR 0006](docs/adr/0006-single-runtime-coding-agent.md)
-> for why the archive happened first.
+## The system at a glance
+
+```
+                        ┌────────────────────────────────────────┐
+                        │  Mac Studio — the hub                  │
+   SkippyMac (macOS) ──▶│  skippy_factory.py :8000               │
+   SkippyPhone (iOS) ──▶│   /ws/factory  chat·code·RE·git·files  │
+   SkippyClient      ──▶│   /ws/voice    full-duplex speech      │
+   Cursor extension ───▶│                                        │
+                        │  mlx_lm.server :8080/:8081             │
+   core2-voice ── WiFi ─▶│   fast 30B · heavy 480B (Qwen3-Coder) │
+                        │                                        │
+   core2-devio ─ WiFi ──▶│  project memory · note packs · NAS    │
+       └──── BLE ──▶ bridge (MacBook) ──▶ hub                    │
+                        └────────────────────────────────────────┘
+```
+
+One hub, one protocol, many seats. Everything speaks JSON over two WebSocket
+lanes on port 8000: `/ws/factory` for chat, agent runs, git, files and device
+I/O, and `/ws/voice` for speech. Clients are interchangeable — a run started
+from the phone streams its timeline to the Mac app, and an approval card
+appears wherever the run was started.
+
+## What Skippy does
+
+### Coding agent
+
+Multi-file features in real repositories, driven by a local 480B-parameter
+model. The loop thinks, calls tools, observes, and repeats until it decides it
+is finished — and only `finished` counts as success. It reads with sandboxed
+`list_dir`/`read_file`/`grep`/`glob_files`, writes through one atomic
+`apply_patch`, and checks its own work with `run_command` (allowlisted,
+shell-free — test runners, linters, type checkers, builds). Details below under
+[Architecture](#architecture).
+
+### Reverse-engineering mode
+
+A separate tool table for taking unknown binaries and devices apart without
+being able to run or modify them: evidence-bearing findings in per-target note
+packs, function-at-a-time disassembly and decompilation (rizin + the Ghidra
+decompiler, no JVM), firmware carving with unblob inside a hardened container,
+and an inspection-only command allowlist. Weakness findings carry severity and
+flow into project memory as work items, so the next *coding* session opens
+knowing what needs fixing.
+
+### Device I/O — real hardware on the bench
+
+RE mode can touch physical hardware through device bridges, addressed by
+`host=`:
+
+- **`host="studio"`** — serial/USB hardware plugged into the Mac Studio.
+- **`host="macbook"`** — the SkippyMac app registers as a bridge ("Share
+  devices" in Settings), sharing whatever is plugged into the laptop.
+- **`host="bench"`** — the Core2 bench node (below): UART, I2C, GPIO and ADC
+  over the air.
+
+Reads happen straight away. **Any write — serial bytes, an I2C write, driving a
+pin — stops for an approval card** on the machine that started the run, with a
+sequence number and an "Approve all writes" escape hatch for repetitive jobs.
+
+### The wireless bench node
+
+`firmware/core2-devio` turns an M5Stack Core2 into a carry-along probe: clip it
+to a target and the agent can enumerate ports, talk UART, scan and read I2C,
+drive pins and sample analog inputs. It is deliberately a dumb executor — every
+decision, and every approval, stays on the hub.
+
+One protocol, two transports. On the shop network the node holds its own
+WebSocket to the hub over Wi-Fi. Away from any network it is a BLE peripheral,
+relayed to the hub by either `skippy_ble_bridge.py` (Python, bleak) or
+SkippyMac's built-in CoreBluetooth bridge — so a MacBook is the only other
+thing you need in the room. BLE wins when both links are possible, and the hub
+only ever sees one node.
+
+The node has a high-contrast touchscreen UI (scrollable action log, pause both
+radios with a fingertip before putting your hands in the circuit), a light bar
+that carries link state across the room, and a chirp on every write. It reports
+battery, signal and uptime every 15 seconds; the app's RE dashboard lists every
+node the hub has heard from — online or not — as a pickable "BENCH NODES"
+group. See `firmware/core2-devio/README.md` and ADRs 0020/0021.
+
+### Voice
+
+Full-duplex speech through `skippy_voice.py`: Whisper transcription in,
+Kokoro synthesis out, server-side VAD, and barge-in. Seats include the Mac app
+(spacebar push-to-talk), the phone (hold-to-talk or full duplex), and
+`firmware/core2-voice` — a wireless mic/speaker puck that streams raw PCM, so
+model changes never require a reflash. Voice sessions end by writing a summary
+into project memory.
+
+### Git and GitHub
+
+The hub owns the git surface, and both the agent and the app use it:
+
+- **Repo panel (SkippyMac)** — per-repo status, branches, diffs, commit, pull,
+  push, create a new repo, clone one of yours, and a read-only file explorer
+  (folder tree plus viewer that refuses binaries).
+- **New repo** creates both the local repository in a workspace root and the
+  GitHub repository, wired together as `origin`.
+- **Auth** is a GitHub personal access token pasted once into the app's
+  Settings; the hub stores it (`~/.skippy/github_token`, mode 0600) and feeds
+  git over HTTPS through a `GIT_ASKPASS` helper, so the token never lands in a
+  remote URL or the repo config.
+- **The agent** has `git_commit`, `git_branch`, `git_push` and `git_pull`
+  tools; anything that touches a remote stops for approval first.
+
+### Project memory across sessions
+
+A run's record is written automatically when it ends, and the next run on the
+same workspace roots opens with the relevant history already in context —
+conventions, decisions, open weaknesses, and recent sessions including failed
+ones. Stale entries say so: every entry records the commit and paths it
+concerns, and a path that no longer exists gets marked, because a misinformed
+session is worse off than a blind one. Recall is deterministic keyword scoring,
+no embedding backend required. See [ADR 0013](docs/adr/0013-project-memory.md).
+
+## The apps
+
+| App | Platform | What it is |
+| --- | --- | --- |
+| `apps/SkippyMac` | macOS | The main seat: chat / code / RE modes with the full agent timeline, approval cards, the RE dashboard (studio, MacBook and bench devices, memory maps, hex diffs, findings), the Repo panel with GitHub and the file explorer, a built-in BLE bridge for the bench node, voice with push-to-talk, and a device bridge for hardware plugged into the Mac. Dark theme throughout. |
+| `apps/SkippyPhone` | iOS | The same Work / Voice / Settings pages speaking the same protocol. Full agent timeline and approval sheets; full-duplex or hold-to-talk voice using the hardware echo canceller. No device bridge — a phone has no ports to share. |
+| `apps/SkippyServer` | macOS | Menu-bar app that boots the model servers and the backend on the Studio, and shows the voice token. |
+| `apps/SkippyClient` | macOS/iOS | The original lightweight chat client. |
+| `apps/PhotoFrame` | macOS/tablet | An off-mission companion: a rotating photo frame with captions and music for the living room. |
+| `cursor_client/` | VS Code/Cursor | Sideloaded extension: Skippy's multi-file edits land in the editor as one undo step, and every patch comes back with the diagnostics it caused. |
+
+Away from the shop LAN, the apps reach the hub over Tailscale rather than port
+forwarding — see [docs/cloud-access.md](docs/cloud-access.md).
 
 ## Architecture
 
-Models are addressed by **role**, never by size or port. `skippy_llm.py` owns the
-mapping, so changing weights is configuration rather than a code change:
+### Models, addressed by role
+
+Models are addressed by **role**, never by size or port. `skippy_llm.py` owns
+the mapping, so changing weights is configuration rather than a code change:
 
 | Role | Port | Model | Used for |
 | --- | --- | --- | --- |
@@ -22,15 +150,14 @@ mapping, so changing weights is configuration rather than a code change:
 | `heavy` | 8081 | Qwen3-Coder-480B-A35B-Instruct-4bit | The agent loop: multi-file edits, RE analysis |
 | `compressor` | 8080 | Qwen3-Coder-30B-A3B-Instruct-4bit | Squeezing oversized tool output |
 
-Two server processes, not three — `compressor` shares `fast`'s. Override any role with
-`SKIPPY_<ROLE>_URL`, `SKIPPY_<ROLE>_MODEL`, and `SKIPPY_<ROLE>_MAX_TOKENS`. `GET /health`
-reports what each role actually resolved to. See
-[ADR 0007](docs/adr/0007-model-roles-and-cloud-escalation.md) for the benchmark behind
-these choices.
+Two server processes, not three — `compressor` shares `fast`'s. Override any
+role with `SKIPPY_<ROLE>_URL`, `SKIPPY_<ROLE>_MODEL`, and
+`SKIPPY_<ROLE>_MAX_TOKENS`. `GET /health` reports what each role actually
+resolved to. See [ADR 0007](docs/adr/0007-model-roles-and-cloud-escalation.md)
+for the benchmark behind these choices.
 
-Serve them with `HF_HUB_OFFLINE=1` set. Without it `mlx_lm.server` calls the Hugging Face
-API to check each model's revision, which both reaches the network at runtime and takes
-the server down with a 401 when the call fails:
+Serve them with `HF_HUB_OFFLINE=1` set — without it `mlx_lm.server` phones the
+Hugging Face API at runtime and dies with a 401 when the call fails:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
@@ -39,38 +166,29 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 
 The `SkippyServer` menu-bar app boots the models plus the backend for you.
 
-### Cloud escalation
+**Cloud escalation is opt-in and never silent.** A role may point at any
+OpenAI-compatible hosted endpoint, but without `SKIPPY_ALLOW_CLOUD=1` resolving
+an off-machine role raises `CloudNotAllowed`. `is_local` is computed from the
+URL, and only loopback counts — a LAN or tailnet address is treated as
+off-machine on purpose.
 
-Local by default. A role may point at any OpenAI-compatible hosted endpoint, but
-reaching off-machine is opt-in and never silent:
+### The path sandbox
 
-```bash
-export SKIPPY_ALLOW_CLOUD=1
-export SKIPPY_HEAVY_URL="https://api.example.com/v1/chat/completions"
-export SKIPPY_HEAVY_API_KEY="..."
-```
-
-Without `SKIPPY_ALLOW_CLOUD=1`, resolving an off-machine role raises `CloudNotAllowed`.
-`is_local` is computed from the URL rather than declared, and only loopback counts — a
-LAN or tailnet address is treated as off-machine on purpose.
-
-### Which repositories Skippy can touch
-
-`SKIPPY_WORKSPACE_ROOTS` is an `os.pathsep`-separated list of directories, and it
-is the only thing that grants filesystem access:
+`SKIPPY_WORKSPACE_ROOTS` is an `os.pathsep`-separated list of directories, and
+it is the only thing that grants filesystem access:
 
 ```bash
 export SKIPPY_WORKSPACE_ROOTS="$HOME/skippy-workspaces/skippy:$HOME/skippy-workspaces/symatix"
 ```
 
-It defaults to **empty**, so an unconfigured agent can reach nothing. Every path a
-tool touches is resolved — symlinks followed, `..` collapsed — and then required to
-land inside a root, so `../../.ssh/id_ed25519` is a hard error rather than a
-prompt. `GET /health` reports the roots actually in effect.
+It defaults to **empty**, so an unconfigured agent can reach nothing. Every
+path a tool touches is resolved — symlinks followed, `..` collapsed — and then
+required to land inside a root, so `../../.ssh/id_ed25519` is a hard error
+rather than a prompt. `GET /health` reports the roots actually in effect.
 [ADR 0008](docs/adr/0008-path-sandbox.md) covers the boundary and, importantly,
 what it does not defend against.
 
-### Running a task
+### The agent loop
 
 ```python
 import asyncio, skippy_agent, skippy_fs, skippy_paths
@@ -84,9 +202,10 @@ print(outcome.status, outcome.files_changed)
 ```
 
 The loop stops for one of four reasons and says which: `finished`, `max_steps`,
-`stopped_without_finish`, or `cancelled`. **Only `finished` is success** — a run that
-exhausted its step budget may have changed real files, but the model never decided
-it was done, and reporting that as success would hide a stalled run.
+`stopped_without_finish`, or `cancelled`. **Only `finished` is success** — a
+run that exhausted its step budget may have changed real files, but the model
+never decided it was done, and reporting that as success would hide a stalled
+run.
 
 Tool calls travel as native OpenAI `tool_calls`, so every call gets exactly one
 `tool` message in reply and the transcript only ever grows.
@@ -95,123 +214,62 @@ including what it does when the model gets stuck.
 
 ### How edits are applied
 
-`apply_patch` is the only way anything gets written, and it is all-or-nothing: a
-list of edits spanning any number of files is validated against staged content
-first, and if any one edit is bad, nothing is written and every problem is reported
-together. A rename touching five files is one call, not five, so a half-applied
-refactor is not a state the repo can reach.
+`apply_patch` is the only way anything gets written, and it is all-or-nothing:
+a list of edits spanning any number of files is validated against staged
+content first, and if any one edit is bad, nothing is written and every problem
+is reported together. A rename touching five files is one call, not five, so a
+half-applied refactor is not a state the repo can reach.
 
-Edits are byte-for-byte search/replace rather than line numbers, which go stale as
-soon as an earlier edit shifts them. An ambiguous search is rejected instead of
-guessed at. `dry_run` returns the diff without writing.
-
-Files that are not valid UTF-8, look binary, or exceed 8MB are refused rather than
-rewritten, and CRLF line endings are preserved. Pre-images go to
-`patch_journal_root()` with a manifest that documents how to restore them.
-[ADR 0009](docs/adr/0009-atomic-multi-file-patching.md) has the details, including
-the three data-destroying bugs this replaced.
+Edits are byte-for-byte search/replace rather than line numbers, which go stale
+as soon as an earlier edit shifts them. An ambiguous search is rejected instead
+of guessed at. `dry_run` returns the diff without writing. Files that are not
+valid UTF-8, look binary, or exceed 8MB are refused rather than rewritten, and
+CRLF line endings are preserved. Pre-images go to `patch_journal_root()` with a
+manifest that documents how to restore them.
+[ADR 0009](docs/adr/0009-atomic-multi-file-patching.md) has the details,
+including the three data-destroying bugs this replaced.
 
 ### How it checks its own work
 
 `run_command` runs a single test runner, linter, type checker, build tool or
-read-only git command, without a shell. This is what makes the difference between code
-that looks right and code that has been run: in the live run for
-[ADR 0011](docs/adr/0011-command-execution.md) the model wrote a test file with a
-missing import, ran the suite, read its own failure, fixed the cause and re-ran to
-green. Before this existed, that broken file would have shipped with a confident
-summary.
+read-only git command, without a shell. This is what makes the difference
+between code that looks right and code that has been run: in the live run for
+[ADR 0011](docs/adr/0011-command-execution.md) the model wrote a test file with
+a missing import, ran the suite, read its own failure, fixed the cause and
+re-ran to green.
 
-Be clear about what the allowlist does. `pytest` executes `conftest.py`, and the agent
-can write `conftest.py`, so **"may run pytest" and "may execute arbitrary code" are the
-same permission.** The allowlist is accident prevention — no `rm -rf`, no
-`git push --force`, no `curl | sh` — not containment, and there is deliberately no
-approval-gated shell tool, because asking permission for the loud path while the quiet
-one is open is theatre. Real containment means running the whole thing in a VM.
+Be clear about what the allowlist does. `pytest` executes `conftest.py`, and
+the agent can write `conftest.py`, so **"may run pytest" and "may execute
+arbitrary code" are the same permission.** The allowlist is accident prevention
+— no `rm -rf`, no `git push --force`, no `curl | sh` — not containment, and
+there is deliberately no approval-gated shell tool, because asking permission
+for the loud path while the quiet one is open is theatre. Real containment
+means running the whole thing in a VM.
 
-What is guaranteed: no shell interpretation, a bounded timeout that kills the entire
-process tree, bounded output that keeps the head and the tail, no stdin, and an
-allowlisted environment so a repo's test suite is never handed your API keys. Extend
-the program list per machine with `SKIPPY_EXTRA_COMMANDS`; installers and anything that
-fetches are excluded by default.
+What is guaranteed: no shell interpretation, a bounded timeout that kills the
+entire process tree, bounded output that keeps the head and the tail, no stdin,
+and an allowlisted environment so a repo's test suite is never handed your API
+keys. Extend the program list per machine with `SKIPPY_EXTRA_COMMANDS`;
+installers and anything that fetches are excluded by default.
 
 ### Cursor integration
 
-Sideload `cursor_client/` and Skippy's edits land in the editor instead of behind its
-back. Two things change:
+Sideload `cursor_client/` and Skippy's edits land in the editor instead of
+behind its back. A multi-file change is one undo step (a single
+`vscode.WorkspaceEdit`), and every patch comes back with the diagnostics your
+language servers produce for the files it touched — *waited for* rather than
+sampled, because reading them the instant an edit lands returns the state from
+before it.
 
-- **A multi-file change is one undo step.** Edits go through a single
-  `vscode.WorkspaceEdit`, so ⌘Z reverses the whole thing. Files no longer appear to
-  mutate on disk with no undo history.
-- **Every patch reports what it broke.** A successful edit comes back with the
-  diagnostics your language servers produce for the files it touched, in the same
-  observation — not as a separate call the model has to remember to make. Diagnostics
-  are *waited for* rather than sampled: reading them the instant an edit lands returns
-  the state from before it, which would tell the agent a new error is a clean bill of
-  health.
+There is one `apply_patch`, and it routes to the editor when one is attached
+and writes to disk when not; nothing in the tool schema mentions Cursor. Both
+sides implement the same search-and-replace semantics and run the same 27-case
+parity table in `tests/fixtures/patch_parity.json`. Deliberately absent: any
+way for the editor to run a command — that would be a second execution path
+with none of the policy in `skippy_exec.py`. See
+[ADR 0014](docs/adr/0014-cursor-integration.md).
 
-There is one `apply_patch`, and it routes to the editor when one is attached and writes
-to disk when not. Nothing in the tool schema mentions Cursor, because a model asked to
-choose on the basis of state it cannot see will choose wrong.
-
-The editor never decides what an edit *means*. The server validates, resolves paths
-against the sandbox, and stages the final text of each file; the extension is handed
-that text and puts it there. Both sides still implement search-and-replace — the editor
-has to plan against unsaved buffers — so both run the same 27-case table in
-`tests/fixtures/patch_parity.json`. If they disagreed, Skippy would give different
-answers depending on whether your editor happened to be open.
-
-Deliberately absent: any way for the editor to run a command. That would be a second
-execution path with none of the policy in `skippy_exec.py`, behind a socket that has no
-authentication yet. See [ADR 0014](docs/adr/0014-cursor-integration.md).
-
-### Project memory across sessions
-
-A run's record is written automatically when it ends, and the next run on the same
-workspace roots opens with the relevant history already in context:
-
-```text
-## What you already know about this project (skippy)
-Conventions established here:
-- test command: python -m pytest -q
-
-Decisions from earlier sessions:
-- [0003] Retries belong in the transport [MAY BE OUT OF DATE: net/client.py no longer exists]
-
-Open weaknesses found in earlier reverse-engineering sessions:
-- [0001] [critical, confirmed] Firmware update accepts unsigned images
-  evidence: finding 0004 in pack firmware-bin-a3f81c2e
-
-Recent sessions, newest first:
-- 2026-07-29T21:31 [finished] Moved retries into the transport (touched net/pool.py)
-- 2026-07-28T16:02 [max_steps] Got halfway through the auth migration; refresh path unfinished
-```
-
-Four choices worth knowing about:
-
-- **Recall is not optional.** The history goes in the opening message rather than
-  waiting on the model to call a tool. A tool the model may call is one it mostly will
-  not — RE mode had to announce its note pack for the same reason. `recall_project`
-  exists for older or more specific questions than the opening block covers.
-- **Stale memory says so.** Every entry records the commit it was written at and the
-  paths it concerns; a path that no longer exists gets marked. This is the difference
-  between memory that helps and memory that hurts: "retries live in `client.py`" is
-  confidently wrong after a refactor, and a misinformed session is worse off than a
-  blind one. Superseded decisions are dropped from the opening block and marked in
-  recall.
-- **Failed runs are recorded too.** A run that ran out of steps halfway through a
-  migration is the most useful thing for the next session to know, so the record is
-  written on every terminal outcome, not just success.
-- **It carries work across modes.** A weakness recorded in an RE session becomes a work
-  item here, so the coding session that can actually fix it opens knowing about it. The
-  item points at the finding rather than restating it, `resolve_work_item` closes it, and
-  the resolution is a new record rather than an edit.
-
-Sessions are JSON and decisions are markdown under `sessions_root()/projects/<id>`,
-keyed by the basenames of your workspace roots, so nothing has to be named by hand.
-Recall is deterministic keyword scoring — no embedding backend required, which is also
-what keeps it testable. See [ADR 0013](docs/adr/0013-project-memory.md).
-
-### Reverse-engineering mode
+### Reverse-engineering mode, in depth
 
 ```python
 outcome = await skippy_agent.run_task(
@@ -222,95 +280,68 @@ outcome = await skippy_agent.run_task(
 )
 ```
 
-RE mode differs from coding mode in four things, and nothing else:
+RE mode differs from coding mode in these things, and nothing else:
 
-- **The notes are the deliverable.** A coding task leaves a diff and the repo remembers
-  it; an RE task changes nothing, so anything not written down is lost when the
-  transcript folds. `note_finding` writes one markdown file per finding under
-  `notes_root()`, in a pack keyed by the target's resolved path, so next month's session
-  accumulates onto this one instead of re-deriving it — and two products that both ship a
-  `firmware.bin` get two packs rather than one confusing one. If the target's bytes have
-  changed since the pack was started, every read of it says so.
-- **Evidence and confidence are mandatory.** A finding with no evidence is refused:
-  "the header is 32 bytes" is worthless later, "`otool -h` reports sizeofcmds 0x20" can
-  be rechecked. Confidence is `speculative` / `likely` / `confirmed`, recorded
-  separately, because the thing that ruins an investigation is a guess getting cited as
-  fact by everything built on it. Corrections supersede rather than overwrite, and a
-  superseded finding is marked as such on every path that reads it.
-  The loop also logs every inspection command it runs and what the command printed, so a
-  run that dies at step nine leaves the evidence rather than nothing, and a finding can be
-  checked against the output it came from. Conclusions are still the model's to write;
-  after six commands with nothing recorded, it gets told so.
-- **Findings can name work.** A `weakness` finding carries a severity — `low` through
-  `critical`, alongside its confidence, because a speculative critical and a confirmed one
-  are different work. Recording one raises a work item in project memory, which is how the
-  next coding session on the same repos opens knowing what needs fixing. Finding it in RE
-  mode and fixing it in coding mode is the workflow; there is deliberately no
-  report generator.
-- **It carves containers, in a container.** `extract_artifact` runs unblob over 30-odd
-  archive, compression and filesystem formats, recursively, and the files land in a
-  quarantine directory inside the note pack rather than a workspace root. Extraction is
-  the one operation here that points format parsers at a hostile blob and lets them write,
-  so it never runs on the host: unblob's Landlock sandbox — the layer that covers the
-  twenty-odd third-party extractors it drives — is Linux-only, and on macOS a container
-  *is* a Linux VM, so containerising buys the VM boundary, turns that sandbox back on and
-  supplies extractors that macOS has no packages for. No network, no capabilities,
-  read-only input, image pinned by digest, and a watchdog for decompression bombs.
-- **It reads code a function at a time.** `list_symbols`, then `disassemble_function` or
-  `decompile`, each returning one function rather than a region — which is what keeps the
-  heavy model's context small enough to be affordable. Behind them are rizin and the
-  Ghidra decompiler as self-contained C++, so no JVM and no Ghidra install, covering
-  x86-64, ARM, AArch64, MIPS, RISC-V and Xtensa. rizin is deliberately *not* in the
-  command allowlist: its `-c` argument is a command language with a shell escape in it, so
-  it is only ever invoked with an argument vector Skippy builds, always with `-N` and
-  never with `-w`, and the symbol you ask for is resolved to an address before anything
-  reaches a command string.
-- **It cannot run the artifact.** There is no `apply_patch`, and `run_command` switches
-  to an inspection-only allowlist: `file`, `strings`, `nm`, `otool`, `objdump`,
-  `dwarfdump`, `xxd`, `c++filt` and friends, with no interpreter, build tool or test
-  runner in it. Tools that read by default and write when asked are constrained to their
-  read-only form — `lipo -info` yes, `lipo -create` no; `plutil -p` yes, `-convert` no;
-  `tar -tf` yes, `tar xf` no. The mode is set by the loop and stripped from the model's
-  arguments, so it cannot ask for the coding table.
+- **The notes are the deliverable.** `note_finding` writes one markdown file
+  per finding under `notes_root()`, in a pack keyed by the target's resolved
+  path, so next month's session accumulates onto this one instead of
+  re-deriving it. If the target's bytes have changed since the pack was
+  started, every read of it says so.
+- **Evidence and confidence are mandatory.** A finding with no evidence is
+  refused; confidence is `speculative` / `likely` / `confirmed`, recorded
+  separately. Corrections supersede rather than overwrite. The loop also logs
+  every inspection command and its output, so a run that dies at step nine
+  leaves the evidence rather than nothing.
+- **Findings can name work.** A `weakness` finding carries a severity — `low`
+  through `critical` — and raises a work item in project memory, which is how
+  the next coding session on the same repos opens knowing what needs fixing.
+- **It carves containers, in a container.** `extract_artifact` runs unblob over
+  30-odd formats, recursively, into a quarantine directory inside the note
+  pack. No network, no capabilities, read-only input, image pinned by digest,
+  and a watchdog for decompression bombs.
+- **It reads code a function at a time.** `list_symbols`, then
+  `disassemble_function` or `decompile`, each returning one function — rizin
+  and the Ghidra decompiler as self-contained C++, covering x86-64, ARM,
+  AArch64, MIPS, RISC-V and Xtensa. rizin is deliberately *not* in the command
+  allowlist: its `-c` argument has a shell escape in it, so it is only invoked
+  with an argument vector Skippy builds, always `-N`, never `-w`.
+- **It can touch hardware, with approval.** The device tools (`list_devices`,
+  `serial_*`, `i2c_*`, `gpio_io`, `adc_read`, `usb_*`) route to a bridge by
+  `host=`; every write stops for an on-screen approval card. Exchanges are
+  bounded request/response — a time-boxed capture of at most 30 seconds and
+  4KB. A long trace belongs on a logic analyzer.
+- **It cannot run the artifact.** No `apply_patch`, and `run_command` switches
+  to an inspection-only allowlist (`file`, `strings`, `nm`, `otool`, `objdump`,
+  `xxd`, …) with tools constrained to their read-only forms — `lipo -info` yes,
+  `lipo -create` no. The mode is set by the loop and stripped from the model's
+  arguments.
 
-**What it cannot do yet.** Nothing bounds the *number* of files an extraction produces, so
-a bomb that makes ten million empty ones passes the size cap; the depth limit and the
-timeout are the only answers, and neither is a good one. Decompiled parameter lists are
-unreliable on Xtensa and RISC-V, where rz-ghidra cannot
-match the calling convention; the tool says so in its output rather than leaving you to
-find out. And running the target under a debugger is a separate need that wants a VM
-rather than another entry in the allowlist; the refusal says so, and the model records the
-question instead. See
-[ADR 0012](docs/adr/0012-reverse-engineering-mode.md),
+Carving needs a container runtime (`brew install podman && podman machine
+start`); without one, `extract_artifact` says so and the rest of RE mode
+carries on. Disassembly needs the pinned rizin source build — the Homebrew
+bottle silently lacks the Xtensa and RISC-V plugins; ADR 0018 records the
+commits. See ADRs
+[0012](docs/adr/0012-reverse-engineering-mode.md),
 [0015](docs/adr/0015-note-pack-identity.md),
 [0016](docs/adr/0016-loop-captured-evidence.md),
 [0017](docs/adr/0017-weakness-findings-and-handoff.md),
-[0018](docs/adr/0018-rizin-structured-tools.md) and
+[0018](docs/adr/0018-rizin-structured-tools.md),
 [0019](docs/adr/0019-containerised-extraction.md).
-
-Carving needs a container runtime, which on macOS means a Linux VM: `brew install podman`
-then `podman machine start`. Without one, `extract_artifact` says so and the rest of RE
-mode carries on.
-
-Disassembly needs the pinned rizin build, which is a source build rather than a Homebrew
-one: rizin gates its Xtensa and RISC-V plugins on a bundled capstone that the Homebrew
-bottle does not use, so `brew install rizin` silently lacks both. ADR 0018 records the
-commits and the one-line rz-ghidra build fix RISC-V needs. Without it the RE mode still
-works; the two tools report that they are unavailable and the static allowlist carries on.
 
 ### Why transcripts are append-only
 
-`mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy` role: a
-12K-token prefill measures 59.9s cold against 2.8–3.3s warm. Editing an already-sent
-message invalidates that cache and forces a full re-prefill, so `skippy_llm.Transcript`
-exposes no way to delete or rewrite a turn. Use `fold()` when context genuinely has to
+`mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy`
+role: a 12K-token prefill measures 59.9s cold against 2.8–3.3s warm. Editing an
+already-sent message invalidates that cache, so `skippy_llm.Transcript` exposes
+no way to delete or rewrite a turn. Use `fold()` when context genuinely has to
 be shed; it returns a new transcript and logs the cost.
 
-Tool interaction uses native OpenAI-style function calling — schemas in `tool_schemas.py`,
-parsed server-side by `mlx_lm.server`. `parse_leaked_tool_calls` in `skippy_factory.py`
-recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
+Tool interaction uses native OpenAI-style function calling — schemas in
+`tool_schemas.py`, parsed server-side by `mlx_lm.server`.
+`parse_leaked_tool_calls` in `skippy_factory.py` recovers the malformed
+XML-style calls Qwen3-Coder occasionally emits instead.
 
-### File map
+## File map
 
 | File | Purpose |
 | --- | --- |
@@ -318,24 +349,30 @@ recovers the malformed XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_sandbox.py` | The path boundary every filesystem tool goes through |
 | `skippy_fs.py` | Read-only workspace tools: `list_dir`, `read_file`, `grep`, `glob_files` |
 | `skippy_edit.py` | The write path: `apply_patch`, atomic across any number of files |
-| `skippy_exec.py` | `run_command`: allowlisted, shell-free execution so it can test its own changes |
-| `skippy_re.py` | Reverse-engineering note packs: evidence-bearing findings, and the command log behind them |
-| `skippy_rizin.py` | Function-scoped disassembly and decompilation, with rizin kept out of the allowlist |
-| `skippy_extract.py` | Carving firmware images inside a hardened container, into a quarantine in the pack |
-| `skippy_memory.py` | Project memory: sessions, decisions and work items, carried into the next run and marked when stale |
-| `skippy_tasks.py` | Runs a task for a connected client: one at a time, cancellable, events follow the client |
-| `skippy_cursor.py` | Bridge to the editor: routes patches through it and brings diagnostics back |
+| `skippy_exec.py` | `run_command`: allowlisted, shell-free execution |
+| `skippy_git.py` | Git for agent and app: status, diff, commit, branch, push, pull, new, clone |
+| `skippy_github.py` | GitHub: PAT storage, askpass helper, REST client (whoami, create, list repos) |
+| `skippy_re.py` | RE note packs: evidence-bearing findings and the command log behind them |
+| `skippy_rizin.py` | Function-scoped disassembly and decompilation |
+| `skippy_extract.py` | Carving firmware images inside a hardened container |
+| `skippy_device.py` | Device I/O routing and write approvals for the studio, MacBook and bench bridges |
+| `skippy_ble_bridge.py` | Python BLE-to-hub relay for the bench node (bleak) |
+| `skippy_memory.py` | Project memory: sessions, decisions, work items, marked when stale |
+| `skippy_voice.py` | The voice lane: VAD, Whisper in, Kokoro out, barge-in |
+| `skippy_tasks.py` | Runs a task for a connected client: one at a time, cancellable |
+| `skippy_cursor.py` | Bridge to the editor: routes patches through it, brings diagnostics back |
 | `cursor_client/` | The sideloaded VS Code-compatible extension |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
 | `prompts.py` | The system prompt, and the fold-summary extraction prompt |
 | `skippy_paths.py` | Where NAS-backed state lives, and which repos are in scope |
-| `skippy_factory.py` | FastAPI server: websocket hub, voice, transcription, endpoints |
-| `tools.py` | Research and context tools (web, memory, GitHub, directory maps, code RAG) |
+| `skippy_factory.py` | FastAPI server: websocket hub, voice, git/files actions, endpoints |
+| `tools.py` | Research and context tools (web, memory, directory maps, code RAG) |
 | `tool_schemas.py` | OpenAI-format function schemas for native tool calling |
-| `apps/SkippyServer/` | macOS app that boots the model servers and backend |
-| `apps/SkippyClient/` | macOS/iOS chat client |
-| `docs/adr/` | Architecture decision records |
+| `apps/` | SkippyMac, SkippyPhone, SkippyServer, SkippyClient, PhotoFrame |
+| `firmware/core2-voice/` | Wireless mic/speaker puck for the voice lane |
+| `firmware/core2-devio/` | The bench IO node: UART/I2C/GPIO/ADC over Wi-Fi or BLE |
+| `docs/adr/` | Architecture decision records, 0001–0021 |
 
 ## Tests
 
@@ -344,16 +381,16 @@ pip install -r requirements-test.txt
 python -m pytest
 ```
 
-`requirements-test.txt` is the light dependency set CI installs, so a local run
-matches CI exactly. The suite needs no model server, no weights, no NAS, and no
-network — `tests/fake_llm.py` stands in for `mlx_lm.server`. Chroma, Whisper and
-Kokoro are loaded on first use rather than at import, which is what keeps
-`skippy_factory` importable without them. Adding an import-time dependency on any
-of them will break collection.
+The suite needs no model server, no weights, no NAS, and no network —
+`tests/fake_llm.py` stands in for `mlx_lm.server`, and `tests/fake_bridge.py`
+stands in for a bench node. Chroma, Whisper and Kokoro are loaded on first use
+rather than at import; adding an import-time dependency on any of them will
+break collection. The SkippyMac unit tests run with
+`xcodebuild test -project apps/SkippyMac/SkippyMac.xcodeproj -scheme SkippyMac -destination 'platform=macOS'`.
 
-CI runs the suite three ways: normally, again inside a network namespace with only
-loopback available so nothing can quietly reach the internet, and `pyflakes` over
-every module with no exclusions.
+CI runs the Python suite three ways: normally, again inside a network namespace
+with only loopback available so nothing can quietly reach the internet, and
+`pyflakes` over every module with no exclusions.
 
 ## Setup
 
@@ -362,26 +399,41 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Download the Kokoro voice files (`kokoro-v1.0.int8.onnx`, `voices-v1.0.bin`) into the repo
-root, start the MLX servers on ports 8080/8081/8082, then:
+Download the Kokoro voice files (`kokoro-v1.0.int8.onnx`, `voices-v1.0.bin`)
+into the repo root, start the MLX servers on ports 8080/8081, then:
 
 ```bash
-python3 skippy_factory.py
+python3 skippy_factory.py                      # loopback only
+SKIPPY_BIND_HOST=0.0.0.0 \
+SKIPPY_FACTORY_TOKEN=some-long-secret \
+SKIPPY_VOICE_TOKEN=another-long-secret \
+python3 skippy_factory.py                      # LAN/tailnet, token-gated
 ```
 
-Long-term memory lives in ChromaDB at `/Volumes/skippy_memory/chroma_db`, so the NAS must
-be mounted before the backend starts.
+Long-term memory lives in ChromaDB at `/Volumes/skippy_memory/chroma_db`, so
+the NAS must be mounted before the backend starts.
 
 ## Security notes
 
-- The backend binds to `0.0.0.0` for LAN clients and **has no authentication layer**. Do
-  not port-forward it or expose it to a network you don't control. Remote access is
-  planned via Tailscale plus a bearer token on the websocket handshake; until that lands,
-  LAN only.
-- Web content (search results, fetched pages) and any decompiled or third-party source is
-  untrusted input to the agent loop. Keep human-approval gates on destructive tools.
-- The command allowlist stops accidents, not a determined agent. Anything that can run
-  `pytest` can run arbitrary code, because it can also write `conftest.py`. Treat the
-  workspace roots as the real blast radius, and run against repos you can restore from
-  git. If you ever point Skippy at code you do not trust, put the whole process in a VM;
-  no setting in this repo substitutes for that.
+- The hub binds **loopback by default**. A non-loopback bind is a deliberate
+  act: set `SKIPPY_FACTORY_TOKEN` (gates `/ws/factory`, the lane that can start
+  agent runs) and `SKIPPY_VOICE_TOKEN` (gates `/ws/voice`), and prefer a
+  private interface — Tailscale — over `0.0.0.0`. The boot log says out loud
+  which protection you have.
+- The bench node's factory token travels its BLE link too: the first line a
+  central sends must be a hello carrying it, or the node disconnects. A
+  `devices*` client can send replies and a hello and nothing else, so a
+  compromised node cannot drive the agent.
+- The GitHub PAT is held by the hub at `~/.skippy/github_token` (mode 0600) and
+  injected via `GIT_ASKPASS` — it never appears in remote URLs, repo config, or
+  the transcript. Scope it minimally: Contents read/write, Administration
+  read/write (repo creation), Metadata read.
+- Web content, fetched pages, and any decompiled or third-party source is
+  untrusted input to the agent loop. Keep human-approval gates on destructive
+  tools.
+- The command allowlist stops accidents, not a determined agent. Anything that
+  can run `pytest` can run arbitrary code, because it can also write
+  `conftest.py`. Treat the workspace roots as the real blast radius, and run
+  against repos you can restore from git. If you ever point Skippy at code you
+  do not trust, put the whole process in a VM; no setting in this repo
+  substitutes for that.
