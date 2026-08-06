@@ -524,6 +524,36 @@ _SCHEMAS = {
             "required": ["message"],
         },
     },
+    "git_push": {
+        "description": (
+            "Pushes the current branch to origin (with -u on the first push). "
+            "The outgoing commits go to the human for approval first — a push "
+            "leaves the machine, so it asks the way a commit does. A rejected "
+            "non-fast-forward comes back as a readable error suggesting a pull."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Which repository. Required with several repos."},
+            },
+            "required": [],
+        },
+    },
+    "git_pull": {
+        "description": (
+            "Pulls the current branch from origin, fast-forward only — local "
+            "history is never rewritten, and a diverged branch fails with an "
+            "explanation instead of merging. Asks the human for approval first, "
+            "because a pull rewrites the working tree."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Which repository. Required with several repos."},
+            },
+            "required": [],
+        },
+    },
     "list_devices": {
         "description": (
             "Lists serial ports and USB devices attached to a host. Call this before "
@@ -763,6 +793,120 @@ _SCHEMAS = {
             "required": ["address"],
         },
     },
+    "i2c_scan": {
+        "description": (
+            "Probes every 7-bit address on an I2C bus of a hardware bridge node and "
+            "lists what answered. Read-only — no approval needed. This is the first "
+            "call when you do not yet know what is on the bus. Needs a bridge: "
+            "host='bench' is the Core2 node; the hub itself has no I2C."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Bridge node with the bus. Defaults to 'bench'.",
+                },
+                "bus": {"type": "integer", "description": "Bus index on that node. Defaults to 0."},
+            },
+            "required": [],
+        },
+    },
+    "i2c_io": {
+        "description": (
+            "One I2C transaction with a device found by i2c_scan: write bytes, read "
+            "bytes, or write-then-read from the same start (the usual register read). "
+            "A read is free; a non-empty write requires human approval, because a "
+            "register write can reconfigure or brick the part. Payloads are hex."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "addr": {
+                    "type": "string",
+                    "description": "7-bit device address, e.g. '0x3c' or '60'.",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Bridge node with the bus. Defaults to 'bench'.",
+                },
+                "register": {
+                    "type": "integer",
+                    "description": "Register byte to address first. Omit for a raw transaction.",
+                },
+                "write": {
+                    "type": "string",
+                    "description": "Bytes to write after the register, encoded per write_encoding.",
+                },
+                "write_encoding": {
+                    "type": "string",
+                    "enum": ["hex", "base64", "utf8"],
+                    "description": "How to decode `write`. Defaults to hex.",
+                },
+                "read_len": {
+                    "type": "integer",
+                    "description": "Bytes to read back after the write (max 256).",
+                },
+                "bus": {"type": "integer", "description": "Bus index on that node. Defaults to 0."},
+            },
+            "required": ["addr"],
+        },
+    },
+    "gpio_io": {
+        "description": (
+            "Reads a digital pin on a bridge node, or drives one. direction='read' is "
+            "free; direction='write' requires human approval, because a pin driven "
+            "against an output on the other end damages both. Needs a bridge node such "
+            "as host='bench'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "Pin number on the node, e.g. 26."},
+                "host": {
+                    "type": "string",
+                    "description": "Bridge node with the pin. Defaults to 'bench'.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["read", "write"],
+                    "description": "read samples the pin; write drives it. Defaults to read.",
+                },
+                "value": {
+                    "type": "integer",
+                    "description": "Level to drive, 0 or 1. Required for direction='write'.",
+                },
+                "pull": {
+                    "type": "string",
+                    "enum": ["none", "up", "down"],
+                    "description": "Internal pull for a read of a floating pin. Defaults to none.",
+                },
+            },
+            "required": ["pin"],
+        },
+    },
+    "adc_read": {
+        "description": (
+            "Reads an analog input on a bridge node and returns millivolts and the raw "
+            "count. Read-only — no approval needed. Needs a bridge node such as "
+            "host='bench'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "Analog-capable pin, e.g. 36."},
+                "host": {
+                    "type": "string",
+                    "description": "Bridge node with the pin. Defaults to 'bench'.",
+                },
+                "samples": {
+                    "type": "integer",
+                    "description": "Samples to average, 1-64. Defaults to 1.",
+                },
+            },
+            "required": ["pin"],
+        },
+    },
 }
 
 
@@ -947,7 +1091,7 @@ WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
 # Version control, coding mode only: an RE session does not change the artifact,
 # so it has no history to write. Commits gate through the code-approval card.
-GIT_TOOLS = ("git_status", "git_diff", "git_branch", "git_commit")
+GIT_TOOLS = ("git_status", "git_diff", "git_branch", "git_commit", "git_push", "git_pull")
 NOTES_TOOLS = ("note_finding", "read_notes")
 # RE mode only, and not because coding mode would be harmed by them: they read the
 # session's target artifact, and a coding session has a repository rather than a target.

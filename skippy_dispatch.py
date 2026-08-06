@@ -78,6 +78,9 @@ _ASYNC_TOOLS = {
     "git_diff": skippy_git.git_diff,
     "git_branch": skippy_git.git_branch,
     "git_commit": skippy_git.git_commit,
+    # Remote sync: writes beyond the bench, so both gate through the approver.
+    "git_push": skippy_git.git_push,
+    "git_pull": skippy_git.git_pull,
     "list_devices": skippy_device.list_devices,
     "serial_open": skippy_device.serial_open,
     "serial_io": skippy_device.serial_io,
@@ -87,6 +90,11 @@ _ASYNC_TOOLS = {
     "net_connect": skippy_device.net_connect,
     "net_io": skippy_device.net_io,
     "net_scan": skippy_device.net_scan,
+    # Pins and buses. Bridge-only: there is no local backend to fall back to.
+    "i2c_scan": skippy_device.i2c_scan,
+    "i2c_io": skippy_device.i2c_io,
+    "gpio_io": skippy_device.gpio_io,
+    "adc_read": skippy_device.adc_read,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
@@ -165,8 +173,9 @@ async def dispatch(
         # The human-in-the-app gate. None means no gate (headless, or approvals
         # turned off), and apply_patch writes as before.
         args["approver"] = approver
-    if name == "git_commit":
-        # The same human gate as apply_patch: a commit is a write to history.
+    if name in ("git_commit", "git_push", "git_pull"):
+        # The same human gate as apply_patch: a commit is a write to history,
+        # and push/pull are writes beyond the bench entirely.
         args["approver"] = approver
     if name == "run_command":
         args["mode"] = mode

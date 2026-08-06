@@ -6,8 +6,9 @@ import logging
 import tempfile
 import base64
 import io
+import time
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 
@@ -18,6 +19,7 @@ logger = logging.getLogger("skippy_factory")
 # Models are addressed by role (fast / heavy / compressor); skippy_llm owns the
 # url and weight mapping, and refuses to reach off-machine unless asked to.
 import skippy_llm
+import skippy_device
 import skippy_fs
 import skippy_tasks
 import skippy_voice
@@ -94,6 +96,13 @@ class ConnectionManager:
         # wait on these futures instead of calling receive() themselves,
         # which would race the endpoint loop for incoming frames.
         self.pending_auth: Dict[int, asyncio.Future] = {}
+        # What each device bridge last said about itself. Presence alone is not
+        # enough to trust a bench node in another room: a reading from a node on
+        # 4% battery or -89 dBm is one to be suspicious of, and the app can only
+        # show that if the hub keeps it. Entries outlive the connection so the
+        # app can say "last seen 20 minutes ago" rather than silently dropping a
+        # node that went flat.
+        self.bridge_nodes: Dict[str, dict] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -151,6 +160,37 @@ class ConnectionManager:
             return {"status": "DENY", "reason": "timeout or connection error"}
         finally:
             self.pending_auth.pop(key, None)
+
+    # -- device bridge presence -------------------------------------------
+
+    NODE_FIELDS = (
+        "node", "firmware", "battery", "charging", "rssi", "ip",
+        "uptime_s", "actions", "busy", "uart_open", "ports", "transport",
+    )
+
+    def note_bridge(self, client_id: str, data: dict) -> dict:
+        """Record a bridge's hello or node_status. Unknown fields are ignored."""
+        entry = self.bridge_nodes.setdefault(client_id, {"client_id": client_id})
+        for field in self.NODE_FIELDS:
+            if field in data:
+                entry[field] = data[field]
+        entry["last_seen"] = time.time()
+        return entry
+
+    def bridge_snapshot(self) -> list:
+        """Every bridge the hub has heard from, for the app's node list."""
+        now = time.time()
+        nodes = []
+        for client_id, entry in sorted(self.bridge_nodes.items()):
+            item = {k: v for k, v in entry.items() if k != "last_seen"}
+            item["online"] = client_id in self.active_connections
+            item["seen_seconds_ago"] = round(now - entry.get("last_seen", now), 1)
+            # The name a device tool's `host` argument should use to reach it.
+            item["host"] = entry.get("node") or (
+                client_id.split(":", 1)[1] if ":" in client_id else client_id
+            )
+            nodes.append(item)
+        return nodes
 
     def resolve_auth(self, websocket: WebSocket, data: dict) -> bool:
         """Called by the endpoint loop when a frame arrives while an auth
@@ -217,10 +257,40 @@ app = FastAPI(title="Skippy Coding & RE Agent API", lifespan=lifespan)
 app.include_router(skippy_voice.router)
 
 # --- MULTI-CLIENT WEBSOCKET ENDPOINT ---
+def _authorized(token: Optional[str]) -> bool:
+    """True if this connection may proceed.
+
+    Mirrors the voice lane's gate (`skippy_voice._authorized`). When
+    SKIPPY_FACTORY_TOKEN is set it must match, which is what makes a
+    non-loopback bind survivable on a lane where a message can start an agent
+    run. When it is unset, the default loopback bind is the only thing standing
+    there, and a non-loopback operator gets the warning at boot instead.
+    """
+    expected = os.environ.get("SKIPPY_FACTORY_TOKEN", "").strip()
+    if not expected:
+        return True
+    return bool(token) and token == expected
+
+
 @app.websocket("/ws/factory")
-async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
+async def factory_endpoint(
+    websocket: WebSocket, client_id: str = "swiftui", token: Optional[str] = None,
+):
+    if not _authorized(token):
+        # 1008 = policy violation. Closed before accept so an unauthenticated
+        # LAN scanner learns nothing, not even the protocol.
+        await websocket.close(code=1008)
+        return
+
     await hub.connect(websocket, client_id)
-    
+
+    # A device bridge is an executor, not an operator: it answers tool calls on
+    # its hardware and that is all. The wireless bench node is an ESP32 on the
+    # LAN, so "whoever holds that socket can start an agent run with file-write
+    # and command-execution tools" is not an acceptable consequence of plugging
+    # it in. Replies and a greeting are the whole vocabulary it gets.
+    rpc_only = skippy_device.is_bridge_client_id(client_id)
+
     try:
         while True:
             raw_input = await websocket.receive_text()
@@ -243,6 +313,30 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
             # launch an agent run with "hello" as the task.
             if data.get("type") == "hello":
                 logger.info("Client '%s' announced itself.", client_id)
+                if rpc_only:
+                    hub.note_bridge(client_id, data)
+                continue
+
+            # Bench-node telemetry: battery, signal, uptime, whether it is
+            # mid-action. The other half of the vocabulary a bridge gets, and
+            # like a reply it starts nothing — it only updates what the hub
+            # knows about a node it is already talking to.
+            if rpc_only and data.get("type") == "node_status":
+                hub.note_bridge(client_id, data)
+                continue
+
+            if rpc_only:
+                logger.warning(
+                    "Ignoring a non-reply message from bridge client '%s': %s",
+                    client_id, str(data)[:200],
+                )
+                await websocket.send_json({
+                    "type": "error",
+                    "message": (
+                        "This client is a device bridge. It may send task_id replies "
+                        "and a hello; it cannot start or query work."
+                    ),
+                })
                 continue
 
             # Read-only queries for the app's cockpit. Answered inline — neither
@@ -277,6 +371,14 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
                 await websocket.send_json(payload)
                 continue
 
+            # Which bench nodes exist, and are they healthy. What the app needs
+            # to offer a `host` worth picking rather than a name to type.
+            if data.get("action") == "bridge_nodes":
+                await websocket.send_json({
+                    "type": "bridge_nodes", "nodes": hub.bridge_snapshot(),
+                })
+                continue
+
             if data.get("action") == "re_add_finding":
                 payload = await asyncio.to_thread(runner.re_add_finding, data)
                 payload["type"] = "re_finding_saved"
@@ -301,6 +403,54 @@ async def factory_endpoint(websocket: WebSocket, client_id: str = "swiftui"):
             if data.get("action") == "git_branch":
                 payload = await runner.git_branch_action(data)
                 payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            # Remote sync from the panel. Same posture as git_commit: the
+            # human's click is the approval. Pull is ff-only, push is
+            # current-branch-to-origin; anything cleverer is an agent run.
+            if data.get("action") == "git_push":
+                payload = await runner.git_push_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "git_pull":
+                payload = await runner.git_pull_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "git_new":
+                payload = await runner.git_new_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "git_clone":
+                payload = await runner.git_clone_action(data)
+                payload["type"] = "git_result"
+                await websocket.send_json(payload)
+                continue
+
+            # The GitHub connection: status / set_token / repos. The token is
+            # stored hub-side and never echoed back.
+            if data.get("action") == "github":
+                payload = await runner.github_action(data)
+                payload["type"] = "github"
+                await websocket.send_json(payload)
+                continue
+
+            # Read-only file explorer, repo-scoped, for the app's Files tab.
+            if data.get("action") == "files":
+                payload = await runner.files_action(data)
+                payload["type"] = "files"
+                await websocket.send_json(payload)
+                continue
+
+            if data.get("action") == "file":
+                payload = await runner.file_action(data)
+                payload["type"] = "file"
                 await websocket.send_json(payload)
                 continue
 
@@ -366,29 +516,38 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 def bind_host() -> str:
     """Where to listen. Loopback unless someone deliberately says otherwise.
 
-    This used to be `0.0.0.0`, which put the whole agent on the local network. There
-    is no authentication on `/ws/factory` — `client_id` is a query parameter — and any
-    message that is not a reply, a greeting or a cancel starts an agent run. So on a
-    `0.0.0.0` bind, anything that can reach port 8000 can edit files in the workspace
-    roots and run commands through `run_command`: write a script with apply_patch, run
-    it with the interpreter, and the allowlist has been walked around entirely.
+    This used to be `0.0.0.0`, which put the whole agent on the local network. Any
+    message on `/ws/factory` that is not a reply, a greeting or a cancel starts an
+    agent run. So on a `0.0.0.0` bind with no token, anything that can reach port 8000
+    can edit files in the workspace roots and run commands through `run_command`: write
+    a script with apply_patch, run it with the interpreter, and the allowlist has been
+    walked around entirely.
 
     ADR 0014 accepted the missing authentication on the stated grounds that the bind
     was loopback. It was not; the app's own boot line is `python skippy_factory.py`,
     which took this default. Binding loopback is what makes that reasoning true.
 
-    The override exists because remote access is a real requirement, and the answer
-    there is a private interface (Tailscale) rather than a public one — so a bind to a
-    non-loopback address is a deliberate act that says so out loud in the log.
+    The override exists because remote access is a real requirement — the wireless
+    bench node of ADR 0020 needs it. The answer there is a private interface
+    (Tailscale) plus `SKIPPY_FACTORY_TOKEN`, so a bind to a non-loopback address is a
+    deliberate act that says out loud in the log which of the two you have.
     """
     host = os.environ.get("SKIPPY_BIND_HOST", "").strip() or DEFAULT_BIND_HOST
     if host not in LOOPBACK_HOSTS:
-        logger.warning(
-            "Binding %s, which is not loopback. /ws/factory has no authentication and "
-            "can start agent runs, so anything that can reach this port can edit your "
-            "workspace roots and run commands. Only do this on a private interface.",
-            host,
-        )
+        if os.environ.get("SKIPPY_FACTORY_TOKEN", "").strip():
+            logger.warning(
+                "Binding %s, which is not loopback. SKIPPY_FACTORY_TOKEN is set, so "
+                "/ws/factory is gated on it; keep this on a private interface anyway.",
+                host,
+            )
+        else:
+            logger.warning(
+                "Binding %s, which is not loopback. /ws/factory has no authentication "
+                "and can start agent runs, so anything that can reach this port can "
+                "edit your workspace roots and run commands. Set SKIPPY_FACTORY_TOKEN, "
+                "and only do this on a private interface.",
+                host,
+            )
     return host
 
 

@@ -29,6 +29,7 @@ a queue of stale ones has no value to a client that has missed the middle.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -373,6 +374,204 @@ class TaskRunner:
         out = {"ok": True, "summary": result.summary}
         out.update(result.data or {})
         return out
+
+    async def git_push_action(self, request: dict) -> dict:
+        """Push from the repo panel; the click is the approval, as with commit."""
+        import skippy_git
+
+        sandbox, error = self._git_sandbox()
+        if sandbox is None:
+            return {"error": error}
+        result = await skippy_git.git_push(
+            sandbox, repo=self._repo_argument(sandbox, str(request.get("repo") or "")),
+        )
+        if not result.ok:
+            return {"error": result.summary}
+        out = {"ok": True, "summary": result.summary}
+        out.update(result.data or {})
+        return out
+
+    async def git_pull_action(self, request: dict) -> dict:
+        """Pull (ff-only) from the repo panel."""
+        import skippy_git
+
+        sandbox, error = self._git_sandbox()
+        if sandbox is None:
+            return {"error": error}
+        result = await skippy_git.git_pull(
+            sandbox, repo=self._repo_argument(sandbox, str(request.get("repo") or "")),
+        )
+        if not result.ok:
+            return {"error": result.summary}
+        out = {"ok": True, "summary": result.summary}
+        out.update(result.data or {})
+        return out
+
+    async def git_new_action(self, request: dict) -> dict:
+        """Create a repo under the workspace root, with a GitHub twin when possible."""
+        import skippy_git
+
+        sandbox, error = self._git_sandbox()
+        if sandbox is None:
+            return {"error": error}
+        result = await skippy_git.git_new(
+            sandbox,
+            name=str(request.get("name") or ""),
+            private=bool(request.get("private", True)),
+        )
+        if not result.ok:
+            return {"error": result.summary}
+        out = {"ok": True, "summary": result.summary}
+        out.update(result.data or {})
+        return out
+
+    async def git_clone_action(self, request: dict) -> dict:
+        """Clone one of the account's GitHub repos into the workspace root."""
+        import skippy_git
+
+        sandbox, error = self._git_sandbox()
+        if sandbox is None:
+            return {"error": error}
+        result = await skippy_git.git_clone(sandbox, str(request.get("full_name") or ""))
+        if not result.ok:
+            return {"error": result.summary}
+        out = {"ok": True, "summary": result.summary}
+        out.update(result.data or {})
+        return out
+
+    async def github_action(self, request: dict) -> dict:
+        """The GitHub connection itself: status, set_token, repos.
+
+        The token arrives here once, is stored server-side, and is never sent
+        back — status answers with the login it maps to, which is all the app
+        needs to show "connected as ...".
+        """
+        import skippy_github
+
+        op = str(request.get("op") or "status")
+
+        if op == "set_token":
+            token = str(request.get("token") or "")
+            if not token.strip():
+                skippy_github.set_token("")
+                return {"op": op, "connected": False}
+            try:
+                who = await skippy_github.whoami(token.strip())
+            except skippy_github.GitHubError as exc:
+                return {"op": op, "error": str(exc)}
+            # Only a token that answered /user gets stored.
+            skippy_github.set_token(token)
+            return {"op": op, "connected": True, "login": who["login"], "name": who["name"]}
+
+        if op == "status":
+            if not skippy_github.get_token():
+                return {"op": op, "connected": False}
+            try:
+                who = await skippy_github.whoami()
+            except skippy_github.GitHubError as exc:
+                return {"op": op, "connected": False, "error": str(exc)}
+            return {"op": op, "connected": True, "login": who["login"], "name": who["name"]}
+
+        if op == "repos":
+            try:
+                repos = await skippy_github.list_repos()
+            except skippy_github.GitHubError as exc:
+                return {"op": op, "error": str(exc)}
+            return {"op": op, "repos": repos}
+
+        return {"op": op, "error": f"Unknown github op '{op}'."}
+
+    # -- file explorer (read-only, repo-scoped) ------------------------------
+
+    _FILE_READ_CAP = 200_000  # chars; the viewer is for reading, not archaeology
+
+    def _explorer_target(self, request: dict):
+        """Resolve {repo, path} to (repo_root, absolute_path) or (None, error)."""
+        import skippy_git
+
+        sandbox, error = self._git_sandbox()
+        if sandbox is None:
+            return None, None, error
+        repo = str(request.get("repo") or "")
+        repo_path = self._repo_argument(sandbox, repo)
+        if not repo_path:
+            return None, None, "A repo is required."
+        try:
+            root = sandbox.resolve(repo_path, must_exist=True)
+        except SandboxError as exc:
+            return None, None, f"Sandbox violation: {exc}"
+        root = sandbox.repo_root_for(root) or root
+
+        rel = str(request.get("path") or "").strip().lstrip("/")
+        try:
+            target = sandbox.resolve(os.path.join(root, rel) if rel else root, must_exist=True)
+        except SandboxError as exc:
+            return None, None, f"Sandbox violation: {exc}"
+        if not (target == root or target.startswith(root + os.sep)):
+            return None, None, f"'{rel}' is not inside the repo."
+        return root, target, None
+
+    async def files_action(self, request: dict) -> dict:
+        """One directory level of a repo, for the app's lazy folder tree."""
+        root, target, error = self._explorer_target(request)
+        if error:
+            return {"error": error}
+        if not os.path.isdir(target):
+            return {"error": "Not a directory."}
+
+        def scan() -> list:
+            entries = []
+            for name in sorted(os.listdir(target)):
+                if name == ".git":
+                    continue
+                full = os.path.join(target, name)
+                is_dir = os.path.isdir(full)
+                size = 0
+                if not is_dir:
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        size = 0
+                entries.append({"name": name, "dir": is_dir, "size": size})
+            entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+            return entries
+
+        entries = await asyncio.to_thread(scan)
+        return {
+            "repo": str(request.get("repo") or ""),
+            "path": str(request.get("path") or ""),
+            "entries": entries,
+        }
+
+    async def file_action(self, request: dict) -> dict:
+        """One file's text, size-capped; binary is refused rather than mangled."""
+        root, target, error = self._explorer_target(request)
+        if error:
+            return {"error": error}
+        if os.path.isdir(target):
+            return {"error": "That is a directory, not a file."}
+
+        def read() -> dict:
+            try:
+                with open(target, "rb") as fh:
+                    head = fh.read(self._FILE_READ_CAP + 1)
+            except OSError as exc:
+                return {"error": f"Could not read the file: {exc}"}
+            if b"\x00" in head[:8192]:
+                return {"error": "This looks like a binary file; the viewer only shows text."}
+            truncated = len(head) > self._FILE_READ_CAP
+            text = head[: self._FILE_READ_CAP].decode("utf-8", errors="replace")
+            return {"text": text, "truncated": truncated}
+
+        result = await asyncio.to_thread(read)
+        if "error" in result:
+            return result
+        return {
+            "repo": str(request.get("repo") or ""),
+            "path": str(request.get("path") or ""),
+            "text": result["text"],
+            "truncated": result["truncated"],
+        }
 
     async def send(self, client_id: str, payload: dict) -> bool:
         """Deliver one message to whatever socket that client currently holds.

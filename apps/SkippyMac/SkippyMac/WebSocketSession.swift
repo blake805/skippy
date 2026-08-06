@@ -46,6 +46,13 @@ final class WebSocketSession: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// Verbatim text, for relays that must not re-serialize what they carry.
+    func sendText(_ text: String) {
+        queue.async {
+            self.task?.send(.string(text)) { _ in }
+        }
+    }
+
     func sendBinary(_ data: Data) {
         queue.async {
             self.task?.send(.data(data)) { _ in }

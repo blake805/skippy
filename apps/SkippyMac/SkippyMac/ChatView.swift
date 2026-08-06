@@ -47,6 +47,7 @@ struct ChatView: View {
                 TextField("RE target (binary / pack key)", text: $app.reTarget)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 260)
+                reHostPicker
             }
             Spacer()
             if app.isRunning {
@@ -68,6 +69,29 @@ struct ChatView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    /// Which host RE device I/O goes through: local hardware by default, or a
+    /// bench node the hub knows about. An offline node stays listed (picking
+    /// it is how you find out it went flat), marked as offline.
+    private var reHostPicker: some View {
+        Picker("Host", selection: $app.reHost) {
+            Text("Local devices").tag("")
+            ForEach(app.factory.benchNodes) { node in
+                Text(node.online ? "Node: \(node.label)" : "Node: \(node.label) (offline)")
+                    .tag(node.host)
+            }
+            // A selection made before the node list arrived still has a row,
+            // so the picker never shows blank.
+            if !app.reHost.isEmpty,
+               !app.factory.benchNodes.contains(where: { $0.host == app.reHost }) {
+                Text("Node: \(app.reHost)").tag(app.reHost)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: 180)
+        .help("Where device I/O runs: this machine, or a wireless bench node.")
+        .onAppear { app.factory.requestBridgeNodes() }
     }
 
     @ViewBuilder
@@ -170,8 +194,15 @@ private struct RunLane: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(runs) { run in
-                            RunCardView(run: run)
-                                .id(run.id)
+                            RunCardView(
+                                run: run,
+                                // Only the live run can be the one waiting.
+                                awaitingApproval: !run.state.isTerminal
+                                    && app.factory.pendingApproval != nil,
+                                autoApproving: !run.state.isTerminal
+                                    && app.factory.autoApproveWrites
+                            )
+                            .id(run.id)
                         }
                     }
                     .padding(20)
@@ -190,6 +221,10 @@ private struct RunLane: View {
 /// touched files, and the step-by-step transcript behind a disclosure.
 struct RunCardView: View {
     let run: RunCard
+    /// The hub is blocked on a human answer for this run.
+    var awaitingApproval: Bool = false
+    /// Further device writes in this run answer themselves.
+    var autoApproving: Bool = false
     @State private var showSteps = false
 
     private var accent: Color { Theme.accent(for: run.mode) }
@@ -201,7 +236,13 @@ struct RunCardView: View {
                     .font(.body.weight(.medium))
                     .textSelection(.enabled)
                 Spacer()
+                if autoApproving, case .running = run.state {
+                    StatusPill(text: "auto-approving writes", color: .orange)
+                }
                 statePill
+            }
+            if case .running = run.state {
+                activityLine
             }
             HStack(spacing: 8) {
                 if case .running = run.state {
@@ -251,10 +292,35 @@ struct RunCardView: View {
         .animation(.easeInOut(duration: 0.2), value: run.state)
     }
 
+    /// What the run is doing right now: blocked on the human, or quietly
+    /// thinking. A slow local model can go a minute between events, and
+    /// without this line that silence reads as a frozen app.
+    @ViewBuilder
+    private var activityLine: some View {
+        if awaitingApproval {
+            Label("Waiting for your approval — check the approval window", systemImage: "hand.raised")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let quiet = Int(context.date.timeIntervalSince(run.lastEventAt))
+                if quiet >= 8 {
+                    Label("Thinking — \(quiet)s since the last step", systemImage: "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
     private var statePill: some View {
         switch run.state {
         case .running:
-            return StatusPill(text: "Running", color: accent, pulsing: true)
+            return StatusPill(
+                text: awaitingApproval ? "Needs approval" : "Running",
+                color: awaitingApproval ? .orange : accent,
+                pulsing: true
+            )
         case .finished(let status):
             let good = status.lowercased().contains("complete")
                 || status.lowercased().contains("done")

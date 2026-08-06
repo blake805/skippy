@@ -31,6 +31,10 @@ ddgs
 pyserial
 pyusb
 
+# BLE bridge (skippy_ble_bridge). CoreBluetooth-backed on macOS; runs on the
+# laptop carrying the bench node, not necessarily the hub machine.
+bleak
+
 # Misc
 numpy
 

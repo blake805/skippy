@@ -11,6 +11,7 @@ import inspect
 
 import pytest
 
+import skippy_device
 import skippy_edit
 import skippy_exec
 import skippy_fs
@@ -35,11 +36,18 @@ IMPLEMENTED = {
     "read_notes": skippy_re.read_notes,
     "record_decision": skippy_memory.record_decision,
     "recall_project": skippy_memory.recall_project,
+    # The pins-and-buses class of ADR 0020. Their arguments are addresses and pin
+    # numbers, which is exactly where a stale schema turns into a write to the
+    # wrong register on real hardware.
+    "i2c_scan": skippy_device.i2c_scan,
+    "i2c_io": skippy_device.i2c_io,
+    "gpio_io": skippy_device.gpio_io,
+    "adc_read": skippy_device.adc_read,
 }
 
 # Arguments the dispatcher supplies. The model never sees these, so a schema that
 # declared one would be describing a parameter it cannot fill.
-INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory", "approver")
+INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory", "approver", "service")
 
 # Tools that accept their required arguments with Python defaults and check them in
 # the body, so an omission comes back as a message naming the field and its legal
@@ -176,6 +184,7 @@ def test_the_re_toolset_cannot_edit_and_can_record():
     # Live hardware is RE-only: probing a part on the bench is not a coding concern,
     # and coding mode must not suddenly grow a way to talk to /dev.
     assert {"list_devices", "serial_open", "serial_io", "net_scan"} <= names
+    assert {"i2c_scan", "i2c_io", "gpio_io", "adc_read"} <= names
 
 
 def test_note_finding_explains_why_evidence_is_required():

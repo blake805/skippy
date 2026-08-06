@@ -84,6 +84,10 @@ struct PendingApproval: Identifiable, Equatable {
     let diff: String
     /// File paths a code edit touches; empty for a device write.
     let files: [String]
+    /// Which approval this is within the current run (1-based; 0 = unknown).
+    /// A run that writes ten times asks ten times, and without a number the
+    /// second card looks like the first one refusing to go away.
+    let sequence: Int
 
     init(
         taskId: String?,
@@ -91,7 +95,8 @@ struct PendingApproval: Identifiable, Equatable {
         explanation: String,
         detail: String,
         diff: String = "",
-        files: [String] = []
+        files: [String] = [],
+        sequence: Int = 0
     ) {
         self.id = UUID()
         self.taskId = taskId
@@ -100,6 +105,7 @@ struct PendingApproval: Identifiable, Equatable {
         self.detail = detail
         self.diff = diff
         self.files = files
+        self.sequence = sequence
     }
 }
 
@@ -128,6 +134,10 @@ struct RunCard: Identifiable, Equatable {
     var items: [TimelineItem]
     var summary: String
     var patchedFiles: [String]
+    /// When the last event landed on this card. A slow local model can sit
+    /// silent for a minute per turn; the card uses this to say "thinking"
+    /// instead of looking frozen.
+    var lastEventAt: Date
 
     init(task: String, mode: AgentMode, id: UUID = UUID(), startedAt: Date = Date()) {
         self.id = id
@@ -139,6 +149,7 @@ struct RunCard: Identifiable, Equatable {
         self.items = []
         self.summary = ""
         self.patchedFiles = []
+        self.lastEventAt = startedAt
     }
 
     var elapsed: TimeInterval {
@@ -307,6 +318,105 @@ struct GitRepoDetail: Equatable {
     var isClean: Bool { changes.isEmpty }
 }
 
+// MARK: - GitHub
+
+/// The hub's GitHub connection: whether a token is stored and who it maps to.
+/// The token itself never comes back over the wire — only the login it proved.
+struct GitHubStatus: Equatable {
+    let connected: Bool
+    let login: String
+    let name: String
+    let error: String?
+
+    init(payload: [String: Any]) {
+        connected = payload["connected"] as? Bool ?? false
+        login = payload["login"] as? String ?? ""
+        name = payload["name"] as? String ?? ""
+        error = payload["error"] as? String
+    }
+
+    var headline: String {
+        if connected { return login.isEmpty ? "Connected" : "Connected as \(login)" }
+        return error ?? "Not connected"
+    }
+}
+
+/// One repository on the connected GitHub account, for the clone picker.
+struct GitHubRepo: Identifiable, Equatable {
+    let fullName: String
+    let name: String
+    let isPrivate: Bool
+    let detail: String
+    let updated: String
+
+    var id: String { fullName }
+
+    init(from raw: [String: Any]) {
+        fullName = raw["full_name"] as? String ?? ""
+        name = raw["name"] as? String ?? ""
+        isPrivate = raw["private"] as? Bool ?? false
+        detail = raw["description"] as? String ?? ""
+        updated = raw["updated"] as? String ?? ""
+    }
+}
+
+// MARK: - File explorer
+
+/// One entry of a repo directory listing, as the hub's `files` action reports it.
+struct FileEntry: Identifiable, Equatable {
+    let name: String
+    let isDirectory: Bool
+    let size: Int
+
+    var id: String { name }
+
+    init(from raw: [String: Any]) {
+        name = raw["name"] as? String ?? ""
+        isDirectory = raw["dir"] as? Bool ?? false
+        size = raw["size"] as? Int ?? 0
+    }
+
+    var sizeText: String {
+        guard !isDirectory else { return "" }
+        if size < 1024 { return "\(size) B" }
+        if size < 1024 * 1024 { return String(format: "%.1f KB", Double(size) / 1024) }
+        return String(format: "%.1f MB", Double(size) / (1024 * 1024))
+    }
+}
+
+/// One directory level of a repo, keyed by the path it answers.
+struct FilesListing: Equatable {
+    let repo: String
+    let path: String
+    let entries: [FileEntry]
+    let error: String?
+
+    init(payload: [String: Any]) {
+        repo = payload["repo"] as? String ?? ""
+        path = payload["path"] as? String ?? ""
+        entries = (payload["entries"] as? [[String: Any]] ?? []).map { FileEntry(from: $0) }
+        error = payload["error"] as? String
+    }
+}
+
+/// One file's text for the read-only viewer. A binary or oversized file comes
+/// back as an error, not as mangled text.
+struct FileContent: Equatable {
+    let repo: String
+    let path: String
+    let text: String
+    let truncated: Bool
+    let error: String?
+
+    init(payload: [String: Any]) {
+        repo = payload["repo"] as? String ?? ""
+        path = payload["path"] as? String ?? ""
+        text = payload["text"] as? String ?? ""
+        truncated = payload["truncated"] as? Bool ?? false
+        error = payload["error"] as? String
+    }
+}
+
 // MARK: - Reverse engineering
 
 /// A target Skippy can talk to: a serial port, a USB device, or a network
@@ -359,6 +469,84 @@ struct REDevice: Identifiable, Equatable {
         label = "\(netAddress):\(port)"
         detail = "tcp"
         id = "macbook/net/\(netAddress):\(port)"
+    }
+}
+
+/// A wireless bench node the hub has heard from: an IO bridge like the Core2
+/// on the bench, with the health it last reported. Every field but `client_id`
+/// is best-effort — a node that dropped off still appears, `online: false`,
+/// with whatever the hub remembers.
+struct BenchNode: Identifiable, Equatable {
+    let clientId: String
+    /// What a device tool's `host` argument should say to reach this node.
+    let host: String
+    let name: String
+    let firmware: String
+    let battery: Int?
+    let charging: Bool
+    let rssi: Int?
+    let ip: String
+    let uptimeS: Int?
+    let actions: Int
+    let busy: Bool
+    let uartOpen: Bool
+    let ports: [String]
+    let online: Bool
+    let seenSecondsAgo: Double?
+
+    var id: String { clientId }
+
+    init(from raw: [String: Any]) {
+        clientId = raw["client_id"] as? String ?? ""
+        let node = raw["node"] as? String ?? ""
+        // The hub derives `host` the same way; done here too so a sparse
+        // entry (a hello with no node_status yet) still has a usable name.
+        let derived = node.isEmpty
+            ? (clientId.contains(":")
+                ? String(clientId.split(separator: ":", maxSplits: 1)[1])
+                : clientId)
+            : node
+        host = raw["host"] as? String ?? derived
+        name = node.isEmpty ? derived : node
+        firmware = raw["firmware"] as? String ?? ""
+        battery = (raw["battery"] as? NSNumber)?.intValue
+        charging = raw["charging"] as? Bool ?? false
+        rssi = (raw["rssi"] as? NSNumber)?.intValue
+        ip = raw["ip"] as? String ?? ""
+        uptimeS = (raw["uptime_s"] as? NSNumber)?.intValue
+        actions = (raw["actions"] as? NSNumber)?.intValue ?? 0
+        busy = raw["busy"] as? Bool ?? false
+        uartOpen = raw["uart_open"] as? Bool ?? false
+        ports = raw["ports"] as? [String] ?? []
+        online = raw["online"] as? Bool ?? false
+        seenSecondsAgo = (raw["seen_seconds_ago"] as? NSNumber)?.doubleValue
+    }
+
+    var label: String { name.isEmpty ? clientId : name }
+
+    var detail: String {
+        [firmware, ip].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    /// "100%  -74 dBm  up 5m" — whichever parts the node actually reported.
+    var healthSummary: String {
+        var parts: [String] = []
+        if let battery { parts.append("\(battery)%\(charging ? "+" : "")") }
+        if let rssi { parts.append("\(rssi) dBm") }
+        if let uptimeS { parts.append("up \(Self.duration(uptimeS))") }
+        return parts.joined(separator: "  ")
+    }
+
+    /// "last seen 20m ago", for a node that went quiet.
+    var lastSeenText: String {
+        guard let seenSecondsAgo else { return "last seen: unknown" }
+        return "last seen \(Self.duration(Int(seenSecondsAgo))) ago"
+    }
+
+    private static func duration(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m" }
+        return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
     }
 }
 

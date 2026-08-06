@@ -22,6 +22,13 @@ has already named, and only through a handle `serial_open` (etc.) issued.
 through pyserial/pyusb/sockets in-process. A part plugged into the MacBook
 routes through the same client-RPC channel the Cursor extension already uses
 (`hub.execute_tool_on_client`). The tool surface the model sees is identical.
+The host name picks the bridge — `host="bench"` looks for the client id
+`devices:bench`, the Core2 node wired to the bench — and falls back to the bare
+`devices` id a lone Mac bridge connects with.
+
+**Pins and buses only exist on a bridge.** `i2c_scan`, `i2c_io`, `gpio_io` and
+`adc_read` have no local backend: the Studio has no GPIO header, so they refuse
+a local host rather than pretending. ADR 0020 pins their wire shapes.
 """
 
 from __future__ import annotations
@@ -54,6 +61,31 @@ DEFAULT_WRITE_APPROVAL_TIMEOUT = 600.0
 DEVICE_BRIDGE_CLIENT_ID = "devices"
 
 LOCAL_HOSTS = frozenset({"studio", "local", "hub", ""})
+
+
+def bridge_client_id(host: str) -> str:
+    """The named-bridge client id for a host: 'bench' -> 'devices:bench'.
+
+    One hub can have several bridges on it at once — a Mac sharing its USB
+    ports and the Core2 on the bench — so the bridge a host names has to be
+    part of the client id rather than a single well-known string.
+    """
+    name = str(host or "").strip().lower()
+    if not name or name == DEVICE_BRIDGE_CLIENT_ID:
+        return DEVICE_BRIDGE_CLIENT_ID
+    if name.startswith(DEVICE_BRIDGE_CLIENT_ID + ":"):
+        return name
+    return f"{DEVICE_BRIDGE_CLIENT_ID}:{name}"
+
+
+def is_bridge_client_id(client_id: str) -> bool:
+    """True for the ids a device bridge connects with.
+
+    Used by the factory endpoint to keep bridges RPC-only: a bridge answers
+    tool calls, and must never be able to start an agent run.
+    """
+    name = str(client_id or "").strip().lower()
+    return name == DEVICE_BRIDGE_CLIENT_ID or name.startswith(DEVICE_BRIDGE_CLIENT_ID + ":")
 
 
 @dataclass
@@ -120,22 +152,46 @@ class DeviceService:
     def _is_local(self, host: str) -> bool:
         return str(host or "studio").strip().lower() in LOCAL_HOSTS
 
-    async def _remote(self, action: str, payload: dict, timeout: float = 30.0) -> dict:
+    def _bridge_for(self, host: str) -> str:
+        """Which connected bridge serves this host.
+
+        A named bridge wins when it is there: the Core2 on the bench registers
+        as `devices:bench`, so `host="bench"` reaches it and nothing else. The
+        fall-back to the bare `devices` id is what keeps `host="macbook"`
+        working against a Mac bridge that predates named bridges.
+        """
+        named = bridge_client_id(host)
+        if named == self.bridge_client_id:
+            return self.bridge_client_id
+        if named in (getattr(self.hub, "active_connections", None) or {}):
+            return named
+        return self.bridge_client_id
+
+    async def _remote(
+        self, action: str, payload: dict, timeout: float = 30.0, host: str = "",
+    ) -> dict:
         if self.hub is None:
             return {"ok": False, "error": "No hub available for remote device access."}
-        if self.bridge_client_id not in getattr(self.hub, "active_connections", {}):
+        target = self._bridge_for(host)
+        if target not in getattr(self.hub, "active_connections", {}):
+            named = bridge_client_id(host)
+            expected = (
+                f"'{named}' or '{self.bridge_client_id}'"
+                if named != target else f"'{target}'"
+            )
             return {
                 "ok": False,
                 "error": (
-                    f"No device bridge is connected (expected client_id="
-                    f"'{self.bridge_client_id}'). Open SkippyMac on the machine "
-                    "that has the hardware and enable device sharing."
+                    f"No device bridge is connected for host '{host or 'studio'}' "
+                    f"(expected client_id={expected}). Power up the bench node, or "
+                    "open SkippyMac on the machine that has the hardware and enable "
+                    "device sharing."
                 ),
             }
         request = dict(payload)
         request["action"] = action
         response = await self.hub.execute_tool_on_client(
-            self.bridge_client_id, request, timeout=timeout
+            target, request, timeout=timeout
         )
         if not isinstance(response, dict):
             return {"ok": False, "error": f"Malformed bridge reply: {response!r}"}
@@ -294,7 +350,8 @@ async def list_devices(
             devices.extend(await asyncio.to_thread(_list_usb_local))
     else:
         remote = await service._remote(
-            "device_list", {"host": host, "kinds": sorted(wanted)}, timeout=20.0
+            "device_list", {"host": host, "kinds": sorted(wanted)}, timeout=20.0,
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -352,6 +409,7 @@ async def serial_open(
                 "stopbits": float(stopbits), "handle": handle,
             },
             timeout=15.0,
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -427,6 +485,7 @@ async def serial_io(
                 "capture_seconds": capture,
             },
             timeout=max(10.0, capture + idle + 5.0),
+            host=session.host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -489,7 +548,9 @@ async def serial_close(service: DeviceService, handle: str) -> ToolResult:
         except Exception as exc:
             return ToolResult(False, f"Closed with error: {exc}", data={"handle": handle})
     elif not service._is_local(session.host):
-        await service._remote("device_serial_close", {"handle": handle}, timeout=10.0)
+        await service._remote(
+            "device_serial_close", {"handle": handle}, timeout=10.0, host=session.host,
+        )
     return ToolResult(True, f"Closed {session.port}.", data={"handle": handle})
 
 
@@ -557,6 +618,7 @@ async def usb_transfer(
                 "length": length, "timeout_ms": timeout_ms,
             },
             timeout=timeout_ms / 1000.0 + 5.0,
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -672,6 +734,7 @@ async def usb_control(
                 "length": length, "timeout_ms": timeout_ms,
             },
             timeout=timeout_ms / 1000.0 + 5.0,
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -733,6 +796,7 @@ async def net_connect(
             {"address": str(address), "port": port, "proto": proto,
              "timeout": timeout, "handle": handle},
             timeout=timeout + 5.0,
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -808,6 +872,7 @@ async def net_io(
                 "read_bytes": read_n,
             },
             timeout=30.0,
+            host=session.host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -886,6 +951,7 @@ async def net_scan(
             "device_net_scan",
             {"address": str(address), "ports": parsed, "timeout": timeout},
             timeout=max(10.0, len(parsed) * timeout + 5.0),
+            host=host,
         )
         if not remote["ok"]:
             return ToolResult(False, remote["error"])
@@ -913,6 +979,283 @@ def _net_scan_local(address: str, ports: Sequence[int], timeout: float) -> List[
     return open_ports
 
 
+# ---------------------------------------------------------------------------
+# Pins and buses — bridge only
+# ---------------------------------------------------------------------------
+#
+# Serial, USB and sockets all exist on the hub, so those tools have a local
+# backend. An I2C bus, a GPIO pin and an ADC channel do not: a Mac Studio has no
+# header to put them on. Rather than pretend — pyserial cannot help here, and a
+# vague failure deep in a driver teaches the model nothing — these four refuse a
+# local host outright and name the node that can do the job.
+
+# One I2C transaction, not a transfer session. A page is the natural unit on
+# every part that has one, and a caller wanting a whole EEPROM reads it a page
+# at a time so each call stays a bounded exchange.
+MAX_I2C_BYTES = 256
+
+
+def _bridge_only(service: DeviceService, host: str, tool: str) -> Optional[ToolResult]:
+    if service._is_local(host):
+        return ToolResult(
+            False,
+            f"{tool} needs a hardware bridge node: '{host or 'studio'}' is this hub, "
+            "which has no I2C bus, GPIO header or ADC. Pass host='bench' for the "
+            "Core2 bench node, or another host running a device bridge.",
+        )
+    return None
+
+
+def _as_int(value: Any, name: str) -> int:
+    """Accept 60, '60' or '0x3c' — the model writes bus addresses either way."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number.")
+    if isinstance(value, int):
+        return value
+    return int(str(value).strip(), 0)
+
+
+def _hex_addr(value: int) -> str:
+    return f"0x{value:02x}"
+
+
+async def i2c_scan(
+    service: DeviceService,
+    host: str = "bench",
+    bus: int = 0,
+) -> ToolResult:
+    """Probe every 7-bit address on an I2C bus. Read-only; no approval needed."""
+    refusal = _bridge_only(service, host, "i2c_scan")
+    if refusal is not None:
+        return refusal
+    try:
+        bus_i = _as_int(bus, "bus")
+    except ValueError as exc:
+        return ToolResult(False, str(exc))
+
+    remote = await service._remote(
+        "device_i2c_scan", {"bus": bus_i}, timeout=20.0, host=host,
+    )
+    if not remote["ok"]:
+        return ToolResult(False, remote["error"])
+
+    found: List[str] = []
+    for entry in remote["result"].get("addresses") or []:
+        try:
+            found.append(_hex_addr(_as_int(entry, "address")))
+        except ValueError:
+            found.append(str(entry))
+
+    body = "\n".join(f"{a} responded to a bus probe" for a in found)
+    return ToolResult(
+        True,
+        f"{len(found)} device(s) on I2C bus {bus_i} at {host}",
+        body or f"No device answered on bus {bus_i}",
+        {"host": host, "bus": bus_i, "addresses": found},
+    )
+
+
+async def i2c_io(
+    service: DeviceService,
+    addr: str,
+    host: str = "bench",
+    register: Optional[int] = None,
+    write: Optional[str] = None,
+    write_encoding: str = "hex",
+    read_len: int = 0,
+    bus: int = 0,
+) -> ToolResult:
+    """One I2C transaction: optional write, optional read-back, same start.
+
+    A register read is free. A non-empty `write` puts bytes into a part that may
+    have its configuration — or its firmware — behind that register, so it waits
+    on the same approval card a serial write does.
+    """
+    refusal = _bridge_only(service, host, "i2c_io")
+    if refusal is not None:
+        return refusal
+    try:
+        addr_i = _as_int(addr, "addr")
+        bus_i = _as_int(bus, "bus")
+        register_i = None if register is None or register == "" else _as_int(register, "register")
+    except ValueError as exc:
+        return ToolResult(False, f"Bad I2C argument: {exc}")
+    if not (0x00 <= addr_i <= 0x7f):
+        return ToolResult(False, f"addr must be a 7-bit I2C address (0x00-0x7f), got {addr}.")
+    if register_i is not None and not (0 <= register_i <= 0xff):
+        return ToolResult(False, "register must be a single byte (0-255).")
+
+    try:
+        payload = _decode_payload(write, write_encoding) if write else b""
+    except (ValueError, binascii.Error) as exc:
+        return ToolResult(False, f"Bad write payload: {exc}")
+    if len(payload) > MAX_I2C_BYTES:
+        return ToolResult(
+            False, f"I2C write exceeds {MAX_I2C_BYTES} bytes; send it a page at a time."
+        )
+
+    read_n = max(0, min(int(read_len or 0), MAX_I2C_BYTES))
+    if not payload and read_n == 0:
+        return ToolResult(False, "i2c_io needs a write, a read_len, or both.")
+
+    if payload:
+        where = f"register {_hex_addr(register_i)}" if register_i is not None else "no register"
+        denied = await service.approve_write(
+            f"Write {len(payload)} byte(s) to I2C {_hex_addr(addr_i)} ({where}) on bus {bus_i}",
+            {
+                "device": f"i2c {_hex_addr(addr_i)}",
+                "host": host,
+                "bus": bus_i,
+                "register": register_i,
+                "bytes": len(payload),
+                "preview_hex": _encode_payload(payload[:64], "hex"),
+            },
+        )
+        if denied is not None:
+            return denied
+
+    remote = await service._remote(
+        "device_i2c_io",
+        {
+            "bus": bus_i,
+            "addr": _hex_addr(addr_i),
+            "register": register_i,
+            "write_hex": _encode_payload(payload, "hex") if payload else "",
+            "read_len": read_n,
+        },
+        timeout=20.0,
+        host=host,
+    )
+    if not remote["ok"]:
+        return ToolResult(False, remote["error"])
+    try:
+        received = _decode_payload(remote["result"].get("data_hex") or "", "hex")
+    except (ValueError, binascii.Error) as exc:
+        return ToolResult(False, f"Bridge returned bad data: {exc}")
+
+    received, clipped = _clip(received, MAX_I2C_BYTES)
+    summary = (
+        f"{'wrote ' + str(len(payload)) + 'B, ' if payload else ''}"
+        f"read {len(received)}B from I2C {_hex_addr(addr_i)}"
+    )
+    return ToolResult(
+        True, summary, _encode_payload(received, "hex"),
+        {
+            "host": host, "bus": bus_i, "addr": _hex_addr(addr_i),
+            "register": register_i, "bytes": len(received), "truncated": clipped,
+        },
+    )
+
+
+async def gpio_io(
+    service: DeviceService,
+    pin: int,
+    host: str = "bench",
+    direction: str = "read",
+    value: Optional[int] = None,
+    pull: str = "none",
+) -> ToolResult:
+    """Read a pin, or drive one. Driving is a write and needs approval.
+
+    `direction` rather than the more natural `mode`: the dispatcher strips a
+    `mode` argument before calling a tool, because the agent loop chooses the
+    execution mode and a model must not. A pin tool that took one would have it
+    silently removed and every drive would read instead.
+    """
+    refusal = _bridge_only(service, host, "gpio_io")
+    if refusal is not None:
+        return refusal
+    direction = str(direction or "read").strip().lower()
+    if direction not in ("read", "write"):
+        return ToolResult(False, "direction must be 'read' or 'write'.")
+    pull = str(pull or "none").strip().lower()
+    if pull not in ("none", "up", "down"):
+        return ToolResult(False, "pull must be 'none', 'up', or 'down'.")
+    try:
+        pin_i = _as_int(pin, "pin")
+    except ValueError as exc:
+        return ToolResult(False, str(exc))
+    if pin_i < 0:
+        return ToolResult(False, "pin must be a non-negative pin number.")
+
+    level: Optional[int] = None
+    if direction == "write":
+        if value is None:
+            return ToolResult(False, "gpio_io direction='write' needs value=0 or value=1.")
+        try:
+            level = 1 if _as_int(value, "value") else 0
+        except ValueError as exc:
+            return ToolResult(False, str(exc))
+        denied = await service.approve_write(
+            f"Drive GPIO {pin_i} {'high' if level else 'low'} on {host}",
+            {
+                "device": f"gpio {pin_i}",
+                "host": host,
+                "pin": pin_i,
+                "value": level,
+            },
+        )
+        if denied is not None:
+            return denied
+
+    remote = await service._remote(
+        "device_gpio",
+        {"pin": pin_i, "direction": direction, "value": level, "pull": pull},
+        timeout=15.0,
+        host=host,
+    )
+    if not remote["ok"]:
+        return ToolResult(False, remote["error"])
+    try:
+        read_back = _as_int(remote["result"].get("value", level or 0), "value")
+    except ValueError:
+        return ToolResult(False, "Bridge returned a non-numeric pin value.")
+
+    verb = "drove" if direction == "write" else "read"
+    return ToolResult(
+        True, f"{verb} GPIO {pin_i} = {read_back} on {host}",
+        data={"host": host, "pin": pin_i, "direction": direction, "value": read_back},
+    )
+
+
+async def adc_read(
+    service: DeviceService,
+    pin: int,
+    host: str = "bench",
+    samples: int = 1,
+) -> ToolResult:
+    """Read an analog pin. Read-only; no approval needed."""
+    refusal = _bridge_only(service, host, "adc_read")
+    if refusal is not None:
+        return refusal
+    try:
+        pin_i = _as_int(pin, "pin")
+    except ValueError as exc:
+        return ToolResult(False, str(exc))
+    if pin_i < 0:
+        return ToolResult(False, "pin must be a non-negative pin number.")
+    # Averaging is the bridge's job; the cap keeps one tool call bounded.
+    samples_i = max(1, min(int(samples or 1), 64))
+
+    remote = await service._remote(
+        "device_adc", {"pin": pin_i, "samples": samples_i}, timeout=15.0, host=host,
+    )
+    if not remote["ok"]:
+        return ToolResult(False, remote["error"])
+    result = remote["result"]
+    try:
+        raw = _as_int(result.get("raw", 0), "raw")
+        millivolts = _as_int(result.get("mv", 0), "mv")
+    except ValueError:
+        return ToolResult(False, "Bridge returned a non-numeric ADC reading.")
+
+    return ToolResult(
+        True, f"ADC pin {pin_i} = {millivolts} mV (raw {raw}) on {host}",
+        data={"host": host, "pin": pin_i, "raw": raw, "mv": millivolts,
+              "samples": samples_i},
+    )
+
+
 # Names offered to the model — keep in sync with tool_schemas / dispatch.
 DEVICE_TOOLS = (
     "list_devices",
@@ -924,4 +1267,8 @@ DEVICE_TOOLS = (
     "net_connect",
     "net_io",
     "net_scan",
+    "i2c_scan",
+    "i2c_io",
+    "gpio_io",
+    "adc_read",
 )

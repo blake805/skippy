@@ -18,6 +18,9 @@ final class SettingsStore: ObservableObject {
     @Published var clientId: String {
         didSet { UserDefaults.standard.set(clientId, forKey: Keys.clientId) }
     }
+    @Published var benchToken: String {
+        didSet { UserDefaults.standard.set(benchToken, forKey: Keys.benchToken) }
+    }
 
     var factoryURL: URL {
         URL(string: "ws://\(hubHost):\(hubPort)/ws/factory?client_id=\(clientId)")!
@@ -25,6 +28,16 @@ final class SettingsStore: ObservableObject {
 
     var devicesBridgeURL: URL {
         URL(string: "ws://\(hubHost):\(hubPort)/ws/factory?client_id=devices")!
+    }
+
+    /// Where the BLE bridge presents a bench node: the node's own client id,
+    /// so the hub cannot tell this relay from the node's Wi-Fi socket.
+    func benchBridgeURL(node: String) -> URL {
+        var s = "ws://\(hubHost):\(hubPort)/ws/factory?client_id=devices:\(node)"
+        if !benchToken.isEmpty {
+            s += "&token=\(benchToken)"
+        }
+        return URL(string: s)!
     }
 
     var voiceURL: URL {
@@ -43,6 +56,7 @@ final class SettingsStore: ObservableObject {
         voiceToken = defaults.string(forKey: Keys.voiceToken) ?? ""
         shareDevices = defaults.object(forKey: Keys.shareDevices) as? Bool ?? true
         clientId = defaults.string(forKey: Keys.clientId) ?? "skippy-mac"
+        benchToken = defaults.string(forKey: Keys.benchToken) ?? ""
     }
 
     private enum Keys {
@@ -51,5 +65,6 @@ final class SettingsStore: ObservableObject {
         static let voiceToken = "skippy.voiceToken"
         static let shareDevices = "skippy.shareDevices"
         static let clientId = "skippy.clientId"
+        static let benchToken = "skippy.benchToken"
     }
 }

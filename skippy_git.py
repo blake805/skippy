@@ -35,7 +35,10 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import re
+
 import skippy_exec
+import skippy_github
 from skippy_sandbox import (
     MAX_TOOL_OUTPUT_CHARS,
     Sandbox,
@@ -54,8 +57,20 @@ GIT_TIMEOUT = 60.0
 FALLBACK_IDENTITY = ("Skippy", "skippy@hub.local")
 
 
-async def _git(repo: str, *args: str, timeout: float = GIT_TIMEOUT) -> Tuple[int, str]:
-    """Run one git command in `repo`. Returns (exit_code, combined_output)."""
+async def _git(
+    repo: str, *args: str,
+    timeout: float = GIT_TIMEOUT,
+    env_extra: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str]:
+    """Run one git command in `repo`. Returns (exit_code, combined_output).
+
+    `env_extra` exists for the remote verbs: skippy_github.git_env() rides in
+    there so push/pull/clone can authenticate without any repo carrying a
+    token in its config.
+    """
+    env = skippy_exec._child_env()
+    if env_extra:
+        env = {**env, **env_extra}
     try:
         process = await asyncio.create_subprocess_exec(
             "git", *args,
@@ -63,7 +78,7 @@ async def _git(repo: str, *args: str, timeout: float = GIT_TIMEOUT) -> Tuple[int
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
-            env=skippy_exec._child_env(),
+            env=env,
             start_new_session=True,
         )
     except FileNotFoundError:
@@ -113,12 +128,39 @@ def _locate_repo(sandbox: Sandbox, repo: Optional[str]) -> Tuple[Optional[str], 
 
 
 def list_repos(sandbox: Sandbox) -> List[Dict[str, str]]:
-    """Workspace roots that are git repositories, by display name."""
-    return [
-        {"name": os.path.basename(root), "path": root}
-        for root in sandbox.roots
-        if os.path.isdir(os.path.join(root, ".git"))
-    ]
+    """Git repositories the sandbox can reach: each workspace root that is one,
+    plus each root's immediate children that are.
+
+    One level deep, not a recursive crawl: `git_new` and `git_clone` put new
+    repositories directly under a root, so this is exactly the set a user can
+    have created through the panel — without the cost or surprise of a scan
+    that wanders into node_modules.
+    """
+    found: List[Dict[str, str]] = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        if path in seen or not os.path.isdir(os.path.join(path, ".git")):
+            return
+        seen.add(path)
+        name = os.path.basename(path)
+        if any(entry["name"] == name for entry in found):
+            name = sandbox.relative(path)
+        found.append({"name": name, "path": path})
+
+    for root in sandbox.roots:
+        add(root)
+        try:
+            children = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for child in children:
+            if child.startswith("."):
+                continue
+            candidate = os.path.join(root, child)
+            if os.path.isdir(candidate):
+                add(candidate)
+    return found
 
 
 def _parse_porcelain(output: str) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
@@ -403,4 +445,305 @@ async def git_commit(
             "repo": display, "commit": commit_hash, "branch": branch,
             "message": message, "committed": files,
         },
+    )
+
+
+# -- remote verbs -------------------------------------------------------------
+#
+# Push and pull are deliberately narrow: current branch, `origin`, and pull is
+# ff-only. The panel is for sync; anything that rewrites history belongs to an
+# agent run where a human can watch it think. Credentials come from
+# skippy_github.git_env() — an askpass helper, never a token in a URL.
+
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GIT_REMOTE_TIMEOUT = 180.0
+
+
+async def _current_branch(root: str) -> Tuple[Optional[str], str]:
+    code, out = await _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if code != 0:
+        return None, out.strip()
+    branch = out.strip()
+    if branch == "HEAD":
+        return None, "detached HEAD"
+    return branch, ""
+
+
+def _new_repo_home(sandbox: Sandbox) -> str:
+    """Where a new or cloned repo lands: the first workspace root that is not
+    itself a repo, else the first root — nesting a repo in a repo is legal,
+    just not the first choice."""
+    for root in sandbox.roots:
+        if not os.path.isdir(os.path.join(root, ".git")):
+            return root
+    return sandbox.roots[0]
+
+
+async def git_push(
+    sandbox: Sandbox,
+    repo: Optional[str] = None,
+    approver: Optional[Any] = None,
+) -> ToolResult:
+    """Push the current branch to origin; `-u` when there is no upstream yet.
+
+    With an approver (agent-initiated pushes), the human sees the outgoing
+    commits first — a push is a write beyond the bench, so it asks the same
+    way a commit does.
+    """
+    root, problem = _locate_repo(sandbox, repo)
+    if problem:
+        return problem
+    display = sandbox.relative(root)
+
+    branch, why = await _current_branch(root)
+    if branch is None:
+        return ToolResult(False, f"Cannot push from {display}: {why or 'no branch is checked out'}.")
+
+    code, _ = await _git(root, "remote", "get-url", "origin")
+    if code != 0:
+        return ToolResult(
+            False,
+            f"{display} has no 'origin' remote, so there is nowhere to push. "
+            f"Create a GitHub repo for it (git_new wires origin up), or add one by hand.",
+        )
+
+    code, _ = await _git(root, "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}")
+    has_upstream = code == 0
+    args = ["push", "origin", branch] if has_upstream else ["push", "-u", "origin", branch]
+
+    if approver is not None:
+        if has_upstream:
+            _, preview = await _git(root, "log", "--oneline", "@{upstream}..HEAD")
+        else:
+            _, preview = await _git(root, "log", "--oneline", "-20")
+            preview = f"(first push of this branch; most recent commits)\n{preview}"
+        declined = await approver.approve(
+            f"git push {branch} to origin in {display}",
+            preview.strip(),
+            [],
+        )
+        if declined is not None:
+            return ToolResult(
+                False,
+                f"The push was not made: {declined.summary}",
+                data={"declined": True},
+            )
+
+    code, out = await _git(
+        root, *args, timeout=GIT_REMOTE_TIMEOUT, env_extra=skippy_github.git_env(),
+    )
+    if code != 0:
+        text = out.strip()
+        if "non-fast-forward" in text or "fetch first" in text or "[rejected]" in text:
+            return ToolResult(
+                False,
+                f"Push rejected: origin has commits {display} does not. "
+                f"Pull first (ff-only), then push again.",
+                cap_text(text, MAX_TOOL_OUTPUT_CHARS),
+            )
+        if "Authentication failed" in text or "could not read Username" in text or "403" in text:
+            return ToolResult(
+                False,
+                f"Push failed: GitHub did not accept the credentials. "
+                f"Check the token in Settings and that it can write to this repo.",
+                cap_text(text, MAX_TOOL_OUTPUT_CHARS),
+            )
+        return ToolResult(False, f"git push failed in {display}: {text.splitlines()[-1] if text else 'unknown error'}",
+                          cap_text(text, MAX_TOOL_OUTPUT_CHARS))
+
+    return ToolResult(
+        True,
+        f"Pushed {branch} to origin in {display}.",
+        cap_text(out.strip(), MAX_TOOL_OUTPUT_CHARS),
+        {"repo": display, "branch": branch, "pushed": True},
+    )
+
+
+async def git_pull(
+    sandbox: Sandbox,
+    repo: Optional[str] = None,
+    approver: Optional[Any] = None,
+) -> ToolResult:
+    """Pull ff-only from origin. A diverged branch is an error naming the fix,
+    never a surprise merge commit. With an approver (agent-initiated), the
+    human confirms first — a pull rewrites the working tree."""
+    root, problem = _locate_repo(sandbox, repo)
+    if problem:
+        return problem
+    display = sandbox.relative(root)
+
+    branch, why = await _current_branch(root)
+    if branch is None:
+        return ToolResult(False, f"Cannot pull into {display}: {why or 'no branch is checked out'}.")
+
+    code, _ = await _git(root, "remote", "get-url", "origin")
+    if code != 0:
+        return ToolResult(False, f"{display} has no 'origin' remote, so there is nothing to pull from.")
+
+    if approver is not None:
+        declined = await approver.approve(
+            f"git pull --ff-only origin {branch} into {display}",
+            "Fast-forward only: local history is never rewritten, and a "
+            "diverged branch fails cleanly instead of merging.",
+            [],
+        )
+        if declined is not None:
+            return ToolResult(
+                False,
+                f"The pull was not made: {declined.summary}",
+                data={"declined": True},
+            )
+
+    code, out = await _git(
+        root, "pull", "--ff-only", "origin", branch,
+        timeout=GIT_REMOTE_TIMEOUT, env_extra=skippy_github.git_env(),
+    )
+    if code != 0:
+        text = out.strip()
+        if "Not possible to fast-forward" in text or "divergent" in text or "diverged" in text:
+            return ToolResult(
+                False,
+                f"{display} and origin/{branch} have diverged, so a fast-forward pull is not possible. "
+                f"Reconcile in an agent run or by hand (rebase or merge), then pull again.",
+                cap_text(text, MAX_TOOL_OUTPUT_CHARS),
+            )
+        if "would be overwritten" in text:
+            return ToolResult(
+                False,
+                f"Pull refused: uncommitted changes in {display} would be overwritten. "
+                f"Commit them first, then pull.",
+                cap_text(text, MAX_TOOL_OUTPUT_CHARS),
+            )
+        return ToolResult(False, f"git pull failed in {display}: {text.splitlines()[-1] if text else 'unknown error'}",
+                          cap_text(text, MAX_TOOL_OUTPUT_CHARS))
+
+    up_to_date = "up to date" in out.lower()
+    summary = (
+        f"{display} is already up to date with origin/{branch}."
+        if up_to_date else f"Pulled origin/{branch} into {display} (fast-forward)."
+    )
+    return ToolResult(
+        True, summary, cap_text(out.strip(), MAX_TOOL_OUTPUT_CHARS),
+        {"repo": display, "branch": branch, "pulled": True, "up_to_date": up_to_date},
+    )
+
+
+async def git_new(
+    sandbox: Sandbox,
+    name: str,
+    private: bool = True,
+    github: bool = True,
+) -> ToolResult:
+    """A new repository under the workspace root: init, initial commit, and —
+    when a token is set and `github` is true — the GitHub twin wired as origin
+    and pushed. The local half never depends on the network half."""
+    name = str(name or "").strip()
+    if not _REPO_NAME_RE.match(name):
+        return ToolResult(
+            False,
+            "Repo names are letters, digits, dots, dashes and underscores, "
+            "starting with a letter or digit.",
+        )
+
+    home = _new_repo_home(sandbox)
+    path = os.path.join(home, name)
+    if os.path.exists(path):
+        return ToolResult(False, f"'{sandbox.relative(path)}' already exists.")
+
+    os.makedirs(path)
+    code, out = await _git(path, "init", "-b", "main")
+    if code != 0:
+        return ToolResult(False, f"git init failed: {out.strip()}")
+
+    readme = os.path.join(path, "README.md")
+    with open(readme, "w", encoding="utf-8") as fh:
+        fh.write(f"# {name}\n")
+    await _git(path, "add", "README.md")
+
+    commit_args = []
+    code, email = await _git(path, "config", "--get", "user.email")
+    if code != 0 or not email.strip():
+        name_id, email_id = FALLBACK_IDENTITY
+        commit_args += ["-c", f"user.name={name_id}", "-c", f"user.email={email_id}"]
+    code, out = await _git(path, *commit_args, "commit", "-m", "Initial commit")
+    if code != 0:
+        return ToolResult(False, f"Initial commit failed: {out.strip()}")
+
+    display = sandbox.relative(path)
+    data: Dict[str, Any] = {"repo": display, "path": path, "branch": "main", "github": False}
+
+    if not github:
+        return ToolResult(True, f"Created local repo {display} (no GitHub twin requested).", data=data)
+    if not skippy_github.get_token():
+        return ToolResult(
+            True,
+            f"Created local repo {display}. No GitHub token is set, so no remote was created — "
+            f"paste a token in Settings and push later.",
+            data=data,
+        )
+
+    try:
+        remote = await skippy_github.create_repo(name, private=private)
+    except skippy_github.GitHubError as exc:
+        return ToolResult(
+            True,
+            f"Created local repo {display}, but GitHub said no: {exc}. "
+            f"The local repo is fine; create the remote later and push.",
+            data=data,
+        )
+
+    await _git(path, "remote", "add", "origin", remote["clone_url"])
+    code, out = await _git(
+        path, "push", "-u", "origin", "main",
+        timeout=GIT_REMOTE_TIMEOUT, env_extra=skippy_github.git_env(),
+    )
+    if code != 0:
+        return ToolResult(
+            True,
+            f"Created {display} and {remote['full_name']} on GitHub, but the first push failed: "
+            f"{out.strip().splitlines()[-1] if out.strip() else 'unknown error'}. Push again from the panel.",
+            data={**data, "github": True, "full_name": remote["full_name"], "html_url": remote["html_url"]},
+        )
+
+    data.update({"github": True, "full_name": remote["full_name"], "html_url": remote["html_url"]})
+    return ToolResult(
+        True,
+        f"Created {display}, pushed to {remote['full_name']} "
+        f"({'private' if remote['private'] else 'public'}).",
+        data=data,
+    )
+
+
+async def git_clone(sandbox: Sandbox, full_name: str) -> ToolResult:
+    """Clone one of the account's GitHub repos into the workspace root."""
+    full_name = str(full_name or "").strip().removesuffix(".git")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$", full_name):
+        return ToolResult(False, "Expected an owner/name pair, like 'blake/skippy'.")
+
+    name = full_name.split("/", 1)[1]
+    home = _new_repo_home(sandbox)
+    path = os.path.join(home, name)
+    if os.path.exists(path):
+        return ToolResult(False, f"'{sandbox.relative(path)}' already exists; not cloning over it.")
+
+    code, out = await _git(
+        home, "clone", f"https://github.com/{full_name}.git", name,
+        timeout=GIT_REMOTE_TIMEOUT, env_extra=skippy_github.git_env(),
+    )
+    if code != 0:
+        text = out.strip()
+        if "Authentication failed" in text or "could not read Username" in text or "not found" in text.lower():
+            return ToolResult(
+                False,
+                f"Could not clone {full_name}: GitHub refused. If it is private, "
+                f"check the token in Settings can read it.",
+                cap_text(text, MAX_TOOL_OUTPUT_CHARS),
+            )
+        return ToolResult(False, f"git clone failed: {text.splitlines()[-1] if text else 'unknown error'}",
+                          cap_text(text, MAX_TOOL_OUTPUT_CHARS))
+
+    return ToolResult(
+        True,
+        f"Cloned {full_name} into {sandbox.relative(path)}.",
+        data={"repo": sandbox.relative(path), "path": path, "full_name": full_name},
     )

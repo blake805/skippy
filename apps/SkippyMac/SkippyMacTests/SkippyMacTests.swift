@@ -31,6 +31,17 @@ final class SkippyMacTests: XCTestCase {
         XCTAssertEqual(approval.kind, .device)
         XCTAssertTrue(approval.diff.isEmpty)
         XCTAssertTrue(approval.files.isEmpty)
+        XCTAssertEqual(approval.sequence, 0)
+    }
+
+    func testDeviceApprovalCarriesItsSequenceNumber() {
+        let approval = PendingApproval(
+            taskId: nil,
+            explanation: "Write 4 bytes to serial",
+            detail: "{...}",
+            sequence: 3
+        )
+        XCTAssertEqual(approval.sequence, 3)
     }
 
     func testRunCardStartsRunningAndMeasuresElapsed() {
@@ -169,6 +180,121 @@ final class SkippyMacTests: XCTestCase {
         let net = REDevice(netAddress: "10.0.0.5", port: 8080)
         XCTAssertEqual(net.kind, .net)
         XCTAssertEqual(net.label, "10.0.0.5:8080")
+    }
+
+    func testBenchNodeParsesAFullStatus() {
+        let node = BenchNode(from: [
+            "client_id": "devices:bench", "host": "bench", "node": "bench",
+            "firmware": "io-node 1.0", "battery": 100, "charging": false,
+            "rssi": -74, "ip": "192.168.1.145", "uptime_s": 317, "actions": 1,
+            "busy": false, "uart_open": false,
+            "ports": ["uart", "i2c", "gpio", "adc"],
+            "online": true, "seen_seconds_ago": 2.9,
+        ])
+        XCTAssertEqual(node.id, "devices:bench")
+        XCTAssertEqual(node.host, "bench")
+        XCTAssertEqual(node.label, "bench")
+        XCTAssertEqual(node.detail, "io-node 1.0 · 192.168.1.145")
+        XCTAssertTrue(node.online)
+        XCTAssertFalse(node.busy)
+        XCTAssertEqual(node.battery, 100)
+        XCTAssertEqual(node.rssi, -74)
+        XCTAssertEqual(node.ports, ["uart", "i2c", "gpio", "adc"])
+        XCTAssertEqual(node.healthSummary, "100%  -74 dBm  up 5m")
+    }
+
+    func testBenchNodeSurvivesMissingFields() {
+        // A hello with no node_status yet: the hub only knows the client id.
+        let node = BenchNode(from: ["client_id": "devices:garage"])
+        XCTAssertEqual(node.id, "devices:garage")
+        XCTAssertEqual(node.host, "garage")  // derived from the client id
+        XCTAssertEqual(node.label, "garage")
+        XCTAssertNil(node.battery)
+        XCTAssertNil(node.rssi)
+        XCTAssertTrue(node.ports.isEmpty)
+        XCTAssertFalse(node.online)
+        XCTAssertEqual(node.healthSummary, "")
+        XCTAssertEqual(node.lastSeenText, "last seen: unknown")
+    }
+
+    func testBenchNodeOfflineKeepsLastKnownHealth() {
+        let node = BenchNode(from: [
+            "client_id": "devices:bench", "host": "bench", "node": "bench",
+            "battery": 4, "rssi": -89, "online": false,
+            "seen_seconds_ago": 1225.4,
+        ])
+        XCTAssertFalse(node.online)
+        XCTAssertEqual(node.battery, 4)
+        XCTAssertEqual(node.lastSeenText, "last seen 20m ago")
+        XCTAssertEqual(node.healthSummary, "4%  -89 dBm")
+    }
+
+    func testGitHubStatusParsesConnectedAndNotConnected() {
+        let connected = GitHubStatus(payload: [
+            "type": "github", "op": "status", "connected": true,
+            "login": "blake", "name": "Blake W",
+        ])
+        XCTAssertTrue(connected.connected)
+        XCTAssertEqual(connected.login, "blake")
+        XCTAssertEqual(connected.headline, "Connected as blake")
+
+        let bare = GitHubStatus(payload: ["type": "github", "op": "status", "connected": false])
+        XCTAssertFalse(bare.connected)
+        XCTAssertEqual(bare.headline, "Not connected")
+
+        let rejected = GitHubStatus(payload: [
+            "type": "github", "op": "set_token",
+            "error": "GitHub rejected the token (401).",
+        ])
+        XCTAssertFalse(rejected.connected)
+        XCTAssertEqual(rejected.headline, "GitHub rejected the token (401).")
+    }
+
+    func testGitHubRepoParsesTheClonePickerFields() {
+        let repo = GitHubRepo(from: [
+            "full_name": "blake/skippy", "name": "skippy", "private": true,
+            "description": "shop jarvis", "updated": "2026-08-05T12:00:00Z",
+        ])
+        XCTAssertEqual(repo.id, "blake/skippy")
+        XCTAssertEqual(repo.name, "skippy")
+        XCTAssertTrue(repo.isPrivate)
+        XCTAssertEqual(repo.detail, "shop jarvis")
+    }
+
+    func testFilesListingParsesEntriesAndSurvivesAnError() {
+        let listing = FilesListing(payload: [
+            "type": "files", "repo": "skippy", "path": "src",
+            "entries": [
+                ["name": "lib", "dir": true, "size": 0],
+                ["name": "main.py", "dir": false, "size": 2048],
+            ],
+        ])
+        XCTAssertEqual(listing.repo, "skippy")
+        XCTAssertEqual(listing.path, "src")
+        XCTAssertEqual(listing.entries.count, 2)
+        XCTAssertTrue(listing.entries[0].isDirectory)
+        XCTAssertEqual(listing.entries[1].sizeText, "2.0 KB")
+        XCTAssertNil(listing.error)
+
+        let refused = FilesListing(payload: ["type": "files", "error": "Sandbox violation: escape"])
+        XCTAssertEqual(refused.error, "Sandbox violation: escape")
+        XCTAssertTrue(refused.entries.isEmpty)
+    }
+
+    func testFileContentParsesTextTruncationAndBinaryRefusal() {
+        let file = FileContent(payload: [
+            "type": "file", "repo": "skippy", "path": "src/main.py",
+            "text": "print('hi')\n", "truncated": false,
+        ])
+        XCTAssertEqual(file.text, "print('hi')\n")
+        XCTAssertFalse(file.truncated)
+        XCTAssertNil(file.error)
+
+        let binary = FileContent(payload: [
+            "type": "file", "error": "This looks like a binary file; the viewer only shows text.",
+        ])
+        XCTAssertNotNil(binary.error)
+        XCTAssertTrue(binary.text.isEmpty)
     }
 
     func testREFindingParsesSupersededFlag() {

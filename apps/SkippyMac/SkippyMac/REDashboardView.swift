@@ -22,6 +22,7 @@ struct REDashboardView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { app.openReverse() }
+        .onDisappear { app.closeReverse() }
     }
 }
 
@@ -30,17 +31,21 @@ struct REDashboardView: View {
 private struct DevicePanel: View {
     @ObservedObject var re: REStore
     @ObservedObject var factory: FactoryClient
+    @EnvironmentObject private var app: AppModel
+    @State private var selectedBenchHost: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionHeader(title: "Devices", systemImage: "cpu") {
                 re.refreshDevices()
                 factory.requestStudioDevices()
+                factory.requestBridgeNodes()
             }
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     deviceGroup("This Mac", re.localDevices, openable: true)
+                    benchGroup
                     deviceGroup("Studio (hub)", factory.reStudioDevices, openable: false)
                     networkTarget
                 }
@@ -79,6 +84,96 @@ private struct DevicePanel: View {
                 }
             }
         }
+    }
+
+    /// Wireless IO nodes the hub has heard from. A node cannot be opened from
+    /// here — remote I/O runs through an agent — so picking one shows what it
+    /// exposes and hands the host to RE chat instead.
+    private var benchGroup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("BENCH NODES")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+            bluetoothRow
+            if factory.benchNodes.isEmpty {
+                Text("None seen")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(factory.benchNodes) { node in
+                    BenchNodeRow(node: node, selected: selectedBenchHost == node.host) {
+                        if selectedBenchHost == node.host {
+                            selectedBenchHost = nil
+                        } else {
+                            selectedBenchHost = node.host
+                            factory.requestBenchDevices(host: node.host)
+                        }
+                    }
+                    if selectedBenchHost == node.host {
+                        benchDetail(node)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Bluetooth relay, as a button. Where there is no bench network the
+    /// laptop is the network: Connect makes this Mac the node's path to the
+    /// hub, the way skippy_ble_bridge.py does on a machine without the app.
+    private var bluetoothRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: app.ble.phase == .relaying
+                  ? "dot.radiowaves.left.and.right" : "personalhotspot")
+                .foregroundStyle(app.ble.phase == .relaying ? Color.accentColor : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Bluetooth bridge")
+                    .font(.callout)
+                Text(app.ble.statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            if app.ble.active, app.ble.phase != .relaying {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Button(app.ble.active ? "Disconnect" : "Connect") {
+                app.toggleBleBridge()
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+        .help("Connects a nearby io-node over Bluetooth LE and relays it to the hub. "
+              + "The node then appears above and answers host=\"bench\" in RE chat, "
+              + "no Wi-Fi needed. The node token lives in Settings.")
+    }
+
+    @ViewBuilder
+    private func benchDetail(_ node: BenchNode) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            let devices = factory.reBenchDevices[node.host] ?? []
+            if devices.isEmpty {
+                Text(node.online ? "No ports reported" : "Offline — ports unknown")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(devices) { device in
+                    DeviceRow(device: device, active: false, openable: false) {}
+                }
+            }
+            Button {
+                app.useBenchNodeInChat(node.host)
+            } label: {
+                Label("Use in RE chat", systemImage: "bubble.left.and.text.bubble.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .help("Remote nodes are driven from RE chat: an agent run reaches "
+                  + "\"\(node.host)\" through the hub. The panel only opens local hardware.")
+        }
+        .padding(.leading, 12)
     }
 
     private var networkTarget: some View {
@@ -147,6 +242,65 @@ private struct DeviceRow: View {
         case .usb: return "cable.connector.horizontal"
         case .net: return "network"
         }
+    }
+}
+
+/// One bench node: name, an online dot, and its last-reported health. An
+/// offline node stays visible, greyed, with how long ago it was heard from —
+/// a node that went flat is information, not something to hide.
+private struct BenchNodeRow: View {
+    let node: BenchNode
+    let selected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(node.online ? Color.green : Color.secondary.opacity(0.4))
+                    .frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 6) {
+                        Text(node.label)
+                            .font(.callout)
+                            .lineLimit(1)
+                        if node.busy {
+                            StatusPill(text: "busy", color: .orange, pulsing: true)
+                        }
+                    }
+                    if node.online {
+                        HStack(spacing: 8) {
+                            if let battery = node.battery {
+                                Text("\(battery)%\(node.charging ? "+" : "")")
+                                    .foregroundStyle(battery < 20 ? Color.orange : Color.secondary)
+                            }
+                            if let rssi = node.rssi {
+                                Text("\(rssi) dBm")
+                                    .foregroundStyle(.secondary)
+                            }
+                            if !node.detail.isEmpty {
+                                Text(node.detail)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .font(.caption2)
+                    } else {
+                        Text(node.lastSeenText)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Theme.accent(for: .re).opacity(0.10) : Theme.cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .opacity(node.online ? 1 : 0.55)
+        .help(node.online ? "Show this node's ports" : node.lastSeenText)
     }
 }
 

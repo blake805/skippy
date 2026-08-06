@@ -109,6 +109,12 @@ struct ApprovalSheet: View {
                     Text(approval.explanation)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                } else if approval.sequence > 0 {
+                    // A run that writes repeatedly asks repeatedly; the number
+                    // says "this is a new request", not the last one stuck.
+                    Text("Write #\(approval.sequence) in this run")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -123,6 +129,10 @@ struct ApprovalSheet: View {
             if approval.kind == .code {
                 Button("Approve all") { respond(true, true) }
                     .buttonStyle(.bordered)
+            } else {
+                Button("Approve all writes") { respond(true, true) }
+                    .buttonStyle(.bordered)
+                    .help("Approve this and every further device write in this run without asking again. The next run asks as usual.")
             }
             Button("Approve") { respond(true, false) }
                 .keyboardShortcut(.defaultAction)

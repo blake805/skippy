@@ -17,6 +17,10 @@ final class FactoryClient: ObservableObject {
     @Published var reFindings: [REFinding] = []
     @Published var reOpenPackId: String = ""
     @Published var reStudioDevices: [REDevice] = []
+    /// Wireless bench nodes the hub has heard from, health included.
+    @Published var benchNodes: [BenchNode] = []
+    /// What `re_devices` reported per bench host, filled when a node is picked.
+    @Published var reBenchDevices: [String: [REDevice]] = [:]
     @Published var reNotice: String = ""
     /// The repo panel: every repo's headline, the open repo in full, and the
     /// last commit/branch action's outcome.
@@ -24,8 +28,25 @@ final class FactoryClient: ObservableObject {
     @Published var gitDetail: GitRepoDetail?
     @Published var gitSelectedRepo: String = ""
     @Published var gitNotice: String = ""
+    /// A push/pull/new/clone is in flight; the buttons disable rather than
+    /// letting a second click race the first.
+    @Published var gitSyncing = false
+    /// The hub's GitHub connection (who the stored token maps to) and the
+    /// account's repositories, for the clone picker.
+    @Published var githubStatus: GitHubStatus?
+    @Published var githubRepos: [GitHubRepo] = []
+    /// The Files tab: one directory listing per expanded path of the selected
+    /// repo, and the file open in the viewer. Cleared when the repo changes.
+    @Published var fileListings: [String: [FileEntry]] = [:]
+    @Published var openFile: FileContent?
     @Published var pendingApproval: PendingApproval?
+    /// The human opted out of per-write cards for the rest of this run: every
+    /// further device_auth is answered APPROVE without a sheet, and noted on
+    /// the run card. Reset when the run ends — the next run asks again.
+    @Published var autoApproveWrites = false
     @Published var statusLine: String = "Disconnected"
+    /// How many write approvals this run has asked for, to number the cards.
+    private var deviceWriteCount = 0
 
     private let socket = WebSocketSession()
     private var history: [[String: String]] = []
@@ -79,6 +100,14 @@ final class FactoryClient: ObservableObject {
         socket.sendJSON(["action": "re_devices", "host": "studio"])
     }
 
+    func requestBridgeNodes() {
+        socket.sendJSON(["action": "bridge_nodes"])
+    }
+
+    func requestBenchDevices(host: String) {
+        socket.sendJSON(["action": "re_devices", "host": host])
+    }
+
     func addFinding(_ fields: [String: Any]) {
         var payload = fields
         payload["action"] = "re_add_finding"
@@ -92,6 +121,11 @@ final class FactoryClient: ObservableObject {
     }
 
     func requestGitDetail(_ repo: String) {
+        if repo != gitSelectedRepo {
+            // Listings and the open file belong to the previous repo.
+            fileListings = [:]
+            openFile = nil
+        }
         gitSelectedRepo = repo
         socket.sendJSON(["action": "git", "repo": repo])
     }
@@ -104,6 +138,57 @@ final class FactoryClient: ObservableObject {
 
     func gitBranch(repo: String, name: String, create: Bool) {
         socket.sendJSON(["action": "git_branch", "repo": repo, "name": name, "create": create])
+    }
+
+    /// Remote sync from the panel: the click is the approval, same as commit.
+    func gitPush(repo: String) {
+        gitSyncing = true
+        gitNotice = "Pushing…"
+        socket.sendJSON(["action": "git_push", "repo": repo])
+    }
+
+    func gitPull(repo: String) {
+        gitSyncing = true
+        gitNotice = "Pulling…"
+        socket.sendJSON(["action": "git_pull", "repo": repo])
+    }
+
+    func gitNew(name: String, isPrivate: Bool) {
+        gitSyncing = true
+        gitNotice = "Creating \(name)…"
+        socket.sendJSON(["action": "git_new", "name": name, "private": isPrivate])
+    }
+
+    func gitClone(fullName: String) {
+        gitSyncing = true
+        gitNotice = "Cloning \(fullName)…"
+        socket.sendJSON(["action": "git_clone", "full_name": fullName])
+    }
+
+    // MARK: - GitHub connection
+
+    func requestGitHubStatus() {
+        socket.sendJSON(["action": "github", "op": "status"])
+    }
+
+    /// Sends the PAT to the hub, which stores it server-side and answers with
+    /// the login it maps to. An empty token disconnects.
+    func setGitHubToken(_ token: String) {
+        socket.sendJSON(["action": "github", "op": "set_token", "token": token])
+    }
+
+    func requestGitHubRepos() {
+        socket.sendJSON(["action": "github", "op": "repos"])
+    }
+
+    // MARK: - File explorer (read-only)
+
+    func requestFiles(repo: String, path: String) {
+        socket.sendJSON(["action": "files", "repo": repo, "path": path])
+    }
+
+    func requestFile(repo: String, path: String) {
+        socket.sendJSON(["action": "file", "repo": repo, "path": path])
     }
 
     private func refreshGit() {
@@ -146,6 +231,8 @@ final class FactoryClient: ObservableObject {
         }
         isRunning = true
         statusLine = "Running…"
+        deviceWriteCount = 0
+        autoApproveWrites = false
         socket.sendJSON(payload)
     }
 
@@ -162,21 +249,30 @@ final class FactoryClient: ObservableObject {
         pendingApproval = nil
     }
 
-    /// Answer the pending approval. `approveAll` (code edits only) tells the hub
-    /// to stop asking for the rest of this run.
+    /// Answer the pending approval. For a code edit, `approveAll` tells the hub
+    /// to stop asking for the rest of the run. For a device write the hub has
+    /// no such scope, so `approveAll` arms client-side auto-approval instead:
+    /// each later card is still delivered, and this client answers it.
     func respondToApproval(approve: Bool, approveAll: Bool = false) {
         guard let pending = pendingApproval else { return }
         var payload: [String: Any] = ["status": approve ? "APPROVE" : "DENY"]
-        if approve, approveAll { payload["scope"] = "all" }
+        if approve, approveAll, pending.kind == .code { payload["scope"] = "all" }
         if let taskId = pending.taskId, !taskId.isEmpty {
             payload["task_id"] = taskId
         }
         socket.sendJSON(payload)
         let noun = pending.kind == .code ? "edit" : "device write"
-        let verb = approve ? (approveAll ? "Approved all edits" : "Approved \(noun)")
-                           : "Denied \(noun)"
+        let verb: String
+        if approve, approveAll {
+            verb = pending.kind == .code ? "Approved all edits"
+                 : "Approved device write — further writes in this run auto-approve"
+            if pending.kind == .device { autoApproveWrites = true }
+        } else {
+            verb = approve ? "Approved \(noun)" : "Denied \(noun)"
+        }
         appendToRun(TimelineItem(kind: .system, text: "\(verb)."))
         pendingApproval = nil
+        if isRunning { statusLine = "Running…" }
     }
 
     /// Route an event into the active run's card, or the chat lane when no
@@ -184,6 +280,7 @@ final class FactoryClient: ObservableObject {
     private func appendToRun(_ item: TimelineItem) {
         if let id = activeRunId, let index = runs.firstIndex(where: { $0.id == id }) {
             runs[index].items.append(item)
+            runs[index].lastEventAt = Date()
         } else {
             chatItems.append(item)
         }
@@ -265,6 +362,9 @@ final class FactoryClient: ObservableObject {
                 }
             }
             activeRunId = nil
+            // Consent was scoped to the run that asked; the next one asks anew.
+            autoApproveWrites = false
+            deviceWriteCount = 0
             // A finished run is new project history; refresh the rail. And it
             // may have changed or committed files, so refresh the repo panel
             // when it has been opened at least once.
@@ -289,8 +389,18 @@ final class FactoryClient: ObservableObject {
             if let error = msg["error"] as? String {
                 reNotice = error
             } else {
-                reStudioDevices = (msg["devices"] as? [[String: Any]] ?? []).map { REDevice(from: $0) }
+                let devices = (msg["devices"] as? [[String: Any]] ?? []).map { REDevice(from: $0) }
+                // The hub echoes which host it enumerated; a bench node's list
+                // must not clobber the studio's.
+                let host = msg["host"] as? String ?? "studio"
+                if host == "studio" {
+                    reStudioDevices = devices
+                } else {
+                    reBenchDevices[host] = devices
+                }
             }
+        case "bridge_nodes":
+            benchNodes = (msg["nodes"] as? [[String: Any]] ?? []).map { BenchNode(from: $0) }
         case "git":
             if let repos = msg["repos"] as? [[String: Any]] {
                 gitRepos = repos.map { GitRepoSummary(from: $0) }
@@ -305,11 +415,33 @@ final class FactoryClient: ObservableObject {
                 gitDetail = GitRepoDetail(payload: msg)
             }
         case "git_result":
+            gitSyncing = false
             if let error = msg["error"] as? String {
                 gitNotice = error
             } else {
                 gitNotice = msg["summary"] as? String ?? "Done."
                 refreshGit()
+            }
+        case "github":
+            if let repos = msg["repos"] as? [[String: Any]] {
+                githubRepos = repos.map { GitHubRepo(from: $0) }
+            } else {
+                githubStatus = GitHubStatus(payload: msg)
+            }
+        case "files":
+            let listing = FilesListing(payload: msg)
+            if let error = listing.error {
+                gitNotice = error
+            } else if listing.repo == gitSelectedRepo {
+                // A stale answer for a repo we've since left must not leak
+                // into the tree of the current one.
+                fileListings[listing.path] = listing.entries
+            }
+        case "file":
+            let content = FileContent(payload: msg)
+            if content.repo.isEmpty || content.repo == gitSelectedRepo {
+                // Errors ride along: the viewer says "binary file" in place.
+                openFile = content
             }
         case "re_finding_saved":
             if let error = msg["error"] as? String {
@@ -321,6 +453,7 @@ final class FactoryClient: ObservableObject {
                 if !pid.isEmpty { requestPack(pid) }
             }
         case "code_auth":
+            statusLine = "Waiting for your approval…"
             let explanation = msg["explanation"] as? String ?? "Skippy wants to change your files."
             let diff = msg["diff"] as? String ?? ""
             let files = (msg["files"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
@@ -337,12 +470,30 @@ final class FactoryClient: ObservableObject {
                 ?? msg["command"] as? String
                 ?? "Authorization required"
             let detail = prettyJSON(msg)
-            pendingApproval = PendingApproval(
-                taskId: msg["task_id"] as? String,
-                kind: .device,
-                explanation: explanation,
-                detail: detail
-            )
+            deviceWriteCount += 1
+            if autoApproveWrites {
+                // The human already said yes for the rest of this run. Answer
+                // for them, but keep a visible record of what was approved.
+                var payload: [String: Any] = ["status": "APPROVE"]
+                if let taskId = msg["task_id"] as? String, !taskId.isEmpty {
+                    payload["task_id"] = taskId
+                }
+                socket.sendJSON(payload)
+                appendToRun(TimelineItem(
+                    kind: .system,
+                    text: "Auto-approved write #\(deviceWriteCount): \(explanation)",
+                    detail: detail
+                ))
+            } else {
+                statusLine = "Waiting for your approval…"
+                pendingApproval = PendingApproval(
+                    taskId: msg["task_id"] as? String,
+                    kind: .device,
+                    explanation: explanation,
+                    detail: detail,
+                    sequence: deviceWriteCount
+                )
+            }
         case "error":
             appendToRun(TimelineItem(kind: .error, text: msg["message"] as? String ?? "Error"))
         default:

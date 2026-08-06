@@ -394,6 +394,248 @@ def test_git_branch_action_creates_and_reports_the_new_branch(client, tmp_path, 
         assert detail["branch"] == "feature/panel"
 
 
+def test_git_push_and_pull_round_trip_through_the_socket(client, tmp_path, monkeypatch):
+    """Panel push and pull against a bare on-disk origin: no card, no network."""
+    import subprocess
+
+    repo = _seed_repo(tmp_path / "proj")
+    bare = tmp_path / "origin.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main"], cwd=bare, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git_push", "repo": "proj"})
+        pushed = socket.receive_json()
+        assert pushed["type"] == "git_result"
+        assert pushed["ok"] is True
+        assert pushed["branch"] == "main"
+
+        socket.send_json({"action": "git_pull", "repo": "proj"})
+        pulled = socket.receive_json()
+        assert pulled["type"] == "git_result"
+        assert pulled["ok"] is True
+        assert pulled["up_to_date"] is True
+
+
+def test_git_push_without_a_remote_reports_the_error(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git_push", "repo": "proj"})
+        reply = socket.receive_json()
+    assert reply["type"] == "git_result"
+    assert "origin" in reply["error"]
+
+
+def test_git_new_creates_a_repo_under_the_workspace_root(client, tmp_path, monkeypatch):
+    home = tmp_path / "workspace"
+    home.mkdir()
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(home))
+    monkeypatch.setenv("SKIPPY_CONFIG_DIR", str(tmp_path / "config"))  # no token
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "git_new", "name": "scratch", "private": True})
+        reply = socket.receive_json()
+        assert reply["type"] == "git_result"
+        assert reply["ok"] is True
+        assert reply["github"] is False
+
+        socket.send_json({"action": "git"})
+        listing = socket.receive_json()
+        assert any(entry["name"] == "scratch" for entry in listing["repos"])
+
+
+def test_github_status_without_a_token_says_not_connected(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("SKIPPY_CONFIG_DIR", str(tmp_path / "config"))
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "github", "op": "status"})
+        reply = socket.receive_json()
+    assert reply["type"] == "github"
+    assert reply["connected"] is False
+
+
+def test_github_clearing_the_token_needs_no_network(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("SKIPPY_CONFIG_DIR", str(tmp_path / "config"))
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "github", "op": "set_token", "token": ""})
+        reply = socket.receive_json()
+    assert reply["type"] == "github"
+    assert reply["connected"] is False
+
+
+# --- the read-only file explorer -------------------------------------------
+
+def test_files_action_lists_a_directory_folders_first(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    (repo / "src").mkdir()
+    (repo / "src" / "main.py").write_text("print('hi')\n")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "files", "repo": "proj", "path": ""})
+        listing = socket.receive_json()
+        assert listing["type"] == "files"
+        names = [e["name"] for e in listing["entries"]]
+        assert names[0] == "src"           # folders first
+        assert "app.py" in names
+        assert ".git" not in names          # pruned, always
+
+        socket.send_json({"action": "files", "repo": "proj", "path": "src"})
+        nested = socket.receive_json()
+        assert [e["name"] for e in nested["entries"]] == ["main.py"]
+        assert nested["entries"][0]["dir"] is False
+        assert nested["entries"][0]["size"] > 0
+
+
+def test_file_action_returns_text_and_refuses_binary(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02\x03")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "file", "repo": "proj", "path": "app.py"})
+        text = socket.receive_json()
+        assert text["type"] == "file"
+        assert text["text"] == "x = 1\n"
+        assert text["truncated"] is False
+
+        socket.send_json({"action": "file", "repo": "proj", "path": "blob.bin"})
+        blob = socket.receive_json()
+        assert blob["type"] == "file"
+        assert "binary" in blob["error"].lower()
+
+
+def test_the_explorer_refuses_to_walk_out_of_the_repo(client, tmp_path, monkeypatch):
+    repo = _seed_repo(tmp_path / "proj")
+    (tmp_path / "outside.txt").write_text("secret\n")
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS", str(repo))
+
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "file", "repo": "proj", "path": "../outside.txt"})
+        reply = socket.receive_json()
+    assert reply["type"] == "file"
+    assert "error" in reply
+
+
+# --- who may connect, and what they may say (ADR 0020) ---------------------
+
+def test_without_a_token_configured_anyone_on_the_socket_still_works(client):
+    """Loopback development is unchanged: an unset token means no gate."""
+    with client.websocket_connect("/ws/factory?client_id=test") as socket:
+        socket.send_json({"action": "status"})
+        assert socket.receive_json()["type"] == "status"
+
+
+def test_a_configured_token_must_match(client, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect as StarletteDisconnect
+
+    monkeypatch.setenv("SKIPPY_FACTORY_TOKEN", "shared-secret")
+    with pytest.raises(StarletteDisconnect) as caught:
+        with client.websocket_connect("/ws/factory?client_id=test&token=wrong") as socket:
+            socket.receive_json()
+    # 1008 = policy violation, closed before accept: a scanner learns nothing.
+    assert caught.value.code == 1008
+
+
+def test_a_missing_token_is_refused_when_one_is_configured(client, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect as StarletteDisconnect
+
+    monkeypatch.setenv("SKIPPY_FACTORY_TOKEN", "shared-secret")
+    with pytest.raises(StarletteDisconnect):
+        with client.websocket_connect("/ws/factory?client_id=test") as socket:
+            socket.receive_json()
+
+
+def test_the_right_token_gets_in(client, monkeypatch):
+    monkeypatch.setenv("SKIPPY_FACTORY_TOKEN", "shared-secret")
+    with client.websocket_connect(
+        "/ws/factory?client_id=test&token=shared-secret"
+    ) as socket:
+        socket.send_json({"action": "status"})
+        assert socket.receive_json()["type"] == "status"
+
+
+def test_a_device_bridge_may_reply_and_greet_but_not_start_a_run(client):
+    """The bench node is an ESP32 on the LAN. If it is taken, the worst it can do
+    is lie about a voltage — not edit a repository through an agent run."""
+    import skippy_factory
+
+    with client.websocket_connect("/ws/factory?client_id=devices:bench") as socket:
+        socket.send_json({"type": "hello", "role": "devices", "node": "bench"})
+        socket.send_json({"task_id": "nobody-is-waiting", "ok": True, "result": {}})
+
+        socket.send_json({"mode": "Agent", "text": "rm -rf the repo", "history": []})
+        refusal = socket.receive_json()
+        assert refusal["type"] == "error"
+        assert "device bridge" in refusal["message"].lower()
+
+    assert skippy_factory.hub.pending_responses == {}
+
+
+def test_a_device_bridge_cannot_reach_the_dashboard_actions(client):
+    with client.websocket_connect("/ws/factory?client_id=devices") as socket:
+        socket.send_json({"action": "git_commit", "repo": "proj", "message": "sneaky"})
+        assert socket.receive_json()["type"] == "error"
+
+
+def test_a_bench_nodes_telemetry_reaches_the_app(client):
+    """The node pushes battery and signal; the app asks the hub, not the node."""
+    with client.websocket_connect("/ws/factory?client_id=devices:tele") as node:
+        node.send_json({"type": "hello", "role": "devices", "node": "tele",
+                        "firmware": "io-node 1.0"})
+        node.send_json({
+            "type": "node_status", "node": "tele", "battery": 82, "charging": False,
+            "rssi": -54, "ip": "192.168.1.42", "uptime_s": 120, "actions": 3,
+            "busy": False, "ports": ["uart", "i2c", "gpio", "adc"],
+        })
+
+        with client.websocket_connect("/ws/factory?client_id=app") as app:
+            app.send_json({"action": "bridge_nodes"})
+            reply = app.receive_json()
+
+    assert reply["type"] == "bridge_nodes"
+    node_entry = next(n for n in reply["nodes"] if n["client_id"] == "devices:tele")
+    assert node_entry["battery"] == 82
+    assert node_entry["rssi"] == -54
+    assert node_entry["firmware"] == "io-node 1.0"
+    # The name to pass as `host` in a device tool call, so the app can offer it.
+    assert node_entry["host"] == "tele"
+    assert node_entry["online"] is True
+
+
+def test_a_node_that_went_away_is_remembered_as_offline(client):
+    """A flat battery should read as 'last seen', not as a node that never was."""
+    with client.websocket_connect("/ws/factory?client_id=devices:gone") as node:
+        node.send_json({"type": "node_status", "node": "gone", "battery": 4})
+
+    with client.websocket_connect("/ws/factory?client_id=app") as app:
+        app.send_json({"action": "bridge_nodes"})
+        reply = app.receive_json()
+
+    entry = next(n for n in reply["nodes"] if n["client_id"] == "devices:gone")
+    assert entry["online"] is False
+    assert entry["battery"] == 4
+    assert entry["seen_seconds_ago"] >= 0
+
+
+def test_telemetry_from_a_bridge_is_not_mistaken_for_work(client):
+    """node_status is in the bridge's vocabulary, so it is neither refused nor run."""
+    with client.websocket_connect("/ws/factory?client_id=devices:quiet") as node:
+        node.send_json({"type": "node_status", "node": "quiet", "battery": 55})
+        # A real message after it still gets the bridge refusal, which proves the
+        # loop is alive and that the telemetry was consumed rather than answered.
+        node.send_json({"mode": "Agent", "text": "do work", "history": []})
+        assert node.receive_json()["type"] == "error"
+
+
+def test_an_ordinary_client_is_unaffected_by_the_bridge_rule(client):
+    with client.websocket_connect("/ws/factory?client_id=cursor") as socket:
+        socket.send_json({"action": "status"})
+        assert socket.receive_json()["type"] == "status"
+
+
 def test_disconnect_deregisters_the_client(client):
     import skippy_factory
 
@@ -404,12 +646,13 @@ def test_disconnect_deregisters_the_client(client):
 
 # --- where the hub listens ---
 #
-# There is no authentication on /ws/factory: client_id is a query parameter, and any
-# message that is not a reply, a greeting or a cancel starts an agent run. So the bind
-# address is the only thing between the local network and an agent that can edit the
-# workspace roots and run commands. ADR 0014 accepted the missing authentication on the
-# stated grounds that the bind was loopback; it was 0.0.0.0, and the SkippyServer boot
-# line runs `python skippy_factory.py`, which took that default.
+# Any message on /ws/factory that is not a reply, a greeting or a cancel starts an
+# agent run. With SKIPPY_FACTORY_TOKEN unset — the default, and what these tests run
+# with — the bind address is the only thing between the local network and an agent that
+# can edit the workspace roots and run commands. ADR 0014 accepted the missing
+# authentication on the stated grounds that the bind was loopback; it was 0.0.0.0, and
+# the SkippyServer boot line runs `python skippy_factory.py`, which took that default.
+# ADR 0020 added the token, for the wireless bench node that needs a LAN bind.
 
 def test_the_default_bind_is_loopback(monkeypatch):
     import skippy_factory
