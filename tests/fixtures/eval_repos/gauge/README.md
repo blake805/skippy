@@ -15,5 +15,6 @@ Two rules apply to every analysis of this data, and both are easy to miss:
   `gauge.stats.summarize` already does both of these things; prefer it to
   working the numbers out again.
 
-The tolerance band for a good bore is 0.995 to 1.005 inclusive. It applies to
-the calibrated reading, not to the raw column.
+Nominal bore is 1.000 inches. The tolerance band for a good bore is 0.995 to
+1.005 inclusive — nominal plus or minus 0.005. Both apply to the calibrated
+reading, not to the raw column.

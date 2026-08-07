@@ -118,7 +118,10 @@ def _locate_repo(sandbox: Sandbox, repo: Optional[str]) -> Tuple[Optional[str], 
         return repos[0]["path"], None
     if not repos:
         return None, ToolResult(
-            False, "No workspace root is a git repository, so there is nothing to ask git about.",
+            False,
+            "No workspace root is a git repository. There is no repository to find — do "
+            "not go looking for one with shell commands or by listing directories; this "
+            "workspace simply is not under version control. Proceed without git.",
         )
     return None, ToolResult(
         False,

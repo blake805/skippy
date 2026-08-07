@@ -277,6 +277,9 @@ class AgentLoop:
         # every test or linter run.
         self._verified: Optional[bool] = None
         self._finish_pushbacks = 0
+        # Files this run brought into existence, so that deleting them again can be
+        # recognized as cleanup rather than a change. See the patch handling below.
+        self._created_paths: set = set()
         # The command that last proved something green, kept so the run can leave behind
         # how this project is tested. Finding that out costs a session several steps of
         # guessing, and it is the same answer every time.
@@ -766,7 +769,11 @@ class AgentLoop:
 
             if finish is not None:
                 summary = str(finish.get("summary") or "").strip() or "Task reported complete."
-                for path in finish.get("files_changed") or []:
+                # Only a real list. The tool parser can hand an array-typed parameter
+                # back as a raw string when its content failed to parse, and iterating
+                # a string here would fill files_changed with single characters.
+                reported = finish.get("files_changed")
+                for path in reported if isinstance(reported, list) else []:
                     if isinstance(path, str) and path not in self.files_changed:
                         self.files_changed.append(path)
                 return self._outcome("finished", summary)
@@ -857,14 +864,29 @@ class AgentLoop:
             and result.data.get("files")
             and not result.data.get("dry_run")
         ):
-            for report in result.data["files"]:
+            reports = result.data["files"]
+            for report in reports:
                 path = report.get("path")
                 if path and path not in self.files_changed:
                     self.files_changed.append(path)
+            self._created_paths.update(
+                r.get("path") for r in reports if r.get("action") == "create"
+            )
             # Whatever was established by the last test run is no longer about this
             # tree. Reset rather than left, because "the tests passed" from before an
-            # edit is the most misleading state a run can finish in.
-            self._verified = None
+            # edit is the most misleading state a run can finish in. One exemption:
+            # a patch that only deletes files this same run created is cleanup, not a
+            # change — the tree the tests passed on is exactly the tree being handed
+            # over, minus scratch. Without this, deleting a throwaway check script
+            # re-arms the finish gate and the run re-verifies work it just verified.
+            cleanup_only = all(
+                r.get("action") == "delete" and r.get("path") in self._created_paths
+                for r in reports
+            )
+            if cleanup_only:
+                self._created_paths.difference_update(r.get("path") for r in reports)
+            else:
+                self._verified = None
             await self.emit({
                 "type": "agent_patch",
                 "step": self.step,

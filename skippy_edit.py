@@ -146,6 +146,17 @@ def apply_patch(
     rollback logic, which is where the dangerous bugs in this file have all been. A
     writer is expected to apply everything or nothing and to raise on failure.
     """
+    if isinstance(edits, str):
+        # The tool parser hands an array back as a raw string when its content failed
+        # to parse. Dispatch normally catches this first; said here too because the
+        # model believes it already sent a list, and "requires a list" alone teaches
+        # it to resend the same broken call.
+        return ToolResult(
+            False,
+            "'edits' arrived as text rather than a list — the call's arguments did "
+            "not parse. Re-send with 'edits' as a JSON array of edit objects, "
+            "escaping any quotes inside search/replace/content strings.",
+        )
     if not edits or not isinstance(edits, (list, tuple)):
         return ToolResult(False, "apply_patch requires a non-empty 'edits' list.")
 

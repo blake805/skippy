@@ -1229,6 +1229,24 @@ _SCHEMAS["list_extracted"] = {
 }
 
 
+def parameter_types(name: str) -> dict:
+    """Declared parameter types for one tool: {"edits": "array", "timeout": "number"}.
+
+    For dispatch's argument checking. The schemas are already the source of truth for
+    what the model is told; this makes them the source of truth for what the tools
+    accept, so a value that arrives with the wrong type — the tool parser falls back to
+    a raw string when a structured parameter fails to parse — is caught in one place
+    with a message the model can act on, rather than as a TypeError inside each tool.
+    """
+    schema = _SCHEMAS.get(name)
+    if not schema:
+        return {}
+    return {
+        key: str(prop.get("type", ""))
+        for key, prop in schema["parameters"].get("properties", {}).items()
+    }
+
+
 def _wrap(name: str) -> dict:
     schema = _SCHEMAS[name]
     return {

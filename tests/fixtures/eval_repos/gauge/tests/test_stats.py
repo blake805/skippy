@@ -12,6 +12,9 @@ def test_summarize_takes_the_offset_off():
 
 
 def test_the_calibrated_mean_is_below_nominal():
+    # Bounds, not the exact figures: an eval task grades an agent on producing the
+    # summarize() numbers, and a test that states them hands the answer to anything
+    # that greps the repo instead of running the code.
     mean, stdev = summarize()
-    assert round(mean, 4) == 0.9988
-    assert round(stdev, 4) == 0.0037
+    assert 0.995 < mean < 1.0
+    assert 0.0 < stdev < 0.005

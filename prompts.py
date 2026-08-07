@@ -20,16 +20,27 @@ it; the comments say which, so the text is not edited blind later.
 # exactly 25, which is the budget: it was never a judgment failure, it was the cost of
 # refusing to accept a negative result.
 #
-# Over-verification is the same defect wearing a different hat and is deliberately NOT
-# addressed here. The agent does waste steps re-confirming results it already has — on
+# Over-verification is the same defect wearing a different hat, and the first attempt
+# at a rule for it was reverted. The agent wastes steps re-confirming results it has — on
 # the gap-filling task, the answer was computed at step 9 and steps 10 to 22 re-read a
 # constant read at step 3 and rewrote scripts to check output already on screen. But a
 # rule telling it to stop ("verify the change you made, not the answer you already
 # have") measured worse: two of four runs then hit the step ceiling having produced
-# nothing and left the suite red, against two of two passing without it. The plausible
-# reading is that it competes with the rule above, and a model unsure whether it is
-# allowed to check spends more steps deciding than checking. Left alone until there is
-# a version that measures better.
+# nothing and left the suite red, against two of two passing without it. Samples that
+# small prove nothing on their own (Fisher exact p≈0.4) — the revert stands on the
+# failures being catastrophic in kind and on the default winning ties, not on the
+# counts. The plausible reading is that it competes with the rule above, and a model
+# unsure whether it is allowed to check spends more steps deciding than checking.
+#
+# The version that measures better is the "one green run is complete verification"
+# rule below. It defines when checking is finished rather than questioning whether
+# checking is allowed, which is why it does not compete with "run the tests". A/B on
+# the conventions task, 5 runs per arm, after the finish-gate cleanup exemption and
+# the terminal no-repo message landed: without it 12/14/14/15/17 steps, with it
+# 9/13/13/14/14, every run in both arms finishing green. Not significant on its own
+# (Mann-Whitney U=6, p≈0.22) — it stays because the failure mode that reverted the
+# previous wording (ceiling hits, red finishes) did not appear at all, so the mild
+# step win comes without the downside that decision was actually about.
 AGENT_SYSTEM = """You are Skippy, an expert software engineer and reverse engineer \
 working directly in the user's repositories.
 
@@ -58,6 +69,9 @@ to change something is not permission to build it.
 you wrote, not that it works. If the project has a test suite, run it; if your change \
 should have a test, add one and watch it pass. A change you have not executed is a \
 guess.
+- One green run of the project's own suite after your last edit is complete \
+verification. Do not then prove the same result a second way — a scratch script, \
+re-reading the files, an extra spot-check — it adds no information and spends steps.
 - If tests fail, fix the cause rather than the test, unless the test is what is wrong.
 - Remote sync exists: git_push and git_pull talk to the repo's origin on GitHub. \
 Both ask the human for approval first, the way a commit does — use them when the \

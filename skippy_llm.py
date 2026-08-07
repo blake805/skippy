@@ -268,6 +268,7 @@ async def query_message(
     last_error = "no attempts made"
     try:
         for attempt in range(attempts):
+            disconnected = False
             try:
                 response = await http.post(target.url, json=payload, headers=headers, timeout=timeout)
                 if response.status_code == 200:
@@ -281,17 +282,32 @@ async def query_message(
                 last_error = f"HTTP {response.status_code}: {response.text[:400]}"
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                # A connection that opened and then died without a response. This is
+                # the shape a server-side generation crash arrives in — distinct from
+                # a refused connection (server down) or an HTTP error (server spoke).
+                disconnected = isinstance(
+                    exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout)
+                )
             logger.warning(
                 "%s endpoint attempt %d/%d failed: %s", role, attempt + 1, attempts, last_error
             )
             if attempt + 1 < attempts:
-                # Warm the sampler a little on each retry. Not every failure here is the
-                # endpoint being down: mlx_lm's Qwen3-Coder tool parser crashes its own
-                # handler thread on a tool call it cannot parse, which reaches us as a
-                # bare disconnect, and at temperature 0.1 against a warm prompt cache the
-                # retry regenerates near-identical text and dies identically. Three
-                # attempts at the same payload is one attempt billed three times.
-                payload["temperature"] = min(temp + 0.15 * (attempt + 1), 1.0)
+                if disconnected:
+                    # Warm the sampler, but only for the disconnect case: mlx_lm's
+                    # Qwen3-Coder tool parser crashes its own handler thread on a tool
+                    # call it cannot parse, which reaches us as a bare disconnect, and
+                    # at temperature 0.1 against a warm prompt cache the retry
+                    # regenerates near-identical text and dies identically. A refused
+                    # connection or an HTTP error is not that: the payload was never
+                    # the problem, and the caller should get the temperature it asked
+                    # for. Logged, because a silently mutated sample contaminates
+                    # anything that is measuring.
+                    payload["temperature"] = min(temp + 0.15 * (attempt + 1), 1.0)
+                    logger.warning(
+                        "%s retry %d perturbs temperature %.2f -> %.2f (disconnect; an "
+                        "identical payload would likely die identically)",
+                        role, attempt + 2, temp, payload["temperature"],
+                    )
                 await asyncio.sleep(2.0 * (2 ** attempt))
     finally:
         if owned_client:

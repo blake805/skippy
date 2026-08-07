@@ -14,8 +14,11 @@ pre-images go can arrange for them not to exist.
 
 import asyncio
 import inspect
+import json
 import logging
 from typing import Any, Dict, Optional
+
+import tool_schemas
 
 import skippy_brief
 import skippy_device
@@ -138,6 +141,77 @@ def _expected(name: str) -> str:
     return ", ".join(params)
 
 
+def _check_argument_types(name: str, args: Dict[str, Any]) -> Optional[ToolResult]:
+    """Repair or refuse arguments whose type disagrees with the tool's schema.
+
+    Exists because of the tool parser's fallback: when a structured parameter fails to
+    parse server-side (code in an apply_patch edit is the live case), the patched
+    Qwen3-Coder parser hands back the raw string rather than crashing its handler
+    thread. That string reaching a tool as-is is the "silently misbehaves" class —
+    a str where a list was expected iterates character by character. So: coerce when
+    the repair is unambiguous, refuse with a message that names the argument and says
+    how to re-send when it is not. Mutates `args` in place; returns the refusal, or
+    None when everything conforms.
+    """
+    declared = tool_schemas.parameter_types(name)
+    for key, value in list(args.items()):
+        expected = declared.get(key, "")
+
+        if expected in ("array", "object"):
+            if isinstance(value, (list, dict)):
+                continue
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, (list, dict)):
+                    args[key] = parsed
+                    continue
+            return ToolResult(
+                False,
+                f"'{key}' for '{name}' must be a JSON {expected}, but it arrived as "
+                "text that does not parse — usually because quotes or code inside it "
+                f"broke the tool-call syntax. Re-send the call with '{key}' as valid "
+                "JSON, escaping any quotes inside string values.",
+                str(value)[:400],
+            )
+
+        if expected in ("integer", "number"):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                if isinstance(value, str):
+                    try:
+                        args[key] = int(value) if expected == "integer" else float(value)
+                        continue
+                    except ValueError:
+                        pass
+                return ToolResult(
+                    False,
+                    f"'{key}' for '{name}' must be a {expected}, got {value!r}. "
+                    "Re-send with a numeric value.",
+                )
+            if expected == "integer" and isinstance(value, float):
+                if value.is_integer():
+                    args[key] = int(value)
+                    continue
+                return ToolResult(
+                    False,
+                    f"'{key}' for '{name}' must be a whole number, got {value!r}.",
+                )
+            continue
+
+        if expected == "boolean" and not isinstance(value, bool):
+            lowered = str(value).strip().lower()
+            if lowered in ("true", "false"):
+                args[key] = lowered == "true"
+                continue
+            return ToolResult(
+                False,
+                f"'{key}' for '{name}' must be true or false, got {value!r}.",
+            )
+    return None
+
+
 async def dispatch(
     name: str,
     args: Optional[dict],
@@ -187,6 +261,14 @@ async def dispatch(
         "service", "approver", "session", "brief",
     ):
         args.pop(injected, None)
+
+    # After the injected names are gone, so only what the model actually sent is
+    # checked, and before the tool runs, so a wrong type becomes an observation the
+    # model can correct rather than an exception inside the tool.
+    refusal = _check_argument_types(name, args)
+    if refusal is not None:
+        return refusal
+
     if name == "apply_patch":
         if journal_dir:
             args["journal_dir"] = journal_dir

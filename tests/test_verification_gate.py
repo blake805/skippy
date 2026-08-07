@@ -244,6 +244,52 @@ async def test_a_refused_finish_does_not_end_the_run_early(box, routed_llm):
     assert outcome.steps == 4
 
 
+@pytest.mark.asyncio
+async def test_deleting_a_scratch_file_the_run_created_does_not_rearm_the_gate(
+    box, routed_llm
+):
+    """The cleanup ritual, verbatim from live traces: edit, run the suite, write a
+    throwaway check script, run it, delete it, finish. The tree being handed over is
+    exactly the tree the checks passed on, minus scratch — re-arming the gate on the
+    delete makes the run verify work it just verified, two steps at a time."""
+    outcome = await run(box, [
+        edit(),
+        command("python -m pytest -q"),
+        fl.tool_call("apply_patch", call_id="c3", edits=[
+            {"path": "scratch_check.py", "action": "create", "content": "print('ok')\n"},
+        ]),
+        command("python scratch_check.py", call_id="c4"),
+        fl.tool_call("apply_patch", call_id="c5", edits=[
+            {"path": "scratch_check.py", "action": "delete"},
+        ]),
+        finish(summary="Edited, checked, scratch removed."),
+    ], routed_llm)
+
+    assert outcome.status == "finished"
+    assert routed_llm.remaining == 0
+    assert not [o for o in routed_llm.observations() if "have not run anything" in o]
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_file_the_repo_shipped_with_still_rearms_the_gate(
+    box, routed_llm
+):
+    """The exemption is for the run's own scratch, nothing wider. Deleting a file that
+    existed before the run is a real change to the tree, and inheriting a green verdict
+    across it is exactly the misleading state the reset exists to prevent."""
+    await run(box, [
+        edit(),
+        command("python -m pytest -q"),
+        fl.tool_call("apply_patch", call_id="c3", edits=[
+            {"path": "tests/test_ops.py", "action": "delete"},
+        ]),
+        finish(),
+        finish(call_id="c10"),
+    ], routed_llm)
+
+    assert [o for o in routed_llm.observations() if "have not run anything" in o]
+
+
 # -- what the run leaves behind ---------------------------------------------
 
 @pytest.mark.asyncio

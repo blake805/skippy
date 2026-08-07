@@ -224,6 +224,11 @@ class Result:
     changed: List[str] = field(default_factory=list)
     seconds: float = 0.0
     error: str = ""
+    # How many times the endpoint killed this task before the recorded attempt. On the
+    # board so a verdict that needed a retry is distinguishable from one that ran cold:
+    # errors correlate with what the model emitted, so a retried pass is weaker
+    # evidence than it looks and the count is the only way to see how much weaker.
+    retried: int = 0
 
     @property
     def errored(self) -> bool:
@@ -236,6 +241,10 @@ class Result:
             detail = "  <- " + self.error
         else:
             detail = "" if self.passed else "  <- " + "; ".join(self.failures)
+        if self.retried and not self.errored:
+            # Said on the line, not buried in the JSON: a verdict that needed the
+            # endpoint restarted under it is weaker evidence than one that ran cold.
+            detail += f"  [verdict from retry {self.retried}]"
         return (
             f"  {mark:5} {self.task:34} {self.status:22} "
             f"{self.steps:3} steps  {self.seconds:6.1f}s{detail}"
@@ -311,6 +320,14 @@ async def run_task(task: Task, max_steps: int = DEFAULT_MAX_STEPS, verbose: bool
             return result
 
         result.failures = grade(task, root, result.changed, outcome)
+        # A pass requires finish. The loop's own contract says running out of steps is
+        # never success, and the board must not disagree with the thing it measures: the
+        # finish summary is the product the next session opens with, so a run that
+        # wandered into the right file state without ever deciding it was done delivered
+        # a diff with no handoff. Named first and separately, so the board says this is
+        # a termination failure rather than a competence one.
+        if outcome.status != "finished":
+            result.failures.insert(0, f"never called finish (ended as '{outcome.status}')")
         result.passed = not result.failures
     return result
 
@@ -345,6 +362,7 @@ def summarize(results: List[Result]) -> dict:
                 "changed": r.changed,
                 "failures": r.failures,
                 "error": r.error,
+                "retried": r.retried,
             }
             for r in results
         },
@@ -379,6 +397,9 @@ def report(results: List[Result], against: Optional[dict] = None) -> str:
     )
     if board["errored"]:
         headline += f", {board['errored']} errored and not scored"
+    retried = sum(1 for r in results if r.retried)
+    if retried:
+        headline += f", {retried} needed a retry"
     lines = ["", headline, ""]
     lines += [r.line() for r in results]
 
@@ -434,11 +455,12 @@ async def run_all(
     for task in tasks:
         print(f"  .. {task.name}", flush=True)
         result = await run_task(task, max_steps=max_steps, verbose=verbose)
-        for _ in range(retries):
+        for attempt in range(retries):
             if not result.errored:
                 break
             print(f"     retrying, {result.error}", flush=True)
             result = await run_task(task, max_steps=max_steps, verbose=verbose)
+            result.retried = attempt + 1
         results.append(result)
     return results
 

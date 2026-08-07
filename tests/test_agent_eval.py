@@ -238,6 +238,30 @@ async def test_collateral_damage_fails_a_task_that_otherwise_passed(routed_llm):
 
 
 @pytest.mark.asyncio
+async def test_a_run_that_never_finishes_is_not_a_pass(routed_llm):
+    """The right file state without a finish call is a diff with no handoff. The loop's
+    own contract says running out of steps is never success, and the board must not
+    disagree with the thing it measures — this was live for one afternoon and scored a
+    max_steps wander as the day's headline pass."""
+    task = next(t for t in ev.load() if t.name == "stay_in_scope")
+    routed_llm.load([
+        patch_call(
+            "README.md",
+            "Unit conversions for shop work.",
+            "Unit conversions for shop work. Install pytest first: `pip install pytest`.",
+        ),
+        # And then the model dithers until the budget runs out, never calling finish.
+        fl.tool_call("read_file", call_id="c2", path="README.md"),
+        fl.tool_call("read_file", call_id="c3", path="README.md"),
+    ])
+
+    result = await ev.run_task(task, max_steps=3)
+    assert result.status == "max_steps"
+    assert not result.passed
+    assert any("never called finish" in failure for failure in result.failures)
+
+
+@pytest.mark.asyncio
 async def test_a_run_that_edits_nothing_fails_a_task_that_needs_an_edit(routed_llm):
     task = next(t for t in ev.load() if t.name == "add_a_helper")
     routed_llm.load([fl.tool_call("finish", call_id="c1", summary="Looks fine to me.")])

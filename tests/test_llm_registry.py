@@ -237,6 +237,28 @@ async def test_retry_temperature_stays_in_range():
     assert all(0.0 <= t <= 1.0 for t in temps), temps
 
 
+async def test_an_http_error_retry_keeps_the_requested_temperature():
+    """The perturbation is scoped to disconnects, where resending the identical payload
+    is provably useless. An HTTP error means the server answered — the payload was
+    never the problem — and a caller that asked for 0.1 should be sampled at 0.1,
+    because a silently mutated temperature contaminates anything that is measuring."""
+    temps = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        temps.append(json.loads(request.content)["temperature"])
+        if len(temps) < 2:
+            return httpx.Response(500, text="upstream exploded")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with mock_client(handler) as client:
+        message = await skippy_llm.query_message(
+            [{"role": "user", "content": "x"}], temp=0.1, client=client
+        )
+
+    assert message["content"] == "ok"
+    assert temps == [0.1, 0.1], temps
+
+
 async def test_repetition_penalty_widens_the_context_window():
     seen = {}
 
