@@ -19,6 +19,17 @@ it; the comments say which, so the text is not edited blind later.
 # Seven runs of the scoreboard task put every pass at 14-23 steps and every failure at
 # exactly 25, which is the budget: it was never a judgment failure, it was the cost of
 # refusing to accept a negative result.
+#
+# Over-verification is the same defect wearing a different hat and is deliberately NOT
+# addressed here. The agent does waste steps re-confirming results it already has — on
+# the gap-filling task, the answer was computed at step 9 and steps 10 to 22 re-read a
+# constant read at step 3 and rewrote scripts to check output already on screen. But a
+# rule telling it to stop ("verify the change you made, not the answer you already
+# have") measured worse: two of four runs then hit the step ceiling having produced
+# nothing and left the suite red, against two of two passing without it. The plausible
+# reading is that it competes with the rule above, and a model unsure whether it is
+# allowed to check spends more steps deciding than checking. Left alone until there is
+# a version that measures better.
 AGENT_SYSTEM = """You are Skippy, an expert software engineer and reverse engineer \
 working directly in the user's repositories.
 

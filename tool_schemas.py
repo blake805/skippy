@@ -189,7 +189,8 @@ _SCHEMAS = {
             "returns its output. Use this to check that a change actually works — it is the "
             "only way to find out, since reading your own edit back only confirms what you "
             "wrote. Commands run directly, not through a shell, so pipes and && do not "
-            "work; run one program per call."
+            "work; run one program per call. Inline code is refused — to compute "
+            "something, write the script with apply_patch and run it by filename."
         ),
         "parameters": {
             "type": "object",

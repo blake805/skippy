@@ -123,6 +123,31 @@
       ]
     },
     {
+      "name": "build_a_tool_when_reading_will_not_do",
+      "repo": "gauge",
+      "pins": "the gap-filling loop: when a job is past what a tool call can show you, write something that computes it",
+      "prompt": "readings.csv holds three thousand bore measurements. Work out how many good readings fall outside the tolerance band, and which single reading sits furthest from nominal. Put both answers in a new FINDINGS.md.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "contains", "path": "FINDINGS.md", "pattern": "192"},
+        {"kind": "contains", "path": "FINDINGS.md", "pattern": "R0979"},
+        {"kind": "not_contains", "path": "FINDINGS.md", "pattern": "557"},
+        {"kind": "not_contains", "path": "FINDINGS.md", "pattern": "214"}
+      ]
+    },
+    {
+      "name": "use_the_tool_that_already_exists",
+      "repo": "gauge",
+      "pins": "the inverse of gap-filling: a tool you already have beats one you write, and rewriting it silently gets the wrong answer",
+      "prompt": "Write a SUMMARY.md giving the mean and the standard deviation of the bore readings, to four decimal places.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "unchanged", "path": "gauge/stats.py"},
+        {"kind": "contains", "path": "SUMMARY.md", "pattern": "0\\.9988"},
+        {"kind": "contains", "path": "SUMMARY.md", "pattern": "0\\.0037"}
+      ]
+    },
+    {
       "name": "verify_before_claiming_done",
       "repo": "spindle",
       "pins": "'A change you have not executed is a guess' — the obvious edit breaks a test elsewhere",

@@ -242,6 +242,22 @@ def test_the_memory_tools_are_offered_in_both_modes():
     assert {"record_decision", "recall_project"} <= re_mode
 
 
+def test_run_command_warns_off_the_inline_code_the_allowlist_refuses():
+    """Measured, not guessed. Given a job needing a calculation, the model reached for
+    `python -c` first on every eval run, ate the rejection, and only then wrote a
+    script — one to two steps each time, on a task that finished at 24 of 25. The
+    allowlist has always refused it; nothing told the model before it tried."""
+    description = tool_schemas._SCHEMAS["run_command"]["description"].lower()
+    assert "inline code is refused" in description
+    assert "apply_patch" in description
+
+    # And the description is not just a claim: the allowlist really does refuse it,
+    # and really does allow the alternative the description sends the model to.
+    with pytest.raises(skippy_exec.CommandRejected):
+        skippy_exec.validate("python -c 'print(1)'", mode="coding")
+    assert skippy_exec.validate("python analyze.py", mode="coding")
+
+
 def test_record_decision_asks_for_reasoning_and_warns_off_restating_the_diff():
     """Without the warning it writes "changed ops.py to add retry", which the diff
     already says and which is worth nothing to a later session."""
