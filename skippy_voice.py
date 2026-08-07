@@ -77,7 +77,9 @@ import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import prompts
+import skippy_gate
 import skippy_llm
+import skippy_paths
 
 logger = logging.getLogger("skippy_voice")
 
@@ -893,6 +895,11 @@ class VoiceSession:
         self.client_id = f"voice-{os.urandom(3).hex()}"
         self._tap: Optional[_TaskTap] = None
         self._background: List[asyncio.Task] = []
+        # The research budget and cache for this conversation, and the decision behind
+        # a check currently in flight. Per session, because that is the scope a budget
+        # means anything in.
+        self.research = skippy_gate.Conversation()
+        self._checking: Optional[skippy_gate.Decision] = None
 
     # -- inbound ----------------------------------------------------------
 
@@ -964,8 +971,19 @@ class VoiceSession:
         # The action lane runs before the reply is generated, so the persona
         # reports what actually happened instead of improvising what might.
         note = None
-        if _actions_enabled() and self.history and wants_action(self.history[-1]["content"]):
+        latest = self.history[-1]["content"] if self.history else ""
+        if _actions_enabled() and latest and wants_action(latest):
             note = await self._route_and_act()
+
+        # The research gate runs only when the utterance was not an action. Two cold
+        # classifier calls before a spoken reply would cost the second of latency this
+        # lane exists to protect, and an utterance that was a request to do something is
+        # not also a question to go and check.
+        checking = False
+        if note is None and latest:
+            checking = await self._maybe_check(latest)
+            if checking:
+                note = skippy_gate.acknowledgment(self._checking, spoken=True)
 
         trimmed = self.history[-2 * self.MAX_HISTORY:]
         messages = [{"role": "system", "content": self.system_prompt}] + trimmed
@@ -1077,6 +1095,14 @@ class VoiceSession:
             reply = " ".join(spoken).strip()
             if reply:
                 self.history.append({"role": "assistant", "content": reply})
+            # The second layer, behind the delivered reply so it costs no latency: ask
+            # the model that just answered whether what it said should be checked.
+            # Skipped when a check is already running on this turn — grading an answer
+            # that was deliberately hedged would start a second run on the same thing.
+            if reply and not checking:
+                self._background.append(
+                    asyncio.create_task(self._check_after(latest, reply))
+                )
             await self._send_json({
                 "type": "metrics",
                 "stt_ms": stt_ms,
@@ -1232,6 +1258,70 @@ class VoiceSession:
             )
 
         return None
+
+    # -- checking his own work ----------------------------------------------
+    #
+    # Same shape as ask_heavy below: acknowledge in the reply, work in the background,
+    # speak up when it lands. Nothing here ever makes the user wait — a spoken
+    # conversation that stops for ten seconds while Skippy reads the internet is a
+    # broken conversation, however good the eventual answer is.
+
+    async def _maybe_check(self, text: str) -> bool:
+        """Decide whether to check this turn, and start doing it. See skippy_gate."""
+        decision = await skippy_gate.pre_answer(
+            text, self.history[:-1], role=_env("SKIPPY_VOICE_ROLE", "voice")
+        )
+        return self._start_check(decision)
+
+    async def _check_after(self, text: str, reply: str) -> None:
+        decision = await skippy_gate.post_answer(
+            text, reply, role=_env("SKIPPY_VOICE_ROLE", "voice")
+        )
+        self._start_check(decision)
+
+    def _start_check(self, decision) -> bool:
+        """Begin a background check, unless this conversation cannot afford one.
+
+        False means the answer stands unchecked and the persona is told nothing —
+        promising to go and verify something and then not doing it is worse than never
+        having offered.
+        """
+        if not decision:
+            return False
+        conversation = self.research
+        if conversation.key(decision.question) in conversation.in_flight:
+            return False
+        if conversation.recall(decision.question) is None and not conversation.allows():
+            logger.info("Research budget spent for this session; answering unchecked.")
+            return False
+        logger.info("Checking %r (%s: %s)", decision.question, decision.layer, decision.reason)
+        self._checking = decision
+        self._background.append(asyncio.create_task(self._deliver_check(decision)))
+        return True
+
+    async def _deliver_check(self, decision) -> None:
+        try:
+            result = await skippy_gate.check(
+                decision.question,
+                self.research,
+                roots=skippy_paths.configured_workspace_roots(),
+            )
+        except Exception:
+            logger.exception("Background check failed")
+            return
+        spoken = skippy_gate.report(result, spoken=True)
+        if not spoken:
+            return
+        if result.error:
+            self.announce(spoken)
+            return
+        # Out loud, the answer is trimmed to something a person can listen to. The full
+        # write-up with its citations is in the brief, and saying where it is is more
+        # use than reading forty seconds of URLs aloud.
+        self.announce(
+            f"I checked that. {_first_sentences(spoken, 3, 600)} "
+            "The sources are in the brief if you want them."
+        )
 
     async def _ask_heavy(self, question: str) -> None:
         try:

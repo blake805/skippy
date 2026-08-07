@@ -176,8 +176,59 @@ INSPECTION_RULES: Dict[str, Rule] = {
     "git": Rule(subcommands=GIT_READ_ONLY, forbidden_flags=GIT_FORBIDDEN_FLAGS),
 }
 
-MODES = {"coding": CODING_RULES, "re": INSPECTION_RULES}
+# Research mode runs no commands at all. The empty table is not an oversight and not a
+# placeholder: a research run is offered no `run_command` in the first place, and this
+# is what makes that hold a second time if one ever reaches the dispatcher. Nothing a
+# page said should be able to become a process on this machine.
+RESEARCH_RULES: Dict[str, Rule] = {}
+
+# A sub-run answering a question about the code runs nothing either, and for a sharper
+# reason than research does: it exists inside another run that is already working on the
+# same tree. Two things executing against one working copy with no coordination between
+# them is how you get a test result that describes neither state.
+INVESTIGATION_RULES: Dict[str, Rule] = {}
+
+MODES = {
+    "coding": CODING_RULES,
+    "re": INSPECTION_RULES,
+    "research": RESEARCH_RULES,
+    "investigate": INVESTIGATION_RULES,
+}
 DEFAULT_MODE = "coding"
+
+# Programs whose exit code says something about whether an edit works. The agent loop
+# uses this to tell "I ran the tests" from "I looked at the tests", so that finishing a
+# run can require evidence rather than a claim.
+#
+# `git` is deliberately absent even though it is allowlisted: `git diff` shows what
+# changed, which is not the same as showing that it works, and counting it would let a
+# run discharge the requirement by reading its own patch back. `python` is present
+# because `python -m pytest` is how the suite is usually invoked here, and because
+# running a script in the repo is executing the change — which is the whole point.
+VERIFICATION_PROGRAMS = frozenset({
+    "pytest", "tox", "nox", "make", "cargo", "go", "swift", "npm", "yarn", "pnpm",
+    "node", "python", "ruff", "mypy", "black", "flake8", "pyflakes", "eslint",
+    "prettier", "tsc", "cargo-clippy", "gofmt", "swiftformat", "shellcheck",
+})
+
+
+def is_verification(command: str) -> bool:
+    """True when this command's exit code is evidence about an edit.
+
+    Parsed the same way `validate` parses it — basename, versioned python names folded
+    together — so that `python3.11 -m pytest` counts exactly as `pytest` does. Anything
+    unparseable is not evidence.
+    """
+    try:
+        argv = shlex.split(str(command or ""))
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    program = os.path.basename(argv[0])
+    if _PYTHON_NAME.match(program):
+        program = "python"
+    return program in VERIFICATION_PROGRAMS
 
 # Environment is allowlisted, not filtered. A denylist of secret-looking names is a
 # guessing game, and the code that inherits this is the repo's own test suite —
@@ -329,14 +380,29 @@ def validate(command: str, mode: str = DEFAULT_MODE) -> List[str]:
 
     rule = table.get(program)
     if rule is None:
-        purpose = (
-            "This list is for static inspection of an artifact; nothing here can run it. "
-            "Running the target is dynamic analysis, which needs a VM rather than another "
-            "entry on this list."
-            if mode == "re" else
-            "This list is for running tests, linters and builds; if you need something "
-            "else, say so in your finish summary instead."
-        )
+        if mode == "re":
+            purpose = (
+                "This list is for static inspection of an artifact; nothing here can run "
+                "it. Running the target is dynamic analysis, which needs a VM rather than "
+                "another entry on this list."
+            )
+        elif mode == "research":
+            purpose = (
+                "A research run executes nothing at all: it reads the web and records what "
+                "it found. Answer from your sources, and say in your finish summary what "
+                "you could not establish without running something."
+            )
+        elif mode == "investigate":
+            purpose = (
+                "You are answering a question by reading, inside a run that is already "
+                "working on this tree. Read the code and say what you found; if the "
+                "answer needs something run, say so and let the caller decide."
+            )
+        else:
+            purpose = (
+                "This list is for running tests, linters and builds; if you need something "
+                "else, say so in your finish summary instead."
+            )
         raise CommandRejected(
             f"'{program}' is not an allowed program. Allowed: "
             f"{', '.join(allowed_programs(mode))}. {purpose}"

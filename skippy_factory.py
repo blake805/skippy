@@ -462,6 +462,22 @@ async def factory_endpoint(
                 })
                 continue
 
+            # Saying something to a run that is already going. Until this existed the
+            # only thing you could say to a working agent was "stop", so watching one
+            # take a wrong turn meant killing it and losing the good half of the work
+            # with the bad.
+            if data.get("action") == "steer":
+                heard = runner.steer(client_id, str(data.get("text") or ""))
+                await websocket.send_json({
+                    "type": "chat",
+                    "content": (
+                        "Passed that on; it lands at the next step."
+                        if heard else
+                        "There is no run to say that to."
+                    ),
+                })
+                continue
+
             # Started rather than awaited: this loop is the only reader of the socket,
             # so awaiting the run here would mean no cancel could ever arrive.
             await runner.start(client_id, data)

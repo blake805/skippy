@@ -1,11 +1,17 @@
 # Skippy
 
-Skippy is a fully-local AI workbench: a coding and reverse-engineering agent that
-runs on a Mac Studio (M3 Ultra, 512GB unified memory) with no cloud LLM in the
-runtime path, plus the apps and hardware that put it everywhere work happens —
-a native Mac client, an iPhone client, a Cursor/VS Code extension, a wireless
-voice puck, and a battery-powered bench probe that gives the agent physical
-hands on real hardware over Wi-Fi or Bluetooth.
+Skippy is a locally-hosted AI workbench: a coding, reverse-engineering and
+research agent that runs on a Mac Studio (M3 Ultra, 512GB unified memory) with
+no cloud LLM in the runtime path, plus the apps and hardware that put it
+everywhere work happens — a native Mac client, an iPhone client, a Cursor/VS
+Code extension, a wireless voice puck, and a battery-powered bench probe that
+gives the agent physical hands on real hardware over Wi-Fi or Bluetooth.
+
+**The models are local; the facts are not.** Skippy reads the web — searching
+and reading pages through a research API, and doing it on his own when he is not
+sure enough about an answer to leave it standing. Everything fetched is treated
+as untrusted input, and no page can reach a tool that changes anything. See
+[Web research](#web-research-and-checking-his-own-work).
 
 ## The system at a glance
 
@@ -51,6 +57,20 @@ decompiler, no JVM), firmware carving with unblob inside a hardened container,
 and an inspection-only command allowlist. Weakness findings carry severity and
 flow into project memory as work items, so the next *coding* session opens
 knowing what needs fixing.
+
+### Web research, and checking his own work
+
+A third mode of the same agent loop, with the web instead of a repository. It
+plans sub-questions, searches, reads several sources over a few rounds, records
+each claim against the pages that support it, and writes an answer with
+citations. The product is a **brief** — the sources as they read on the day, the
+claims, and the answer — filed under the question, so asking it again next month
+opens the work rather than repeating it.
+
+More usefully, it fires without being asked. When a turn is about something with
+a date on it, or when Skippy's own verdict on what he just said is shaky, he
+answers now, checks behind it, and follows up with what he found. See
+[The research gate](#the-research-gate).
 
 ### Device I/O — real hardware on the bench
 
@@ -328,6 +348,101 @@ commits. See ADRs
 [0018](docs/adr/0018-rizin-structured-tools.md),
 [0019](docs/adr/0019-containerised-extraction.md).
 
+### Web research
+
+The "no network in the runtime path" constraint has been dropped on purpose.
+What replaces it is narrower and, for tools that read the internet, more
+important: **the network is an input, and everything it returns is untrusted.**
+
+```bash
+export SKIPPY_TAVILY_KEY="tvly-..."     # the search backend's key
+export SKIPPY_SEARCH_BACKEND=tavily     # swap providers without touching code
+```
+
+- **Untrusted by construction.** Every fetched page and every search snippet
+  arrives fenced and labelled as data, with the "not instructions" warning
+  beside the content on every observation rather than once in a system prompt. A
+  page that forges the closing fence has its marker defanged on the way in.
+  Research mode is offered no `apply_patch`, no filesystem tools and an empty
+  command table, so the worst a hostile page can reach is another search.
+- **Chunks, not truncation.** `web_fetch` strips scripts, navigation and page
+  furniture with stdlib `HTMLParser`, prefers `<main>`/`<article>`, and splits
+  long pages into numbered chunks sized to stay under the loop's compression
+  threshold — so a version table two-thirds down a page is still reachable, and
+  a citation survives the trip intact.
+- **Fetches are vetted.** http/https only, and loopback, LAN and link-local
+  addresses are refused by default: the model picks these URLs, and the
+  interesting local targets are the model servers and the bench node.
+  `SKIPPY_RESEARCH_ALLOW_PRIVATE=1` opens it deliberately.
+- **A claim must cite a page this run actually read.** Sources are logged to the
+  brief by the loop after every fetch — the text, not just the URL — and
+  `note_claim` refuses a citation that does not match one. Asked for citations
+  it cannot find, a model writes a plausible URL; a fabricated citation is
+  indistinguishable from a real one at a glance. `confirmed` additionally needs
+  two sources on different sites.
+- **The answer is written by a separate pass**, from the claims and citations
+  rather than from the transcript — so a run that ran out of steps still
+  produces an answer, and the researching model's last-page-read bias does not
+  drive the prose.
+- **Briefs go stale and say so.** Sources carry the date they were read; past 30
+  days, every read of the brief warns before handing anything back.
+
+Findings also land in project memory with their source URLs and the date, ranked
+above other matches in `recall_project`, which is what makes the third time a
+subject comes up cost nothing.
+
+### The research gate
+
+Skippy decides for himself when an answer needs checking. Self-reported
+confidence is poorly calibrated — worst exactly when the model is fluent and
+wrong — so the trigger is layered, and none of the three is trusted alone:
+
+1. **Cheap signals**, free: recency words, versions and years, capitalized
+   product names, and on the other side the vocabulary of thinking out loud.
+   These settle the easy cases with no model call at all.
+2. **A fast-model gate before the answer**, the same cold-classifier pattern as
+   the voice action router: needs-research / answer-directly / pure-ideation. It
+   runs only when the cheap layer found something to date the question by,
+   because otherwise it is a model call added to every reply including "good
+   morning".
+3. **The answering model's own verdict afterwards**, behind the delivered reply
+   so it costs no latency. Escalates only on a low confidence **and** a
+   non-empty list of checkable claims — a low number with nothing concrete
+   behind it is modesty about an opinion, and researching that finds nothing.
+
+Explicit instructions outrank all of it in both directions: "just tell me" and
+"go check that" are honoured without a model call. The bias is otherwise toward
+answering, because a false check interrupts someone's thinking while a false
+answer leaves things exactly as they were.
+
+Nothing blocks. The turn is answered now, the check runs behind it, and the
+result arrives on its own — in chat as a `chat` event carrying
+`kind: "research"` (sent after `done`, so a client can style it as a late
+follow-up), and out loud as a spoken announcement trimmed to three sentences
+with the citations left in the brief. Budgets: three runs per conversation, five
+sources and six searches per run, with in-session, brief and project-memory
+caching so a repeated question costs nothing. A run somebody explicitly asked
+for is uncapped.
+
+```bash
+export SKIPPY_AUTO_RESEARCH=0           # never check unasked
+export SKIPPY_RESEARCH_CONFIDENCE=0.75  # the layer-3 threshold
+```
+
+With no search key configured the gate is off entirely: every autonomous check
+would otherwise end in an apology for not being able to check.
+
+**The threshold is derived, not chosen.** `tests/fixtures/gate_cases.json` holds
+labelled turns — should-research, should-answer, pure ideation, with the
+self-check each answer produced — and `python -m tests.gate_eval` sweeps the
+threshold against them under a cost model that prices a missed check at twice a
+needless one. A test fails if the shipped constant drifts from what the set
+picks. `--live` runs the real classifier over the same turns, which is the half
+no offline test can cover; run it whenever `RESEARCH_GATE` is edited.
+
+See [ADR 0022](docs/adr/0022-web-research.md) and
+[ADR 0023](docs/adr/0023-autonomous-research-trigger.md).
+
 ### Why transcripts are append-only
 
 `mlx_lm.server` caches prompts by prefix, worth roughly 20x on the `heavy`
@@ -353,6 +468,9 @@ XML-style calls Qwen3-Coder occasionally emits instead.
 | `skippy_git.py` | Git for agent and app: status, diff, commit, branch, push, pull, new, clone |
 | `skippy_github.py` | GitHub: PAT storage, askpass helper, REST client (whoami, create, list repos) |
 | `skippy_re.py` | RE note packs: evidence-bearing findings and the command log behind them |
+| `skippy_research.py` | The web: search behind a backend interface, page fetching, boilerplate stripping, untrusted framing |
+| `skippy_brief.py` | Research briefs: sources as they read, claims that must cite them, the answer |
+| `skippy_gate.py` | Deciding without being asked when an answer needs checking |
 | `skippy_rizin.py` | Function-scoped disassembly and decompilation |
 | `skippy_extract.py` | Carving firmware images inside a hardened container |
 | `skippy_device.py` | Device I/O routing and write approvals for the studio, MacBook and bench bridges |
@@ -364,15 +482,15 @@ XML-style calls Qwen3-Coder occasionally emits instead.
 | `cursor_client/` | The sideloaded VS Code-compatible extension |
 | `skippy_agent.py` | The agent loop: think, call tools, observe, repeat |
 | `skippy_dispatch.py` | Runs one tool by name, turning every failure into an observation |
-| `prompts.py` | The system prompt, and the fold-summary extraction prompt |
+| `prompts.py` | Every system prompt: the modes, the personas, the routers and the research gate |
 | `skippy_paths.py` | Where NAS-backed state lives, and which repos are in scope |
 | `skippy_factory.py` | FastAPI server: websocket hub, voice, git/files actions, endpoints |
-| `tools.py` | Research and context tools (web, memory, directory maps, code RAG) |
+| `tools.py` | Assorted context helpers (memory, directory maps, code RAG) |
 | `tool_schemas.py` | OpenAI-format function schemas for native tool calling |
 | `apps/` | SkippyMac, SkippyPhone, SkippyServer, SkippyClient, PhotoFrame |
 | `firmware/core2-voice/` | Wireless mic/speaker puck for the voice lane |
 | `firmware/core2-devio/` | The bench IO node: UART/I2C/GPIO/ADC over Wi-Fi or BLE |
-| `docs/adr/` | Architecture decision records, 0001–0021 |
+| `docs/adr/` | Architecture decision records, 0001–0023 |
 
 ## Tests
 
@@ -381,16 +499,36 @@ pip install -r requirements-test.txt
 python -m pytest
 ```
 
-The suite needs no model server, no weights, no NAS, and no network —
-`tests/fake_llm.py` stands in for `mlx_lm.server`, and `tests/fake_bridge.py`
-stands in for a bench node. Chroma, Whisper and Kokoro are loaded on first use
-rather than at import; adding an import-time dependency on any of them will
-break collection. The SkippyMac unit tests run with
+The suite needs no model server, no weights, no NAS, no API key and no network.
+`tests/fake_llm.py` stands in for `mlx_lm.server`, `tests/fake_bridge.py` stands
+in for a bench node, and the web tools are covered against a scripted search
+backend and an `httpx.MockTransport` — a module whose whole job is talking to
+the internet still has to be testable with the internet unplugged. Chroma,
+Whisper and Kokoro are loaded on first use rather than at import; adding an
+import-time dependency on any of them will break collection. The SkippyMac unit
+tests run with
 `xcodebuild test -project apps/SkippyMac/SkippyMac.xcodeproj -scheme SkippyMac -destination 'platform=macOS'`.
 
 CI runs the Python suite three ways: normally, again inside a network namespace
-with only loopback available so nothing can quietly reach the internet, and
-`pyflakes` over every module with no exclusions.
+with only loopback available, and `pyflakes` over every module with no
+exclusions. The namespace run is about the *tests*, not about Skippy: he now
+reads the web on purpose, but a suite that needed the internet would be one that
+fails for reasons that have nothing to do with the code.
+
+Two things are measured rather than asserted, and both need a model, so both are run by
+hand rather than in CI. What CI checks is that the harnesses themselves are sound — in
+particular that no grader passes before the agent has done anything, which is the way an
+eval quietly stops measuring:
+
+```bash
+python -m tests.agent_eval --save  # does the coding agent finish the job? (the scoreboard)
+python -m tests.gate_eval          # score the research gate against the labelled set
+python -m tests.gate_eval --live   # ... using the real classifier, if a model is up
+```
+
+The agent scoreboard is the regression test for `prompts.py`: every task names the line
+of `AGENT_SYSTEM` it defends, and each run reports which tasks changed verdict since the
+last one. See [benchmarks/README.md](benchmarks/README.md).
 
 ## Setup
 

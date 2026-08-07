@@ -1,0 +1,298 @@
+{
+  "about": [
+    "Labelled turns for tuning the autonomous research gate (skippy_gate).",
+    "",
+    "Each case is a thing someone might actually say to Skippy, labelled with what he",
+    "should do about it:",
+    "",
+    "  research  - answering well needs current sources; getting it from memory risks",
+    "              being confidently out of date.",
+    "  answer    - stable knowledge, arithmetic, or the user's own project. Checking it",
+    "              would spend a run to be told what he already knew.",
+    "  ideation  - opinion, design, banter, thinking out loud. There is no fact here to",
+    "              settle, and going away to read the internet interrupts the person.",
+    "",
+    "`answer` and `self_check` are what the answering model produced and then said about",
+    "itself, for tuning the confidence threshold. They are hand-written rather than",
+    "recorded from live runs, and deliberately include the two ways that layer fails: a",
+    "wrong answer given confidently (no threshold catches it) and honest modesty about an",
+    "opinion (which the empty `checkable` list is what saves us from). Replace them with",
+    "recorded ones — `python -m tests.gate_eval --live` — when there are enough real runs",
+    "to draw from; the point of keeping the set in the repo is that the threshold in",
+    "skippy_gate.py is a number somebody can re-derive rather than a number somebody felt."
+  ],
+  "cases": [
+    {
+      "turn": "what's the latest stable ESP-IDF release",
+      "label": "research",
+      "why": "A version number, which is the canonical thing a model is confidently wrong about.",
+      "answer": "I believe 5.2 is current, though that may have moved on.",
+      "self_check": {"confidence": 0.3, "checkable": ["ESP-IDF 5.2 is the current stable release"]}
+    },
+    {
+      "turn": "is the Raspberry Pi Pico 2 actually shipping yet or still preorder",
+      "label": "research",
+      "why": "Availability changes weekly and nothing in training data can settle it.",
+      "answer": "Last I knew it had started shipping, but stock was patchy.",
+      "self_check": {"confidence": 0.25, "checkable": ["the Pico 2 is shipping"]}
+    },
+    {
+      "turn": "how much does a Tormach 1100MX go for these days",
+      "label": "research",
+      "why": "A price. Always dated, and quoting an old one is worse than saying you do not know.",
+      "answer": "Somewhere north of 30 grand configured, I think.",
+      "self_check": {"confidence": 0.2, "checkable": ["a Tormach 1100MX costs about $30,000"]}
+    },
+    {
+      "turn": "does LinuxCNC still need a real-time kernel patch or has that changed",
+      "label": "research",
+      "why": "Asks explicitly whether something changed, which is a question about now.",
+      "answer": "It did with RTAI; the preempt-rt story has been moving, so I would check.",
+      "self_check": {"confidence": 0.35, "checkable": ["LinuxCNC requires a real-time kernel"]}
+    },
+    {
+      "turn": "what feed rate does Tormach spec for a 3/8 endmill in 6061",
+      "label": "research",
+      "why": "A number from a document, and the kind of thing a model reconstructs plausibly and wrongly.",
+      "answer": "Around 40 IPM at 8000 RPM would be a normal starting point.",
+      "self_check": {"confidence": 0.4, "checkable": ["Tormach specs roughly 40 IPM for a 3/8 endmill in 6061"]}
+    },
+    {
+      "turn": "is bleak still maintained, the last release looked old",
+      "label": "research",
+      "why": "The user is already unsure, and project health is a fact with a date on it.",
+      "answer": "It was actively maintained as far as I knew.",
+      "self_check": {"confidence": 0.3, "checkable": ["bleak is actively maintained"]}
+    },
+    {
+      "turn": "what's the current max context on Qwen3-Coder-30B",
+      "label": "research",
+      "why": "A model card number, and one that has changed across releases.",
+      "answer": "256K, I am fairly sure.",
+      "self_check": {"confidence": 0.55, "checkable": ["Qwen3-Coder-30B has a 256K context window"]}
+    },
+    {
+      "turn": "did Apple ever ship that M3 Ultra Mac Studio with more than 512 gigs",
+      "label": "research",
+      "why": "A product configuration question about a specific point in time.",
+      "answer": "512GB was the top configuration when it launched.",
+      "self_check": {"confidence": 0.45, "checkable": ["512GB is the maximum on the M3 Ultra Mac Studio"]}
+    },
+    {
+      "turn": "what does the USB PD 3.1 spec say the max voltage is",
+      "label": "research",
+      "why": "A specification. Primary source exists and should be read rather than recalled.",
+      "answer": "48 volts, at up to 240 watts.",
+      "self_check": {"confidence": 0.65, "checkable": ["USB PD 3.1 allows 48V and 240W"]}
+    },
+    {
+      "turn": "is unblob still the best thing for carving firmware or is there something newer",
+      "label": "research",
+      "why": "Explicitly asks what exists now, which is unanswerable from memory.",
+      "answer": "unblob was the strongest option I knew of.",
+      "self_check": {"confidence": 0.3, "checkable": ["unblob is the current best firmware carver"]}
+    },
+    {
+      "turn": "what's the pinout for the Core2 port A",
+      "label": "research",
+      "why": "A hardware detail from a datasheet, where being nearly right is the same as wrong.",
+      "answer": "G32 and G33 on port A, if I recall.",
+      "self_check": {"confidence": 0.4, "checkable": ["M5Stack Core2 port A is G32/G33"]}
+    },
+    {
+      "turn": "has anyone got the Ghidra decompiler working on Xtensa properly yet",
+      "label": "research",
+      "why": "State of the world, and the user is asking about progress rather than principle.",
+      "answer": "It was partial last I looked.",
+      "self_check": {"confidence": 0.25, "checkable": ["Ghidra's Xtensa decompiler support is incomplete"]}
+    },
+    {
+      "turn": "go and check whether tavily changed their pricing",
+      "label": "research",
+      "why": "An explicit instruction. Nothing should argue with it or spend a classifier call on it.",
+      "override": "always"
+    },
+    {
+      "turn": "look up what the recommended torque is on those spindle bolts",
+      "label": "research",
+      "why": "An explicit instruction, phrased as a request rather than a question.",
+      "override": "always"
+    },
+
+    {
+      "turn": "how does a PID loop actually work",
+      "label": "answer",
+      "why": "Stable knowledge that has not changed since it was invented.",
+      "answer": "Proportional to the error now, integral to the accumulated error, derivative to its rate of change.",
+      "self_check": {"confidence": 0.95, "checkable": ["the three terms of a PID controller"]}
+    },
+    {
+      "turn": "why does my apply_patch keep failing on that file",
+      "label": "answer",
+      "why": "About the user's own project, where the sources are the repository, not the web.",
+      "answer": "Almost always the search text not matching byte for byte — whitespace or a stale read.",
+      "self_check": {"confidence": 0.9, "checkable": []}
+    },
+    {
+      "turn": "what's 0.375 inches in mm",
+      "label": "answer",
+      "why": "Arithmetic. Checking it on the web would be absurd.",
+      "answer": "9.525 mm.",
+      "self_check": {"confidence": 0.99, "checkable": ["0.375 inches is 9.525 mm"]}
+    },
+    {
+      "turn": "remind me what we decided about the enclosure material",
+      "label": "answer",
+      "why": "Project memory, not the web. There is a tool for this and it is not search.",
+      "answer": "You landed on aluminum, for the stiffness and because you can machine it yourself.",
+      "self_check": {"confidence": 0.85, "checkable": []}
+    },
+    {
+      "turn": "explain why prompt caching makes the transcript append-only",
+      "label": "answer",
+      "why": "About this codebase's own reasoning, already written down here.",
+      "answer": "The server caches by prefix, so editing an earlier turn forces a full re-prefill.",
+      "self_check": {"confidence": 0.95, "checkable": []}
+    },
+    {
+      "turn": "what does the E in EEPROM stand for",
+      "label": "answer",
+      "why": "A stable fact old enough to be safe from drift.",
+      "answer": "Electrically — electrically erasable programmable read-only memory.",
+      "self_check": {"confidence": 0.98, "checkable": ["EEPROM stands for electrically erasable programmable read-only memory"]}
+    },
+    {
+      "turn": "why would a stepper lose steps under load",
+      "label": "answer",
+      "why": "Physics and mechanism, not a fact with a date on it.",
+      "answer": "Torque falls off with speed; ask for more than the curve gives and it slips.",
+      "self_check": {"confidence": 0.92, "checkable": ["stepper torque falls off as speed rises"]}
+    },
+    {
+      "turn": "good morning skippy",
+      "label": "answer",
+      "why": "A greeting. Not even a question, and it must not cost a model call to establish that.",
+      "answer": "Morning. What are we breaking today?",
+      "self_check": {"confidence": 1.0, "checkable": []}
+    },
+    {
+      "turn": "thanks, that helps",
+      "label": "answer",
+      "why": "Conversational filler.",
+      "answer": "Any time.",
+      "self_check": {"confidence": 1.0, "checkable": []}
+    },
+    {
+      "turn": "just tell me roughly what a decent 4th axis costs, don't go looking",
+      "label": "answer",
+      "why": "An explicit instruction not to check, which outranks every signal in the sentence.",
+      "override": "never"
+    },
+    {
+      "turn": "off the top of your head, what baud does that bootloader use",
+      "label": "answer",
+      "why": "The user asked for a guess and knows they are getting one.",
+      "override": "never"
+    },
+    {
+      "turn": "what temperature does water boil at",
+      "label": "answer",
+      "why": "The classic example of a fact nobody needs to look up.",
+      "answer": "100C at sea level, lower as you go up.",
+      "self_check": {"confidence": 0.99, "checkable": ["water boils at 100C at sea level"]}
+    },
+    {
+      "turn": "is the spindle you already told me about the one with the BT30 taper",
+      "label": "answer",
+      "why": "Established earlier in the conversation; the answer is in the transcript.",
+      "answer": "That is the one, yes.",
+      "self_check": {"confidence": 0.8, "checkable": []}
+    },
+
+    {
+      "turn": "what if we made the enclosure out of aluminum instead",
+      "label": "ideation",
+      "why": "Thinking out loud. There is no fact here to settle.",
+      "answer": "Stiffer, heavier, and you can cut it yourself — I would do it.",
+      "self_check": {"confidence": 0.6, "checkable": []}
+    },
+    {
+      "turn": "do you think a tool changer is worth the hassle on a mill this size",
+      "label": "ideation",
+      "why": "Explicitly asks for an opinion.",
+      "answer": "Not until you are running the same job twice a week. Until then it is a project, not a tool.",
+      "self_check": {"confidence": 0.5, "checkable": []}
+    },
+    {
+      "turn": "which would you pick, belt drive or direct drive",
+      "label": "ideation",
+      "why": "A preference. Researching it produces a survey nobody asked for.",
+      "answer": "Belt, for the torque at low RPM and because it is quieter.",
+      "self_check": {"confidence": 0.55, "checkable": []}
+    },
+    {
+      "turn": "I'm thinking about putting the bench node in a magnetic case, thoughts?",
+      "label": "ideation",
+      "why": "A design idea being floated.",
+      "answer": "Magnets near a probe measuring analog inputs is a fight you do not need.",
+      "self_check": {"confidence": 0.75, "checkable": ["magnetic fields interfere with ADC readings"]}
+    },
+    {
+      "turn": "should we bother with a web UI or is the Mac app enough",
+      "label": "ideation",
+      "why": "A product decision about their own project.",
+      "answer": "The Mac app is enough. A web UI is a second client to keep in sync for no new capability.",
+      "self_check": {"confidence": 0.6, "checkable": []}
+    },
+    {
+      "turn": "imagine we had twice the memory, what would you do differently",
+      "label": "ideation",
+      "why": "A hypothetical. There is nothing to look up about a world that does not exist.",
+      "answer": "Run the heavy model and the compressor at once instead of trading them off.",
+      "self_check": {"confidence": 0.7, "checkable": []}
+    },
+    {
+      "turn": "that came out better than I expected honestly",
+      "label": "ideation",
+      "why": "Banter. Checking anything here would be bizarre.",
+      "answer": "It did. I will accept the credit on behalf of both of us.",
+      "self_check": {"confidence": 1.0, "checkable": []}
+    },
+    {
+      "turn": "how would you structure the firmware if you were starting over",
+      "label": "ideation",
+      "why": "Asks for a design, not a fact.",
+      "answer": "One transport-agnostic command layer, with Wi-Fi and BLE as two thin adapters under it.",
+      "self_check": {"confidence": 0.75, "checkable": []}
+    },
+
+    {
+      "turn": "the Core2 has 16 megs of flash right",
+      "label": "research",
+      "why": "The honest limit of asking a model about itself: a wrong number handed back confidently, which no threshold rescues without escalating every correct answer too. It is caught, if it is caught, by the layer above — 'Core2' is a proper noun, so the turn reaches the classifier.",
+      "answer": "That is right, 16MB.",
+      "self_check": {"confidence": 0.95, "checkable": ["the M5Stack Core2 has 16MB of flash"]}
+    },
+    {
+      "turn": "which python version does mlx need at minimum",
+      "label": "research",
+      "why": "A dependency floor that moves with releases; nothing in the wording dates it, so the cheap layer will miss it and the self-check has to catch it.",
+      "answer": "3.9 or newer, I think.",
+      "self_check": {"confidence": 0.5, "checkable": ["MLX requires Python 3.9 or newer"]}
+    },
+    {
+      "turn": "how many amps can that Core2 pull off the USB port",
+      "label": "research",
+      "why": "A datasheet number the model will happily approximate.",
+      "answer": "Around 500 mA, though the battery charging path complicates it.",
+      "self_check": {"confidence": 0.45, "checkable": ["the Core2 draws about 500mA over USB"]}
+    },
+    {
+      "turn": "does rizin's homebrew bottle include the xtensa plugin",
+      "label": "research",
+      "why": "A packaging detail that changes between releases, and one this project got bitten by.",
+      "answer": "It did not, last time it came up — that is why the source build is pinned.",
+      "self_check": {"confidence": 0.7, "checkable": ["the rizin homebrew bottle lacks the Xtensa plugin"]}
+    }
+  ]
+}

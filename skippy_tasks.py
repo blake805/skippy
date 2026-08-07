@@ -37,6 +37,7 @@ import prompts
 import skippy_agent
 import skippy_cursor
 import skippy_device
+import skippy_gate
 import skippy_llm
 import skippy_paths
 from skippy_sandbox import Sandbox, SandboxError
@@ -51,6 +52,10 @@ _RE_ALIASES = frozenset({"re", "reverse engineering", "reverse-engineering", "re
 # agent loop, which nudged the model to call tools twice and then reported
 # "stopped_without_finish" — a conversation cannot be a task.
 _CHAT_ALIASES = frozenset({"chat", "talk", "conversation"})
+# Answering a question from the web is a run like any other: it takes a slot, streams
+# its steps, can be cancelled, and reports when it lands. What it does not take is a
+# repository — the sandbox goes with it only because every run has one.
+_RESEARCH_ALIASES = frozenset({"research", "web", "look up", "lookup"})
 
 
 def agent_mode_for(wire_mode: Any) -> str:
@@ -59,6 +64,8 @@ def agent_mode_for(wire_mode: Any) -> str:
         return "re"
     if lowered in _CHAT_ALIASES:
         return "chat"
+    if lowered in _RESEARCH_ALIASES:
+        return "research"
     return "coding"
 
 
@@ -91,6 +98,13 @@ class TaskRunner:
         # here rather than derived from the asyncio.Task because the task object
         # knows it is alive but not what it is doing.
         self._meta: Dict[str, dict] = {}
+        # Per-client research budget and cache, kept across turns. Never cleared on a
+        # turn boundary: a budget that reset every message would not be a budget.
+        self._conversations: Dict[str, skippy_gate.Conversation] = {}
+        # Background checks. Deliberately not in `_tasks`: they must not occupy the
+        # client's one run slot, or asking a question with a fact in it would lock the
+        # conversation until the internet answered.
+        self._side_tasks: set = set()
 
     def is_running(self, client_id: str) -> bool:
         task = self._tasks.get(client_id)
@@ -680,7 +694,12 @@ class TaskRunner:
         self._loops[client_id] = loop
         try:
             outcome = await loop.run()
-            await self.send(client_id, {"type": "chat", "content": outcome.summary})
+            # A research run's product is the answer, not the model's account of having
+            # looked things up. Reporting the summary there would hand back "I searched
+            # and read three pages" and leave the answer on disk.
+            await self.send(client_id, {
+                "type": "chat", "content": outcome.answer or outcome.summary,
+            })
         except Exception as exc:
             # A crash in the runtime is the operator's problem, but the person waiting
             # deserves to hear that it stopped rather than watch nothing arrive.
@@ -716,11 +735,36 @@ class TaskRunner:
         messages.append({"role": "user", "content": text})
         return messages
 
+    def conversation(self, client_id: str) -> skippy_gate.Conversation:
+        """This client's research budget and cache, kept across turns.
+
+        Per client rather than per turn: the budget only means anything over a
+        conversation, and the point of the cache is that the second time a subject comes
+        up it costs nothing.
+        """
+        existing = self._conversations.get(client_id)
+        if existing is None:
+            existing = skippy_gate.Conversation()
+            self._conversations[client_id] = existing
+        return existing
+
     async def _run_chat(self, client_id: str, text: str, history: Optional[list]) -> None:
-        """One conversational turn: no tools, no sandbox, one reply."""
+        """One conversational turn: no tools, no sandbox, one reply.
+
+        Plus, since the research capability exists, a check on the way in and a check on
+        the way out — neither of which the reply waits for. See skippy_gate: the turn is
+        answered now, and anything worth verifying arrives afterwards as its own message.
+        """
         try:
+            messages = self._chat_messages(text, history)
+            decision = await skippy_gate.pre_answer(text, history or [])
+            if decision and self._start_check(client_id, decision):
+                # A note rather than a canned line, so the acknowledgment sounds like
+                # Skippy instead of like a progress bar.
+                messages.append({"role": "system", "content": skippy_gate.acknowledgment(decision)})
+
             reply = await skippy_llm.query_text(
-                self._chat_messages(text, history),
+                messages,
                 role="fast",
                 temp=0.6,
                 # Prose only in this lane, so the penalty skippy_llm forbids for
@@ -732,6 +776,12 @@ class TaskRunner:
                 "type": "chat",
                 "content": reply or "I have nothing to say to that, which is a first.",
             })
+            # Behind the delivered reply, so its cost is not latency anyone waits
+            # through. Skipped when the pre-answer gate already started a check: asking
+            # the model to grade an answer it just hedged on purpose would start a
+            # second run on the same question.
+            if not decision and reply:
+                self._side(client_id, self._check_after(client_id, text, reply))
         except asyncio.CancelledError:
             await self.send(client_id, {"type": "chat", "content": "Stopped."})
         except Exception as exc:
@@ -746,6 +796,65 @@ class TaskRunner:
             self._meta.pop(client_id, None)
             await self.send(client_id, {"type": "done"})
 
+    # -- autonomous checking ----------------------------------------------
+    #
+    # A check is not a run: it does not take the client's slot, it cannot be started by
+    # asking for it, and the conversation never waits for it. It goes out afterwards as
+    # a `chat` event carrying `kind: "research"`, which is a field a client may style or
+    # ignore — arriving after `done` is the point, because the alternative is a
+    # conversation that stops dead while Skippy reads the internet.
+
+    def _side(self, client_id: str, coro) -> None:
+        """Run something beside the conversation, without taking the client's slot."""
+        task = asyncio.create_task(coro)
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    def _start_check(self, client_id: str, decision: skippy_gate.Decision) -> bool:
+        """Begin a background check. False when this conversation cannot afford one.
+
+        Reported back so the caller knows whether to tell the persona it is checking:
+        promising to verify something and then not doing it is worse than not offering.
+        """
+        conversation = self.conversation(client_id)
+        if conversation.key(decision.question) in conversation.in_flight:
+            return False
+        if conversation.recall(decision.question) is None and not conversation.allows():
+            logger.info("Research budget spent for '%s'; answering unchecked.", client_id)
+            return False
+        logger.info(
+            "Checking %r for '%s' (%s: %s)",
+            decision.question, client_id, decision.layer, decision.reason,
+        )
+        self._side(client_id, self._deliver_check(client_id, decision))
+        return True
+
+    async def _deliver_check(self, client_id: str, decision: skippy_gate.Decision) -> None:
+        result = await skippy_gate.check(
+            decision.question,
+            self.conversation(client_id),
+            roots=self.roots_provider() or [],
+        )
+        if not result.answer and not result.error:
+            return
+        await self.send(client_id, {
+            "type": "chat",
+            # The field a client keys off to render this as a late follow-up rather
+            # than as a reply to whatever the user most recently said.
+            "kind": "research",
+            "question": result.question,
+            "brief": result.brief_id,
+            "sources": result.sources,
+            "cached": result.cached,
+            "content": skippy_gate.report(result),
+        })
+
+    async def _check_after(self, client_id: str, text: str, reply: str) -> None:
+        """The second layer: ask the model that answered whether it should be checked."""
+        decision = await skippy_gate.post_answer(text, reply)
+        if decision:
+            self._start_check(client_id, decision)
+
     def cancel(self, client_id: str) -> bool:
         """Ask the run to stop at its next step boundary.
 
@@ -759,9 +868,29 @@ class TaskRunner:
         loop.cancel()
         return True
 
+    def steer(self, client_id: str, text: str) -> bool:
+        """Pass a message to this client's running agent. False when there is nothing
+        to say it to, or nothing to say.
+
+        A chat turn cannot be steered — it is one completion and it is already streaming
+        — so this is agent runs only, which is also where it matters.
+        """
+        loop = self._loops.get(client_id)
+        if loop is None or not self.is_running(client_id):
+            return False
+        steer = getattr(loop, "steer", None)
+        if steer is None:
+            return False
+        return bool(steer(text))
+
     async def shutdown(self) -> None:
         for loop in list(self._loops.values()):
             loop.cancel()
+        # Background checks are cancelled outright rather than waited for. Nobody is
+        # blocked on one, its sources are already written to the brief as they are read,
+        # and a shutdown that waited for the internet would not be a shutdown.
+        for task in list(self._side_tasks):
+            task.cancel()
         tasks = [task for task in self._tasks.values() if not task.done()]
         if tasks:
             # Bounded: shutdown cannot wait on a step that is stuck on a model call.

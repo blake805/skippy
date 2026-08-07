@@ -17,6 +17,7 @@ import inspect
 import logging
 from typing import Any, Dict, Optional
 
+import skippy_brief
 import skippy_device
 import skippy_exec
 import skippy_cursor
@@ -24,6 +25,7 @@ import skippy_fs
 import skippy_git
 import skippy_memory
 import skippy_re
+import skippy_research
 import skippy_extract
 import skippy_rizin
 from skippy_sandbox import Sandbox, SandboxError, ToolResult
@@ -38,6 +40,8 @@ _SYNC_TOOLS = {
     "glob_files": skippy_fs.glob_files,
     "note_finding": skippy_re.note_finding,
     "read_notes": skippy_re.read_notes,
+    "note_claim": skippy_brief.note_claim,
+    "read_brief": skippy_brief.read_brief,
     "record_decision": skippy_memory.record_decision,
     "recall_project": skippy_memory.recall_project,
     "resolve_work_item": skippy_memory.resolve_work_item,
@@ -54,6 +58,17 @@ _NOTES_TOOLS = (
 
 # These take the project memory the loop opens, for the same reason.
 _MEMORY_TOOLS = ("record_decision", "recall_project", "resolve_work_item")
+
+# These take the research session the loop opens: the search backend and the HTTP
+# client behind it. Injected for the same reason as the sandbox — a tool call that could
+# name its own backend could name its own endpoint, and the whole value of routing the
+# web through one object is that there is one place the rules live.
+_RESEARCH_TOOLS = skippy_research.RESEARCH_TOOLS
+
+# These take the brief the loop opens, the way the notes tools take the pack: it is
+# where a run's sources live, and taking it is what stops a claim being filed against
+# another question's evidence.
+_BRIEF_TOOLS = ("note_claim", "read_brief")
 
 # Live hardware. First argument is the DeviceService the loop owns; they are
 # async because writes wait on a human approval and remote hosts go over RPC.
@@ -95,11 +110,15 @@ _ASYNC_TOOLS = {
     "i2c_io": skippy_device.i2c_io,
     "gpio_io": skippy_device.gpio_io,
     "adc_read": skippy_device.adc_read,
+    # The web. Async because both are network round trips, and neither touches the disk.
+    "web_search": skippy_research.web_search,
+    "web_fetch": skippy_research.web_fetch,
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
-# coherent error if it ever arrives out of place.
-CONTROL_TOOLS = ("finish",)
+# coherent error if it ever arrives out of place. `investigate` spawns a run, and what
+# that spends is steps — which the loop owns and the dispatcher knows nothing about.
+CONTROL_TOOLS = ("finish", "investigate")
 
 TOOL_NAMES = tuple(sorted(set(_SYNC_TOOLS) | set(_ASYNC_TOOLS) | set(CONTROL_TOOLS)))
 
@@ -111,7 +130,10 @@ def _expected(name: str) -> str:
         return ""
     params = [
         p for p in inspect.signature(handler).parameters
-        if p not in ("sandbox", "journal_dir", "mode", "pack", "memory", "service")
+        if p not in (
+            "sandbox", "journal_dir", "mode", "pack", "memory", "service", "session",
+            "brief",
+        )
     ]
     return ", ".join(params)
 
@@ -127,6 +149,8 @@ async def dispatch(
     cursor: Optional[Any] = None,
     devices: Optional[Any] = None,
     approver: Optional[Any] = None,
+    research: Optional[Any] = None,
+    brief: Optional[Any] = None,
 ) -> ToolResult:
     """Run one tool. Never raises."""
     args: Dict[str, Any] = dict(args or {})
@@ -160,7 +184,7 @@ async def dispatch(
     # artifact it was asked to analyse, which is the one thing the split prevents.
     for injected in (
         "sandbox", "journal_dir", "mode", "pack", "memory", "bridge", "writer",
-        "service", "approver",
+        "service", "approver", "session", "brief",
     ):
         args.pop(injected, None)
     if name == "apply_patch":
@@ -204,6 +228,25 @@ async def dispatch(
                 "your finish summary instead.",
             )
         first = memory
+    elif name in _BRIEF_TOOLS:
+        if brief is None:
+            return ToolResult(
+                False,
+                f"'{name}' needs a research brief, which only a research run opens. "
+                "This looks like a coding or reverse-engineering task; record what you "
+                "found in your finish summary, or with record_decision if it is a choice "
+                "a later session needs.",
+            )
+        first = brief
+    elif name in _RESEARCH_TOOLS:
+        if research is None:
+            return ToolResult(
+                False,
+                f"'{name}' needs a research session, which only a research run opens. "
+                "This run has no way to reach the web: answer from what you can read "
+                "here, and say plainly which parts you could not check.",
+            )
+        first = research
     elif name in _DEVICE_TOOLS:
         if devices is None:
             return ToolResult(

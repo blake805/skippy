@@ -3,6 +3,11 @@
 - **Status:** accepted
 - **Date:** 2026-07-29
 - **Amends:** [ADR 0001](0001-agent-loop.md) (which named GLM-5.2 as `heavy`)
+- **Amended by:** [ADR 0022](0022-web-research.md) — the "no network at runtime"
+  property this ADR treats as a background fact no longer holds. The policy below is
+  unchanged and still governs *models*: it is about where inference happens and what
+  leaves the machine with it. Reading a public page sends a URL, not the workspace, and
+  ADR 0022 covers the separate risks that come with it.
 
 ## Context
 

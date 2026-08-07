@@ -2,29 +2,17 @@ import os
 import json
 import asyncio
 import datetime
-import urllib.request
 from typing import Any
-from ddgs import DDGS
 import uuid
+
+# The web tools that used to live here — a scraped search and a page reader that cut
+# every page at 5000 characters — are now skippy_research.web_search and
+# skippy_research.web_fetch, which go through a research API, treat what comes back as
+# untrusted input, and chunk long pages instead of silently dropping their ends.
 
 
 def get_system_time() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-async def web_search(query: str) -> str:
-    try: 
-        # Offload blocking DDGS call to thread
-        return await asyncio.to_thread(lambda: json.dumps(DDGS().text(query, max_results=4)))
-    except Exception as e: 
-        return f"Search error: {str(e)}"
-
-async def read_website(url: str) -> str:
-    try:
-        req = urllib.request.Request(f"https://r.jina.ai/{url}", headers={'User-Agent': 'Mozilla/5.0'})
-        response = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
-        return response.read().decode('utf-8')[:5000] 
-    except Exception as e: 
-        return f"Failed to read website: {str(e)}"
 
 async def search_memory(query: str, collection: Any) -> str:
     try:

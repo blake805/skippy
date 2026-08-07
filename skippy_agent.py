@@ -18,10 +18,12 @@ steps" is never reported as success, however much was accomplished.
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import prompts
+import skippy_brief
 import skippy_device
 import skippy_dispatch
 import skippy_exec
@@ -29,6 +31,7 @@ import skippy_llm
 import skippy_memory
 import skippy_paths
 import skippy_re
+import skippy_research
 import tool_schemas
 from skippy_sandbox import Sandbox, ToolResult, cap_text
 
@@ -36,6 +39,30 @@ logger = logging.getLogger("skippy_agent")
 
 DEFAULT_MAX_STEPS = 40
 HARD_MAX_STEPS = 200
+
+# Research runs get a much shorter default than coding runs, and the reason is not
+# cost. A question that forty steps of searching has not answered is a question the
+# searching is not going to answer, and a run that keeps going past that produces a
+# longer answer rather than a better one. Fourteen is comfortably enough for a plan,
+# two or three searches and five or six pages.
+DEFAULT_RESEARCH_STEPS = 14
+
+# A sub-run reading the code to answer one question. Short on purpose: the value of the
+# mechanism is that an expensive question is repaid to the caller as a paragraph, and a
+# reader given forty steps produces an essay and spends the budget of the run that asked.
+SUBAGENT_MAX_STEPS = 12
+# How many a single run may spawn. A budget that can spawn things which have budgets is
+# not a budget, and four is enough to answer the questions a real task raises without
+# turning the run into a manager.
+SUBAGENT_LIMIT = 4
+
+# Which model reads. Empty means the same one driving the run. This is the one place a
+# cheaper model can be swapped in without arguing with ADR 0001: a sub-run has a
+# transcript of its own, so it has a prompt cache of its own, and using a different role
+# here costs the parent's cache nothing. Whether the 30B is good enough at "find the
+# thing and cite it" is a question for the scoreboard rather than for taste, so the
+# default stays honest and the knob exists to measure it.
+SUBAGENT_ROLE = os.environ.get("SKIPPY_SUBAGENT_ROLE", "").strip()
 
 # Above this, an observation goes through the compressor first. The heavy role
 # prefills at ~200 tok/s, so 8000 characters of raw tool output costs about ten
@@ -52,6 +79,20 @@ FOLD_KEEP_LAST = 8
 # recovers; a second means it believes it is done and is not going to call finish.
 NUDGE_LIMIT = 2
 
+# Changes to these cannot break a test suite, so finishing without having run one is not
+# a guess about them. Kept deliberately short: prose only. A `.json` or a `.toml` is
+# configuration that absolutely can break a build, and treating documentation as the
+# exception rather than code as the rule is what keeps this from quietly widening.
+PROSE_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+
+# How many times a `finish` may be sent back for want of evidence that the edits work.
+# Exactly one. The prompt already says "a change you have not executed is a guess", and
+# a single push-back turns that from advice into something the loop checks — but a run
+# that genuinely cannot verify (no test suite, a broken toolchain, a task that is
+# blocked) has to be able to end, and a run that cannot end is worse than one that ends
+# unverified. The second finish goes through, and the model has been made to say why.
+FINISH_PUSHBACK_LIMIT = 1
+
 # Identical call this many times in the recent window and the loop intervenes.
 REPEAT_LIMIT = 3
 REPEAT_WINDOW = 6
@@ -67,6 +108,12 @@ RE_RECORD_NUDGE_AFTER = 6
 # evidence and is deliberately absent: logging it would pad the record without adding to
 # it, and a session that only listed symbols has not established anything to record.
 RE_INSPECTION_TOOLS = ("disassemble_function", "decompile", "extract_artifact")
+
+# Pages read since the last recorded claim before the loop says something. Same
+# mechanism as the RE recording nudge and the same reason: the prompt already asks for
+# record-as-you-go, and a count the model can see is a different message from an
+# instruction it read past ten steps ago.
+RESEARCH_RECORD_NUDGE_AFTER = 4
 
 FINISH_SCHEMA = {
     "type": "function",
@@ -138,6 +185,13 @@ class AgentOutcome:
     work_items: List[str] = field(default_factory=list)
     # Where this run was written down, so a caller can point at it.
     session_id: str = ""
+    # What a research run produced: the synthesized answer with its citations, the
+    # brief holding the sources it was written from, and how many there were. Reported
+    # separately from `summary` because the summary is the model's account of the run
+    # and this is the product of it — a caller that speaks one of them aloud wants this.
+    answer: str = ""
+    brief_id: str = ""
+    sources: int = 0
 
     @property
     def ok(self) -> bool:
@@ -164,6 +218,7 @@ class AgentLoop:
         extra_context: str = "",
         mode: str = skippy_exec.DEFAULT_MODE,
         notes_root: Optional[str] = None,
+        briefs_root: Optional[str] = None,
         target: str = "",
         memory: Optional[Any] = None,
         memory_root: Optional[str] = None,
@@ -172,6 +227,7 @@ class AgentLoop:
         history: Optional[Sequence[dict]] = None,
         devices: Optional[Any] = None,
         approver: Optional[Any] = None,
+        research: Optional[Any] = None,
     ):
         if not task or not str(task).strip():
             raise ValueError("An agent run needs a task.")
@@ -187,7 +243,14 @@ class AgentLoop:
         # Only None means "use the default". An explicit 0 clamps to 1 rather than
         # falling through to 40 — this knob decides how much unattended editing
         # happens, so a caller passing 0 by mistake must not get a full run.
-        budget = DEFAULT_MAX_STEPS if max_steps is None else int(max_steps)
+        # The budget belongs to the mode rather than to whoever starts one: a reader
+        # given forty steps writes an essay, whatever the caller meant by leaving it
+        # unset.
+        default_steps = {
+            "research": DEFAULT_RESEARCH_STEPS,
+            "investigate": SUBAGENT_MAX_STEPS,
+        }.get(self.mode, DEFAULT_MAX_STEPS)
+        budget = default_steps if max_steps is None else int(max_steps)
         self.max_steps = max(1, min(budget, HARD_MAX_STEPS))
         self._emit = emit
         self.journal_dir = journal_dir
@@ -198,10 +261,26 @@ class AgentLoop:
         self.files_changed: List[str] = []
         self._cancelled = False
         self._nudges = 0
+        # Things the user has said since the run started, waiting for a step boundary.
+        self._steering: List[str] = []
+        self._investigations = 0
         self._recent_calls: List[str] = []
         self._folds = 0
         self._commands_since_finding = 0
+        self._pages_since_claim = 0
         self.work_items: List[str] = []
+        self.answer = ""
+
+        # Whether anything has been run since the last edit, and how it went. None means
+        # "edits are outstanding and unexercised", which is the state `finish` is not
+        # allowed to end on without saying something. Reset by every patch, answered by
+        # every test or linter run.
+        self._verified: Optional[bool] = None
+        self._finish_pushbacks = 0
+        # The command that last proved something green, kept so the run can leave behind
+        # how this project is tested. Finding that out costs a session several steps of
+        # guessing, and it is the same answer every time.
+        self._verification_command = ""
 
         # RE mode gets a pack keyed by the target, so a second session on the same
         # artifact accumulates onto the first instead of starting over. The loop opens
@@ -211,6 +290,16 @@ class AgentLoop:
             root = notes_root or skippy_paths.notes_root()
             self.notes_pack = skippy_re.open_pack(
                 root, target=target or "", title=self.task[:80]
+            )
+
+        # A research run gets a brief keyed by the question, for the same reason an RE
+        # run gets a pack keyed by the target: the same question asked next month should
+        # open what was already read rather than paying for it again. The loop opens it,
+        # never the model.
+        self.brief = None
+        if self.mode == "research":
+            self.brief = skippy_brief.open_brief(
+                briefs_root or skippy_paths.briefs_root(), question=self.task
             )
 
         # The attached editor, when there is one. Held rather than consulted here: the
@@ -230,6 +319,20 @@ class AgentLoop:
         if self.devices is None and self.mode == "re":
             self.devices = skippy_device.DeviceService()
 
+        # The web. Opened only for a research run: a coding or RE run has a target in
+        # front of it and no business reaching the internet, and a None is what makes a
+        # hallucinated web_search fail closed in dispatch the same way a device call
+        # does.
+        self.research = research
+        if self.research is None and self.mode == "research":
+            try:
+                self.research = skippy_research.ResearchSession()
+            except skippy_research.ResearchError:
+                # A misconfigured backend must not stop the run at construction. The
+                # tools then refuse with a message naming the variable to set, which is
+                # something the model can report and a person can act on.
+                logger.warning("No search backend; this run cannot reach the web.", exc_info=True)
+
         # Opened by the loop, keyed by the workspace roots, so that working on the same
         # repos tomorrow lands on the same memory without anyone naming it.
         self.memory = memory
@@ -242,7 +345,11 @@ class AgentLoop:
                 # An unmounted NAS must not stop a run; it only costs continuity.
                 logger.warning("Project memory unavailable; running without it.", exc_info=True)
 
-        system = prompts.RE_SYSTEM if self.mode == "re" else prompts.AGENT_SYSTEM
+        system = {
+            "re": prompts.RE_SYSTEM,
+            "research": prompts.RESEARCH_SYSTEM,
+            "investigate": prompts.INVESTIGATE_SYSTEM,
+        }.get(self.mode, prompts.AGENT_SYSTEM)
         self.transcript = skippy_llm.Transcript(system=system)
         # Prior conversation turns from the client, seeded before the opening so the
         # model treats this run as a continuation. Kept ahead of the workspace/memory
@@ -250,9 +357,17 @@ class AgentLoop:
         # task itself) and must remain the last thing the model reads.
         for turn in _clean_history(history):
             self.transcript.append(turn)
-        opening = "Workspace roots:\n" + "\n".join(
-            f"- {sandbox.relative(root)} ({root})" for root in sandbox.roots
-        )
+        if self.mode == "research":
+            # No workspace roots here. A research run is offered no filesystem tools, and
+            # listing repositories it cannot read would only invite it to try.
+            opening = (
+                f"You have {self.max_steps} steps for this question. Spend them on a few "
+                "good sources rather than many shallow ones."
+            )
+        else:
+            opening = "Workspace roots:\n" + "\n".join(
+                f"- {sandbox.relative(root)} ({root})" for root in sandbox.roots
+            )
         # Put in the opening message rather than left to a tool the model may call.
         # A tool it may call is a tool it mostly will not, and continuing prior work is
         # the whole point of keeping the record.
@@ -276,9 +391,28 @@ class AgentLoop:
                 # bytes that have since changed are worse than no findings, and the
                 # model has no way to notice on its own.
                 opening += f"\n\nWARNING: {self.notes_pack.target_changed}"
+        if self.brief is not None:
+            sources = len(self.brief.source_files())
+            claims = len(self.brief.claim_files())
+            opening += (
+                f"\n\nBrief: {self.brief.brief_id} ({sources} source(s), {claims} claim(s) "
+                "so far)"
+            )
+            if sources or claims:
+                # Said here rather than left to the prompt, for the same reason the note
+                # pack announces itself: re-reading pages someone already read is the
+                # most wasteful thing a research run can do, and the model has no way to
+                # know the brief exists unless the loop says so.
+                opening += (
+                    ". This question has been researched before — call read_brief before "
+                    "searching, and build on what is there."
+                )
+            if self.brief.stale:
+                opening += f"\n\nWARNING: {self.brief.stale}"
         if extra_context:
             opening += f"\n\n{extra_context}"
-        self.transcript.append({"role": "user", "content": f"{opening}\n\nTask: {self.task}"})
+        label = "Question" if self.mode == "research" else "Task"
+        self.transcript.append({"role": "user", "content": f"{opening}\n\n{label}: {self.task}"})
 
     # -- plumbing ---------------------------------------------------------
 
@@ -286,6 +420,28 @@ class AgentLoop:
         """Ask the run to stop. Takes effect at the next step boundary, so a tool
         already running is allowed to finish rather than being torn down mid-write."""
         self._cancelled = True
+
+    def steer(self, text: str) -> bool:
+        """Say something to a run that is already going. Delivered at the next step.
+
+        Until this existed the only thing you could say to a working agent was "stop",
+        so watching one head down the wrong path for eight steps meant killing it and
+        starting over — losing the good half of the work along with the bad. A sentence
+        at the right moment is worth more than a better prompt at the start, because the
+        wrong path is usually only visible once it has been taken.
+
+        Delivered at a step boundary rather than injected immediately, for the reason
+        every other interruption here works that way: a tool that is midway through
+        writing files finishes first. And appended as an ordinary user turn, which is
+        the whole trick — the transcript is append-only, so steering costs nothing and
+        breaks no prompt cache, where editing the task in place would re-prefill
+        everything.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return False
+        self._steering.append(text)
+        return True
 
     async def emit(self, event: dict) -> None:
         if self._emit is None:
@@ -299,9 +455,12 @@ class AgentLoop:
             self._emit = None
 
     def tools(self) -> List[dict]:
-        offered = (
-            tool_schemas.re_tools() if self.mode == "re" else tool_schemas.workspace_tools()
-        )
+        by_mode = {
+            "re": tool_schemas.re_tools,
+            "research": tool_schemas.research_tools,
+            "investigate": tool_schemas.investigation_tools,
+        }
+        offered = by_mode.get(self.mode, tool_schemas.workspace_tools)()
         return offered + [FINISH_SCHEMA]
 
     # -- the loop ---------------------------------------------------------
@@ -328,6 +487,14 @@ class AgentLoop:
                 files_changed=list(self.files_changed),
                 tool_calls=self.tool_calls,
             )
+        # Before the run is recorded, so what gets written down includes the answer.
+        # Deliberately after every terminal outcome except the ones that never really
+        # ran: a research run that used all its steps still read sources and recorded
+        # claims, and refusing to write the answer because it never called finish would
+        # throw away the entire run over a missing tool call.
+        if self.brief is not None and outcome.status not in ("failed", "cancelled"):
+            outcome.answer = await self._synthesize(outcome)
+
         # Written for every terminal outcome, including the ones that failed. A run
         # that ran out of steps halfway through a migration is the most useful thing
         # the next session could know, and a save-on-success rule would discard it.
@@ -339,12 +506,95 @@ class AgentLoop:
             "summary": outcome.summary,
             "steps": outcome.steps,
             "files_changed": outcome.files_changed,
+            "answer": outcome.answer,
+            "brief_id": outcome.brief_id,
+            "sources": outcome.sources,
         })
         return outcome
+
+    async def _synthesize(self, outcome: AgentOutcome) -> str:
+        """Write the answer from the brief, in a call of its own.
+
+        Separate from the loop that gathered the sources, and given only the claims and
+        the citations rather than the transcript. The researching model ends its run
+        holding twenty pages of untrusted page text and a strong pull toward whatever it
+        read last; this call cannot be pulled anywhere, because the pages are not in
+        front of it. It is also the reason a run that ran out of steps still produces
+        something: the claims are on disk either way.
+        """
+        claims = self.brief.claims_block()
+        sources = self.brief.citation_block()
+        if not claims and not sources:
+            # Nothing was read and nothing was recorded. Synthesizing here would produce
+            # an answer from the model's own knowledge with a citation section under it,
+            # which is the most convincing possible way to be wrong.
+            return ""
+
+        await self.emit({"type": "agent_synthesis", "brief_id": self.brief.brief_id})
+        request = (
+            f"Question: {self.task}\n\n"
+            f"Claims recorded while researching it:\n{claims or '(none recorded)'}\n\n"
+            f"Sources read:\n{sources or '(none)'}"
+        )
+        if outcome.status != "finished":
+            # Said to the synthesis pass rather than hidden, because an answer written
+            # from a run that stopped early must not read as a complete one.
+            request += (
+                f"\n\nNote: the research run ended as '{outcome.status}' rather than "
+                "finishing, so this may be partial. Say what is missing."
+            )
+        if self.brief.stale:
+            request += f"\n\nNote: {self.brief.stale}"
+
+        try:
+            answer = await skippy_llm.query_text(
+                [
+                    {"role": "system", "content": prompts.RESEARCH_SYNTHESIS},
+                    {"role": "user", "content": request},
+                ],
+                role=self.role,
+                temp=0.2,
+                # Prose, not code: the penalty stops the sentence-repetition loops these
+                # models fall into at low temperature. It must never be used where the
+                # output is code, which is why it is set here and not in the loop.
+                repetition_penalty=1.05,
+            )
+        except Exception:
+            # The claims and the sources are already on disk, so a dead endpoint costs
+            # the prose and nothing else. Better to hand back the record than to fail a
+            # run that did all of its work.
+            logger.warning("Synthesis failed; falling back to the brief.", exc_info=True)
+            return (
+                "The answer could not be written up (the model was unavailable), but the "
+                f"research itself is in brief {self.brief.brief_id}:\n\n{claims}\n\n"
+                f"Sources:\n{sources}"
+            )
+
+        answer = answer.strip()
+        if not answer:
+            return ""
+        try:
+            self.brief.write_answer(answer)
+        except OSError:
+            logger.warning("Could not write the answer into the brief.", exc_info=True)
+        self.answer = answer
+        return answer
 
     def _remember(self, outcome: AgentOutcome) -> None:
         if self.memory is None:
             return
+
+        # Recorded whatever the outcome, because a run that ran out of steps still found
+        # out how this project is tested, and that answer is the same next week. It is a
+        # convention rather than a decision — a fact to reuse verbatim, not a judgment
+        # with reasoning behind it — so it goes in the block every session opens with
+        # instead of waiting to be recalled. Nothing asks the model for it: this is a
+        # thing the loop watched happen.
+        if self._verification_command:
+            try:
+                self.memory.learn_convention("test command", self._verification_command)
+            except Exception:
+                logger.warning("Could not record the test command.", exc_info=True)
         # `failed` and `cancelled` mean the run did not really happen — the endpoint was
         # unreachable, or someone stopped it. When such a run also produced nothing,
         # there is no history in it, and recording it actively hurts: a live run with a
@@ -359,8 +609,11 @@ class AgentLoop:
         did_not_run = outcome.status in ("failed", "cancelled")
         # A logged command counts as having produced something: an RE run killed before
         # it concluded anything still left the evidence trail behind, and that is the
-        # trail the next session picks up.
-        produced = outcome.files_changed or outcome.findings or outcome.commands_logged
+        # trail the next session picks up. A read source counts for the same reason.
+        produced = (
+            outcome.files_changed or outcome.findings or outcome.commands_logged
+            or outcome.sources
+        )
         if did_not_run and not produced:
             logger.info("Not recording a %s run that produced nothing.", outcome.status)
             return
@@ -379,6 +632,31 @@ class AgentLoop:
             # recording it failed would be worse. The work is already on disk.
             logger.warning("Could not record the session in project memory.", exc_info=True)
 
+        # The answer goes into project memory as well as into the brief. The brief is
+        # the working record, filed under a question nobody will think to look up; this
+        # is what a later session — in any mode — finds by searching for the subject,
+        # and it is what stops the same question being researched from scratch a third
+        # time. Source URLs and the date travel with it, because an answer about the web
+        # with neither is worth very little six months on.
+        if self.brief is not None and outcome.answer:
+            try:
+                self.memory.add_research(
+                    question=self.task,
+                    answer=outcome.answer,
+                    sources=[
+                        {
+                            "id": entry["front"].get("id", ""),
+                            "url": entry["front"].get("final_url") or entry["front"].get("url", ""),
+                            "title": entry["front"].get("title", ""),
+                            "fetched": entry["front"].get("fetched", ""),
+                        }
+                        for entry in self.brief.sources()
+                    ],
+                    brief=self.brief.brief_id,
+                )
+            except Exception:
+                logger.warning("Could not record the research in project memory.", exc_info=True)
+
     def _outcome(self, status: str, summary: str) -> AgentOutcome:
         return AgentOutcome(
             status=status,
@@ -386,10 +664,18 @@ class AgentLoop:
             steps=self.step,
             files_changed=list(self.files_changed),
             tool_calls=self.tool_calls,
-            findings=len(self.notes_pack.finding_files()) if self.notes_pack else 0,
+            # A brief's claims are its findings, counted the same way, so that a caller
+            # that reports "N findings" needs to know nothing about which mode ran.
+            findings=(
+                len(self.notes_pack.finding_files()) if self.notes_pack
+                else len(self.brief.claim_files()) if self.brief else 0
+            ),
             pack_id=self.notes_pack.pack_id if self.notes_pack else "",
             commands_logged=len(self.notes_pack.command_files()) if self.notes_pack else 0,
             work_items=list(self.work_items),
+            answer=self.answer,
+            brief_id=self.brief.brief_id if self.brief else "",
+            sources=len(self.brief.source_files()) if self.brief else 0,
         )
 
     async def _loop(self) -> AgentOutcome:
@@ -399,6 +685,7 @@ class AgentLoop:
 
             self.step += 1
             await self._fold_if_needed()
+            await self._deliver_steering()
 
             message = await skippy_llm.query_message(
                 self.transcript.messages,
@@ -439,6 +726,20 @@ class AgentLoop:
                 name, args = call["name"], call["arguments"]
 
                 if name == "finish":
+                    pushback = self._unearned_finish()
+                    if pushback:
+                        # Answered as a failed tool call and the loop continues, so the
+                        # model gets the objection where it is holding the decision
+                        # rather than as a note it reads past.
+                        self._finish_pushbacks += 1
+                        await self.emit({
+                            "type": "agent_finish_refused",
+                            "step": self.step,
+                            "reason": pushback,
+                        })
+                        self._answer(call, ToolResult(False, pushback))
+                        continue
+
                     finish = args
                     # Answered so the transcript stays valid; the loop exits below.
                     self._answer(call, ToolResult(True, "Run ended."))
@@ -455,6 +756,10 @@ class AgentLoop:
                 observation = await self._observe(name, result)
                 if self.notes_pack is not None:
                     note = self._record_re_artifacts(call, result)
+                    if note:
+                        observation = f"{observation}\n{note}"
+                if self.brief is not None:
+                    note = self._record_research_artifacts(call, result)
                     if note:
                         observation = f"{observation}\n{note}"
                 self._answer(call, result, observation)
@@ -479,12 +784,38 @@ class AgentLoop:
                 f"{self.notes_pack.pack_id}, with "
                 f"{len(self.notes_pack.command_files())} command(s) logged"
             )
+        elif self.brief is not None:
+            kept = (
+                f"Claims recorded: {len(self.brief.claim_files())} in brief "
+                f"{self.brief.brief_id}, from {len(self.brief.source_files())} source(s) read"
+            )
         else:
             kept = f"Files changed: {', '.join(self.files_changed) or 'none'}"
         return self._outcome(
             "max_steps",
             f"Ran out of steps after {self.max_steps} without finishing. {kept}.",
         )
+
+    async def _deliver_steering(self) -> None:
+        """Hand the model anything the user said while it was working.
+
+        Marked as arriving mid-run rather than passed off as part of the original task,
+        because the difference matters: it is a correction to work already done, and a
+        model that reads it as more of the brief tends to start again rather than adjust.
+        """
+        if not self._steering:
+            return
+        said, self._steering = self._steering, []
+        for text in said:
+            logger.info("Steering at step %d: %s", self.step, text)
+            await self.emit({"type": "agent_steered", "step": self.step, "content": text})
+            self.transcript.append({
+                "role": "user",
+                "content": (
+                    "The user has just said this, while you are working. Take it as a "
+                    f"correction to what you are doing now, not as a new task:\n\n{text}"
+                ),
+            })
 
     async def _run_tool(self, call: dict) -> ToolResult:
         name, args = call["name"], call["arguments"]
@@ -504,11 +835,17 @@ class AgentLoop:
                 "making progress. Change your approach, or call finish and explain what is "
                 "blocking you.",
             )
+        elif name == "investigate":
+            # Handled here rather than in the dispatcher, for the same reason `finish`
+            # is: what it spends is steps, and the loop is what owns the budget. It also
+            # avoids dispatch having to import the loop that it is itself called from.
+            result = await self._investigate(args)
         else:
             result = await skippy_dispatch.dispatch(
                 name, args, self.sandbox, journal_dir=self.journal_dir,
                 mode=self.mode, notes_pack=self.notes_pack, memory=self.memory,
                 cursor=self.cursor, devices=self.devices, approver=self.approver,
+                research=self.research, brief=self.brief,
             )
 
         # Named rather than inferred from the shape of `data`. This used to key off the
@@ -524,12 +861,25 @@ class AgentLoop:
                 path = report.get("path")
                 if path and path not in self.files_changed:
                     self.files_changed.append(path)
+            # Whatever was established by the last test run is no longer about this
+            # tree. Reset rather than left, because "the tests passed" from before an
+            # edit is the most misleading state a run can finish in.
+            self._verified = None
             await self.emit({
                 "type": "agent_patch",
                 "step": self.step,
                 "files": result.data["files"],
                 "diff": result.data.get("diff", ""),
             })
+
+        # Named by program rather than inferred from success, because a command that
+        # exits 0 having done nothing about the change — `git diff`, a directory listing
+        # — is not evidence, and treating it as such would make the check below
+        # something a run discharges by accident.
+        if name == "run_command" and skippy_exec.is_verification(result.data.get("command", "")):
+            self._verified = bool(result.ok) and result.data.get("exit_code") == 0
+            if self._verified:
+                self._verification_command = str(result.data.get("command") or "")
 
         event = result.as_event()
         event.update({
@@ -643,6 +993,178 @@ class AgentLoop:
             "session on these repos will see this weakness without being told."
         )
 
+    async def _investigate(self, args: dict) -> ToolResult:
+        """Answer one question in a conversation of its own, and return only the answer.
+
+        This is the context-management mechanism, not a delegation one. A question like
+        "which callers depend on this signature" costs fifteen steps of reading, and
+        those fifteen steps of file contents would sit in this run's transcript for the
+        rest of its life — prefilled again on every subsequent step, folded eventually,
+        and crowding out the task. Answering it somewhere else and keeping the paragraph
+        is how a long run stays coherent.
+
+        The child gets the same sandbox and reading tools, its own short budget, and no
+        way to edit, run or spawn. It never records a session: a fragment of an
+        investigation is not something a later session should open with, and the answer
+        is already going where it is needed.
+        """
+        question = " ".join(str(args.get("question") or "").split())
+        if not question:
+            return ToolResult(False, "investigate needs a 'question'.")
+        if self._investigations >= SUBAGENT_LIMIT:
+            return ToolResult(
+                False,
+                f"You have used this run's {SUBAGENT_LIMIT} investigations. Read what you "
+                "need directly with grep and read_file, or finish and say what is still "
+                "unclear.",
+            )
+        self._investigations += 1
+
+        where = str(args.get("where") or "").strip()
+        opening = f"Start from {where}." if where else ""
+
+        async def relay(event: dict) -> None:
+            # Forwarded with a marker rather than swallowed, so the timeline shows the
+            # reading happening instead of a silent gap on an expensive step, and so a
+            # client can nest it under the call that caused it.
+            await self.emit({**event, "sub": True, "parent_step": self.step})
+
+        child = AgentLoop(
+            question,
+            self.sandbox,
+            mode="investigate",
+            max_steps=SUBAGENT_MAX_STEPS,
+            emit=relay,
+            role=SUBAGENT_ROLE or self.role,
+            extra_context=opening,
+            # No session record and no project memory: the child would otherwise write a
+            # fragment into the history that a later run opens with, and read an opening
+            # context it has no use for.
+            remember=False,
+            memory=None,
+        )
+        try:
+            outcome = await child.run()
+        except Exception as exc:
+            logger.exception("Investigation of %r failed.", question)
+            return ToolResult(False, f"The investigation failed: {type(exc).__name__}: {exc}")
+
+        head = f"Investigated: {question}"
+        if not outcome.ok:
+            # Reported as a failure for the same reason the loop reports its own: a
+            # reader that ran out of steps has not answered, and its last words read
+            # exactly like an answer.
+            return ToolResult(
+                False,
+                f"{head} — but the reader did not finish ({outcome.status}), so treat "
+                "this as incomplete.",
+                outcome.summary,
+                {"question": question, "status": outcome.status, "steps": outcome.steps},
+            )
+        return ToolResult(
+            True,
+            f"{head} ({outcome.steps} step(s)).",
+            outcome.summary,
+            {"question": question, "status": outcome.status, "steps": outcome.steps},
+        )
+
+    def _record_research_artifacts(self, call: dict, result: ToolResult) -> str:
+        """Log every page a research run reads, and tell the model what to cite it as.
+
+        The same rule as the RE command log, and the third place ADR 0013 applies:
+        anything that must happen is done by the loop. A source recorded only when the
+        model remembers to record it is a source that a run dying at step nine does not
+        have — and here it is worse than that, because the citation check in
+        `note_claim` can only refuse a fabricated URL if the real ones were logged
+        mechanically.
+
+        Returns a line for the observation. This one is load-bearing rather than
+        informational: the id it reports is how the model cites the page it just read,
+        and without it every claim would be refused.
+        """
+        if call["name"] == "note_claim" and result.ok:
+            self._pages_since_claim = 0
+            return ""
+        if call["name"] != "web_fetch" or not result.ok:
+            return ""
+
+        data = result.data or {}
+        url = str(data.get("final_url") or data.get("url") or "")
+        if not url:
+            return ""
+
+        self._pages_since_claim += 1
+        try:
+            record = self.brief.log_source(
+                url=str(data.get("url") or url),
+                # What the page said, not what the model made of it. The observation was
+                # capped and fenced for the model's benefit; the record keeps the text.
+                text=result.content,
+                title=str(data.get("title") or ""),
+                final_url=url,
+                chunk=int(data.get("chunk") or 1),
+                chunks=int(data.get("chunks") or 1),
+            )
+        except OSError:
+            # The page has already been read and the model already has it. Losing the
+            # log entry costs the citation, not the reading — say so, because a claim
+            # citing this page will now be refused and the model needs to know why.
+            logger.warning("Could not log a source to the brief.", exc_info=True)
+            return (
+                "NOTE: this page could not be written to the brief, so you cannot cite it. "
+                "Say what it told you in your finish summary instead."
+            )
+
+        if not record:
+            return ""
+        return (
+            f"Logged as source {record['id']} in the brief. Cite it by that id in "
+            "note_claim."
+        )
+
+    def _unearned_finish(self) -> str:
+        """Why this `finish` is not accepted yet, or "" if it is.
+
+        The prompt has always said "a change you have not executed is a guess", and a
+        run could always ignore it: edit five files, run nothing, report success. This
+        is ADR 0013's rule applied to the last step of a run — anything that must happen
+        is done by the loop rather than asked of the model — and it is the same shape as
+        the recording nudge, moved to the one moment where the claim is being made.
+
+        Only edits to code trigger it. A run that changed nothing has nothing to have
+        broken, a run that only touched documentation cannot have broken a test with it,
+        and RE and research runs never reach this at all. Demanding a test run for a
+        README edit would teach the model to run the suite as a ritual, which is the
+        habit that makes a green tree stop meaning anything.
+        """
+        code = [
+            path for path in self.files_changed
+            if not str(path).lower().endswith(PROSE_SUFFIXES)
+        ]
+        if not code or self._verified is True:
+            return ""
+        if self._finish_pushbacks >= FINISH_PUSHBACK_LIMIT:
+            # Said once. See FINISH_PUSHBACK_LIMIT: a run that cannot end is worse than
+            # one that ends unverified, and by now the model has been asked and has
+            # chosen to finish anyway, which is a position it can defend in its summary.
+            return ""
+
+        changed = ", ".join(code[:5])
+        if self._verified is False:
+            return (
+                f"The last check you ran did not pass, and you have changed {changed}. "
+                "Do not report this as done: fix what is failing, or call finish again "
+                "and say plainly in your summary what is broken and why you are leaving "
+                "it. Reporting a red tree as finished is the one outcome that wastes the "
+                "next session's time completely."
+            )
+        return (
+            f"You have changed {changed} but have not run anything since. A change you "
+            "have not executed is a guess — run the project's tests, or whatever check "
+            "this repository has, and finish once you know the result. If there is "
+            "genuinely nothing to run here, call finish again and say so in your summary."
+        )
+
     def _recording_nudge(self) -> str:
         """Say something when a run has been inspecting for a while and recording nothing.
 
@@ -655,6 +1177,19 @@ class AgentLoop:
         Resets on firing, so it recurs at the same interval rather than every step. A
         nudge repeated every step is one the model learns to read past.
         """
+        if self.brief is not None:
+            if self._pages_since_claim < RESEARCH_RECORD_NUDGE_AFTER:
+                return ""
+            count = self._pages_since_claim
+            self._pages_since_claim = 0
+            return (
+                f"You have read {count} pages without recording a claim. The pages "
+                "themselves are saved to the brief, so the sources are safe — but what you "
+                "concluded from them is not, and the final answer is written from your "
+                "claims rather than from this conversation. Record what these sources "
+                "support now, at whatever confidence is honest, before reading anything "
+                "further."
+            )
         if self.notes_pack is None or self._commands_since_finding < RE_RECORD_NUDGE_AFTER:
             return ""
         count = self._commands_since_finding
@@ -766,6 +1301,7 @@ async def run_task(
     role: Optional[str] = None,
     mode: str = skippy_exec.DEFAULT_MODE,
     notes_root: Optional[str] = None,
+    briefs_root: Optional[str] = None,
     target: str = "",
     memory: Optional[Any] = None,
     memory_root: Optional[str] = None,
@@ -774,12 +1310,26 @@ async def run_task(
     history: Optional[Sequence[dict]] = None,
     devices: Optional[Any] = None,
     approver: Optional[Any] = None,
+    research: Optional[Any] = None,
 ) -> AgentOutcome:
     """Convenience entry point for one task."""
     loop = AgentLoop(
         task, sandbox, max_steps=max_steps, emit=emit, journal_dir=journal_dir,
-        role=role, mode=mode, notes_root=notes_root, target=target,
-        memory=memory, memory_root=memory_root, remember=remember, cursor=cursor,
-        history=history, devices=devices, approver=approver,
+        role=role, mode=mode, notes_root=notes_root, briefs_root=briefs_root,
+        target=target, memory=memory, memory_root=memory_root, remember=remember,
+        cursor=cursor, history=history, devices=devices, approver=approver,
+        research=research,
     )
     return await loop.run()
+
+
+async def run_research(question: str, sandbox: Sandbox, **kwargs) -> AgentOutcome:
+    """Answer one question from the web, and leave a brief behind.
+
+    A thin wrapper on purpose. Research is the same think-tool-observe-finish loop with
+    a different toolset, a different prompt and a different record — making it a mode
+    rather than a second loop is what keeps the transcript contract, the repeat
+    detection, the folding and the cancellation shared. What is added on top is one
+    call: the synthesis pass that turns the brief into an answer.
+    """
+    return await run_task(question, sandbox, mode="research", **kwargs)

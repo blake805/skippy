@@ -83,6 +83,20 @@ def notes_root(ensure: bool = True) -> str:
     return path
 
 
+def briefs_root(ensure: bool = True) -> str:
+    """Research briefs: the sources read for a question and the claims they support.
+
+    Beside the note packs rather than inside them, and plain files for the same
+    reasons: a brief is the only durable product of a research run, it has to be
+    readable by a person with no Skippy running, and a page's text as it was on the day
+    we read it is worth keeping long after the page itself has changed.
+    """
+    path = os.path.join(memory_root(), "briefs")
+    if ensure:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
 def configured_workspace_roots() -> list:
     """The repos the agent may touch, from `SKIPPY_WORKSPACE_ROOTS` (os.pathsep).
 

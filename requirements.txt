@@ -22,8 +22,11 @@ sounddevice  # tools/voice_client.py only
 # SKIPPY_VOICE_TTS ("mlx:<model_id>"). Not listed here because this file must
 # also install on Linux.
 
-# Tools
-ddgs
+# Web research (skippy_research). The search backend and the page fetcher both go
+# through httpx, which is already here for the model endpoints, and boilerplate
+# stripping is stdlib HTMLParser — no reader service in the path, and nothing new to
+# install. A search API key goes in SKIPPY_TAVILY_KEY; without one, search refuses and
+# says so, and the rest of Skippy is unaffected.
 
 # RE device I/O (skippy_device). pyserial may already be present via platformio;
 # listed explicitly so a clean install has it. pyusb needs libusb on the host

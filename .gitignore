@@ -3,6 +3,11 @@ venv/
 venv_smoke/
 __pycache__/
 
+# Scoreboard runs are a local record, not shared state: they are machine- and
+# model-specific, and two people's numbers are not comparable. Keep your own.
+benchmarks/agent/*.json
+benchmarks/decode/*.json
+
 # Large Media & AI Models
 *.onnx
 *.bin

@@ -8,7 +8,6 @@ uvicorn
 httpx
 websockets
 python-multipart
-ddgs
 pytest
 pytest-asyncio
 pyflakes

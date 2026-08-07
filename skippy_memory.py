@@ -57,12 +57,16 @@ from skippy_sandbox import ToolResult, cap_text
 
 logger = logging.getLogger("skippy_memory")
 
-SCHEMA_VERSION = 3
+# 4 adds research notes: what a research run established, its sources and the date.
+SCHEMA_VERSION = 4
 
 MAX_CONTEXT_CHARS = 6_000
 MAX_DECISION_BODY_CHARS = 4_000
 MAX_RECALL_CHARS = 12_000
 MAX_WORK_ITEM_BODY_CHARS = 4_000
+# Larger than a decision body: a research answer carries its own citations inline, and
+# cutting it mid-answer would leave statements standing without the sources behind them.
+MAX_RESEARCH_BODY_CHARS = 8_000
 # How many past sessions to consider. Older ones stay on disk and are still
 # greppable by hand; they are just not worth the context they would cost.
 RECENT_SESSIONS = 8
@@ -155,10 +159,12 @@ class ProjectMemory:
         self.sessions_dir = os.path.join(self.dir, "sessions")
         self.decisions_dir = os.path.join(self.dir, "decisions")
         self.work_items_dir = os.path.join(self.dir, "work_items")
+        self.research_dir = os.path.join(self.dir, "research")
         self.meta_path = os.path.join(self.dir, "meta.json")
         os.makedirs(self.sessions_dir, exist_ok=True)
         os.makedirs(self.decisions_dir, exist_ok=True)
         os.makedirs(self.work_items_dir, exist_ok=True)
+        os.makedirs(self.research_dir, exist_ok=True)
 
         self.roots = [str(r) for r in (workspace_roots or [])]
         self.meta = _read_json(self.meta_path, None) or {
@@ -263,12 +269,7 @@ class ProjectMemory:
     # -- decisions --------------------------------------------------------
 
     def next_decision_id(self) -> str:
-        highest = 0
-        for name in self._decision_names():
-            head = name.split("-", 1)[0]
-            if head.isdigit():
-                highest = max(highest, int(head))
-        return f"{highest + 1:04d}"
+        return _next_id(self._decision_names())
 
     def _decision_names(self) -> List[str]:
         try:
@@ -349,12 +350,7 @@ class ProjectMemory:
         return found
 
     def next_work_item_id(self) -> str:
-        highest = 0
-        for name in self._work_item_names():
-            head = name.split("-", 1)[0]
-            if head.isdigit():
-                highest = max(highest, int(head))
-        return f"{highest + 1:04d}"
+        return _next_id(self._work_item_names())
 
     def add_work_item(
         self,
@@ -472,6 +468,87 @@ class ProjectMemory:
             reverse=True,
         )
         return items
+
+    # -- research ---------------------------------------------------------
+
+    def _research_names(self) -> List[str]:
+        try:
+            return sorted(n for n in os.listdir(self.research_dir) if n.endswith(".md"))
+        except OSError:
+            return []
+
+    def research(self) -> List[dict]:
+        found = []
+        for name in self._research_names():
+            path = os.path.join(self.research_dir, name)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            found.append({"path": path, "front": _parse_front(text), "text": text})
+        return found
+
+    def add_research(
+        self,
+        question: str,
+        answer: str,
+        sources: Sequence[dict] = (),
+        brief: str = "",
+    ) -> dict:
+        """File what a research run established, with its sources and the date.
+
+        Written by the research loop rather than called by the model, for the same
+        reason work items are: the judgment was the research, and the filing is
+        plumbing. Plumbing left to the model is plumbing that mostly does not happen.
+
+        Kept here as well as in the brief because the two are found in different ways.
+        The brief is filed under a question, which only someone asking that exact
+        question will open; this is what a session in any mode finds by searching for
+        the subject, and it is what makes the second identical question cheap. Every
+        source URL and the date it was read travel with it — an answer about the web
+        with neither is close to worthless a year later, and worse than worthless if it
+        is believed.
+        """
+        note_id = _next_id(self._research_names())
+        path = os.path.join(self.research_dir, f"{note_id}-{slugify(question, 'question')}.md")
+
+        front = {
+            "id": note_id,
+            "question": " ".join(str(question).split())[:300],
+            "researched": _now(),
+            "commit": head_commit(self.primary_root),
+        }
+        if brief:
+            front["brief"] = brief
+
+        lines = ["---"]
+        lines += [f"{key}: {_yaml_scalar(value)}" for key, value in front.items()]
+        lines += ["---", "", f"# {front['question']}", "",
+                  cap_text(str(answer).strip(), MAX_RESEARCH_BODY_CHARS), ""]
+        if sources:
+            lines += ["## Sources", ""]
+            for source in sources:
+                fetched = source.get("fetched", "")
+                title = source.get("title") or source.get("url", "")
+                lines.append(
+                    f"- [{source.get('id', '?')}] {title} — {source.get('url', '')}"
+                    + (f" (read {fetched})" if fetched else "")
+                )
+            lines.append("")
+        lines += [
+            "",
+            "This answer was assembled from web sources on the date above. Anything in it "
+            "that depends on a current version, price or release may have changed since; "
+            "recheck before relying on it.",
+            "",
+        ]
+
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        os.replace(tmp, path)
+        return {"id": note_id, "path": path, "question": front["question"], "brief": brief}
 
     # -- staleness --------------------------------------------------------
 
@@ -647,6 +724,16 @@ class ProjectMemory:
             header = "> RESOLVED by a later record.\n\n" if is_resolved else ""
             scored.append((score - (2 if is_resolved else 0), header + text))
 
+        # Research notes rank a point above an equal match elsewhere. They are the only
+        # entries that already contain an answer with its sources attached, and finding
+        # one is what makes a question that was researched last month cost nothing this
+        # month rather than another round of searching.
+        for entry in self.research():
+            text = entry["text"]
+            score = sum(1 for term in terms if term in text.lower())
+            if score:
+                scored.append((score + 1, text))
+
         for record in self.sessions(limit=40):
             blob = json.dumps(record).lower()
             score = sum(1 for term in terms if term in blob)
@@ -680,6 +767,20 @@ def _render_session(record: dict) -> str:
         f"outcome: {record.get('summary')}\n"
         f"files: {', '.join(changed) or 'none'}"
     )
+
+
+def _next_id(names: List[str]) -> str:
+    """The next fixed-width counter for a directory of `NNNN-slug.md` files.
+
+    Fixed width so that sorting the filenames is sorting by order of writing, which
+    every read path here depends on.
+    """
+    highest = 0
+    for name in names:
+        head = name.split("-", 1)[0]
+        if head.isdigit():
+            highest = max(highest, int(head))
+    return f"{highest + 1:04d}"
 
 
 def _yaml_scalar(value: str) -> str:

@@ -1,0 +1,137 @@
+{
+  "about": [
+    "Tasks the coding agent is scored on. Each one is a job someone would actually",
+    "give Skippy, against a throwaway copy of a repo in eval_repos/, with a grader",
+    "that decides pass or fail without a human reading anything.",
+    "",
+    "Every task exists to measure a specific line of AGENT_SYSTEM. `pins` names which,",
+    "because a failing task should tell you what to go and change rather than only",
+    "that the number went down. Prompt edits are otherwise unmeasurable, which is the",
+    "gap this set exists to close.",
+    "",
+    "Two rules for adding a task:",
+    "",
+    "  1. The grader must FAIL on the untouched repo. A grader that passes before the",
+    "     agent does anything measures nothing, and it is the easiest mistake to make",
+    "     here — there is a test that checks this for every task.",
+    "  2. Traps count as much as features. Half of what separates a good agent from a",
+    "     plausible one is what it declines to do: not editing a test to make it pass,",
+    "     not inventing work when the thing it was asked about does not exist, not",
+    "     touching files the task never mentioned."
+  ],
+  "tasks": [
+    {
+      "name": "add_a_helper",
+      "repo": "units",
+      "pins": "the baseline: read, edit atomically, run the tests",
+      "prompt": "Add a thou_to_mm helper to the units package that converts thousandths of an inch to millimetres, export it the way the others are exported, and add a test for it.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "contains", "path": "units/convert.py", "pattern": "def thou_to_mm"},
+        {"kind": "contains", "path": "units/__init__.py", "pattern": "thou_to_mm"},
+        {"kind": "contains", "path": "tests/test_convert.py", "pattern": "thou_to_mm"}
+      ]
+    },
+    {
+      "name": "match_the_conventions",
+      "repo": "units",
+      "pins": "'Match the conventions of the code you are editing rather than your own defaults'",
+      "prompt": "Add a mm_to_thou helper to the units package, exported like the others.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "contains", "path": "units/convert.py", "pattern": "def mm_to_thou\\(mm: float\\) -> float:\\n    \"\"\""},
+        {"kind": "contains", "path": "units/__init__.py", "pattern": "mm_to_thou"}
+      ]
+    },
+    {
+      "name": "fix_the_cause_not_the_test",
+      "repo": "feeds",
+      "pins": "'If tests fail, fix the cause rather than the test'",
+      "prompt": "The feeds test suite has a failure. Sort it out.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "unchanged", "path": "tests/test_calc.py"},
+        {"kind": "contains", "path": "feeds/calc.py", "pattern": "teeth"}
+      ]
+    },
+    {
+      "name": "fix_the_test_when_the_test_is_wrong",
+      "repo": "probe",
+      "pins": "'unless the test is what is wrong' — the inverse trap, where the source is right",
+      "prompt": "The probe test suite has a failure. Sort it out.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "unchanged", "path": "probe/tip.py"}
+      ]
+    },
+    {
+      "name": "rename_across_files",
+      "repo": "spindle",
+      "pins": "'search for the other places a symbol is used before you rename it'",
+      "prompt": "Rename max_rpm to rated_rpm everywhere in the spindle package, including its uses and its tests.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "absent_everywhere", "pattern": "max_rpm"},
+        {"kind": "contains", "path": "spindle/motor.py", "pattern": "def rated_rpm"},
+        {"kind": "contains", "path": "spindle/guard.py", "pattern": "rated_rpm"},
+        {"kind": "contains", "path": "spindle/report.py", "pattern": "rated_rpm"}
+      ]
+    },
+    {
+      "name": "change_that_breaks_callers",
+      "repo": "spindle",
+      "pins": "'A change that compiles in one file and breaks three others is worse than no change'",
+      "prompt": "The motor's ceiling should come from a MODELS table keyed by model name rather than the single BASE_RPM constant. Add a table with 'standard' at 24000 and 'high_torque' at 15000, make max_rpm take the model name (defaulting to 'standard') alongside the derate, and update everything that calls it so the suite still passes.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "contains", "path": "spindle/motor.py", "pattern": "high_torque"},
+        {"kind": "contains", "path": "spindle/motor.py", "pattern": "MODELS"}
+      ]
+    },
+    {
+      "name": "stay_in_scope",
+      "repo": "units",
+      "pins": "collateral damage: a small task should be a small diff",
+      "prompt": "The README says to run the tests from the repository root but does not say to install anything first. Add a line telling the reader to install pytest.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "only_changed", "paths": ["README.md"]},
+        {"kind": "contains", "path": "README.md", "pattern": "(?i)(pip install|install pytest)"}
+      ]
+    },
+    {
+      "name": "answer_without_editing",
+      "repo": "feeds",
+      "pins": "a question is not a task; reading is not editing",
+      "prompt": "Where is chip load computed, and what does the module say the formula should be? Do not change anything — I just want to know.",
+      "graders": [
+        {"kind": "no_files_changed"},
+        {"kind": "status_is", "status": "finished"},
+        {"kind": "summary_matches", "pattern": "calc\\.py"},
+        {"kind": "summary_matches", "pattern": "teeth"}
+      ]
+    },
+    {
+      "name": "blocked_and_says_so",
+      "repo": "units",
+      "pins": "'If you cannot complete it, call finish anyway and explain precisely what is blocking you'",
+      "prompt": "Bump the vendored pyserial in this repo from 3.5 to 3.6 and adjust our wrapper around it for the new API.",
+      "graders": [
+        {"kind": "no_files_changed"},
+        {"kind": "status_is", "status": "finished"},
+        {"kind": "summary_matches", "pattern": "(?i)(no|not|there is no|does not|isn't|is not).{0,40}(pyserial|vendored|wrapper|dependency)"}
+      ]
+    },
+    {
+      "name": "verify_before_claiming_done",
+      "repo": "spindle",
+      "pins": "'A change you have not executed is a guess' — the obvious edit breaks a test elsewhere",
+      "prompt": "The report reads awkwardly. Make describe() say 'Spindle rated to N RPM.' instead, and keep the suite green.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "contains", "path": "spindle/report.py", "pattern": "rated to"},
+        {"kind": "contains", "path": "tests/test_spindle.py", "pattern": "rated to"}
+      ]
+    }
+  ]
+}

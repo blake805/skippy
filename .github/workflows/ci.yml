@@ -50,11 +50,13 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
-      # Skippy is meant to work with the internet unplugged, and the local/cloud
-      # policy in ADR 0007 is only meaningful if that is enforced rather than
-      # asserted. The suite runs in a network namespace with nothing but loopback,
-      # so anything reaching for the internet fails here. The runner's own agent
-      # stays outside the namespace and can still report the result.
+      # The *suite* must pass with the internet unplugged. That used to be a claim
+      # about Skippy himself; since ADR 0022 he reads the web on purpose, and this
+      # job is now about the tests: every model endpoint, search backend and page
+      # fetch has a fake in front of it, and a test that quietly reached the real
+      # internet would be one that fails on someone's train. The namespace has
+      # nothing but loopback, so such a test fails here instead. The runner's own
+      # agent stays outside the namespace and can still report the result.
       # sudo rather than --map-root-user: Ubuntu 24.04 restricts unprivileged user
       # namespaces via AppArmor, so the unprivileged form fails on this runner.
       - name: Run pytest with only loopback available

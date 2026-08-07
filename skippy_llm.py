@@ -126,16 +126,22 @@ MODELS: Dict[str, ModelEndpoint] = _build_registry()
 # prompt cache stays warm across steps (ADR 0001); set to "fast" to A/B a
 # cheap-planner split without a refactor.
 AGENT_PLANNER_ROLE = _env("SKIPPY_AGENT_PLANNER_ROLE", "heavy")
-AGENT_CODER_ROLE = _env("SKIPPY_AGENT_CODER_ROLE", "heavy")
+
+# There was an `AGENT_CODER_ROLE` here for a planner/coder split, and nothing ever read
+# it. It is gone rather than left: ADR 0001 decided one role drives the whole loop, and
+# splitting the writing off would need a second transcript and a second prompt cache —
+# the exact cost that decision exists to avoid. A knob that does nothing is worse than no
+# knob, because someone eventually sets it and expects an effect. Where a cheaper model
+# genuinely does belong is a sub-run with a transcript of its own; that has its own
+# setting, next to the thing it configures.
 
 
 def reload_registry() -> Dict[str, ModelEndpoint]:
     """Re-read the environment. Used by tests that point roles at a fake server."""
-    global AGENT_PLANNER_ROLE, AGENT_CODER_ROLE
+    global AGENT_PLANNER_ROLE
     MODELS.clear()
     MODELS.update(_build_registry())
     AGENT_PLANNER_ROLE = _env("SKIPPY_AGENT_PLANNER_ROLE", "heavy")
-    AGENT_CODER_ROLE = _env("SKIPPY_AGENT_CODER_ROLE", "heavy")
     return MODELS
 
 
@@ -279,6 +285,13 @@ async def query_message(
                 "%s endpoint attempt %d/%d failed: %s", role, attempt + 1, attempts, last_error
             )
             if attempt + 1 < attempts:
+                # Warm the sampler a little on each retry. Not every failure here is the
+                # endpoint being down: mlx_lm's Qwen3-Coder tool parser crashes its own
+                # handler thread on a tool call it cannot parse, which reaches us as a
+                # bare disconnect, and at temperature 0.1 against a warm prompt cache the
+                # retry regenerates near-identical text and dies identically. Three
+                # attempts at the same payload is one attempt billed three times.
+                payload["temperature"] = min(temp + 0.15 * (attempt + 1), 1.0)
                 await asyncio.sleep(2.0 * (2 ** attempt))
     finally:
         if owned_client:

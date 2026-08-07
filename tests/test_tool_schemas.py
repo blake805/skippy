@@ -16,8 +16,10 @@ import skippy_edit
 import skippy_exec
 import skippy_fs
 import skippy_git
+import skippy_brief
 import skippy_memory
 import skippy_re
+import skippy_research
 import tool_schemas
 
 # The schemas that describe a real Python function, and the function they describe.
@@ -43,11 +45,18 @@ IMPLEMENTED = {
     "i2c_io": skippy_device.i2c_io,
     "gpio_io": skippy_device.gpio_io,
     "adc_read": skippy_device.adc_read,
+    "web_search": skippy_research.web_search,
+    "web_fetch": skippy_research.web_fetch,
+    "note_claim": skippy_brief.note_claim,
+    "read_brief": skippy_brief.read_brief,
 }
 
 # Arguments the dispatcher supplies. The model never sees these, so a schema that
 # declared one would be describing a parameter it cannot fill.
-INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory", "approver", "service")
+INJECTED = (
+    "sandbox", "pack", "journal_dir", "mode", "memory", "approver", "service", "session",
+    "brief",
+)
 
 # Tools that accept their required arguments with Python defaults and check them in
 # the body, so an omission comes back as a message naming the field and its legal
@@ -57,6 +66,7 @@ INJECTED = ("sandbox", "pack", "journal_dir", "mode", "memory", "approver", "ser
 SELF_VALIDATING = {
     "note_finding": {"kind", "title", "body", "confidence"},
     "record_decision": {"title", "body"},
+    "note_claim": {"claim", "support", "sources", "confidence"},
 }
 
 
@@ -135,6 +145,16 @@ def test_a_self_validating_tool_actually_rejects_what_it_calls_required(name, fi
             "confidence": "confirmed",
         }
         first = skippy_re.open_pack(str(tmp_path / "notes"), target="t")
+    elif name == "note_claim":
+        valid = {
+            "claim": "The rapid rate is 400 IPM.",
+            "support": "The specifications table gives 400 IPM.",
+            "sources": "S1",
+            "confidence": "likely",
+        }
+        first = skippy_brief.open_brief(str(tmp_path / "briefs"), question="How fast?")
+        # A claim can only cite a page the run actually read, so there has to be one.
+        first.log_source(url="https://widget.example/specs", text="400 IPM.", title="Specs")
     else:
         valid = {
             "title": "Retries belong in the transport",
