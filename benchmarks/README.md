@@ -57,13 +57,21 @@ same OpenAI-compatible `/v1/chat/completions`, which is why nothing else has to 
 
 ```bash
 pip install mlx-vlm
-mlx_vlm.server --model mlx-community/Qwen2.5-VL-32B-Instruct-8bit --port 8084
+python -m mlx_vlm.server --model mlx-community/Qwen3-VL-32B-Instruct-8bit --port 8084
 
 SKIPPY_VISION_URL=http://127.0.0.1:8084/v1/chat/completions \
-SKIPPY_VISION_MODEL=mlx-community/Qwen2.5-VL-32B-Instruct-8bit \
-python benchmarks/vision_spike.py photo-of-a-board.jpg --repeats 2 \
+SKIPPY_VISION_MODEL=mlx-community/Qwen3-VL-32B-Instruct-8bit \
+python benchmarks/vision_spike.py bench-photos/*.jpg --repeats 2 \
     --ask "Read every part number you can make out. Say which you are unsure of."
 ```
+
+Worth running twice, against two different kinds of model. `mlx-vlm` now carries a
+class of OCR specialists that did not exist when this was written — DeepSeek-OCR,
+DOTS-OCR, GLM-OCR, PaddleOCR-VL — and reading a part number off a chip is their whole
+job, where it is a side skill for a general VL model. But "what is this board" and
+"which connector is that" are not OCR questions, so if the specialist wins on text and
+loses on everything else, the answer is two models or none, and that is worth knowing
+before a role gets added to the registry.
 
 It tries the OpenAI request shape (base64 data URL) and falls back to mlx-vlm's own
 (`input_image` with a path), reporting which was accepted — the real integration will

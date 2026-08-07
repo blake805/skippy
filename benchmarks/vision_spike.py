@@ -22,13 +22,17 @@ does not load VL weights. `mlx_vlm.server` speaks the same OpenAI-compatible
 `/v1/chat/completions`, which is why nothing else here has to change.
 
     pip install mlx-vlm
-    mlx_vlm.server --model mlx-community/Qwen2.5-VL-32B-Instruct-8bit --port 8084
+    python -m mlx_vlm.server --model mlx-community/Qwen3-VL-32B-Instruct-8bit --port 8084
 
     SKIPPY_VISION_URL=http://127.0.0.1:8084/v1/chat/completions \\
-    SKIPPY_VISION_MODEL=mlx-community/Qwen2.5-VL-32B-Instruct-8bit \\
-        python benchmarks/vision_spike.py uploads/IMG_2093.JPG \\
+    SKIPPY_VISION_MODEL=mlx-community/Qwen3-VL-32B-Instruct-8bit \\
+        python benchmarks/vision_spike.py bench-photos/*.jpg --repeats 2 \\
             --ask "What is this board, and what is the largest chip on it?" \\
             --ask "Read every part number you can make out. Say which you are unsure of."
+
+The photographs have to be real ones off the bench, taken the way you would actually
+take them: the phone in one hand, whatever light is over the machine, no staging. A
+spike run against clean product shots answers a question nobody asked.
 
 Two request shapes are tried, because mlx-vlm documents its own (`input_image` with a
 path) alongside the OpenAI one (`image_url` with a base64 data URL) and it is not worth
@@ -66,7 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import httpx  # noqa: E402
 
 DEFAULT_URL = "http://127.0.0.1:8084/v1/chat/completions"
-DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-32B-Instruct-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3-VL-32B-Instruct-8bit"
 
 DEFAULT_QUESTIONS = [
     "What is in this picture? Two sentences.",
