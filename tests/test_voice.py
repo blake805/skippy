@@ -9,7 +9,9 @@ wire logic must all be testable without any of them installed.
 import asyncio
 import json
 import struct
+import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -156,6 +158,76 @@ def test_energy_vad_noise_floor_does_not_learn_from_speech():
     for _ in range(50):
         assert vad.is_speech(loud_frame())
     assert vad.floor == floor_before
+
+
+# --- streaming plumbing: interruption must actually stop the work ---
+
+def test_a_cancelled_consumer_stops_the_synthesis_thread():
+    produced = []
+
+    def factory():
+        for i in range(200):
+            produced.append(i)
+            time.sleep(0.005)
+            yield b"x"
+
+    async def flow():
+        stream = skippy_voice._iterate_in_thread(factory)
+        async for _ in stream:
+            break  # barge-in: the consumer walks away after the first chunk
+        await stream.aclose()  # what task cancellation does to the generator
+        await asyncio.sleep(0.05)  # let the worker notice the stop signal
+        count = len(produced)
+        await asyncio.sleep(0.2)
+        # At most the chunk in flight completes; the sentence does not.
+        assert len(produced) <= count + 1, "producer kept synthesizing after the consumer left"
+
+    asyncio.run(flow())
+
+
+# --- the brain's fallback: a hung server must not beat a dead one ---
+
+def make_stream_role(calls, primary_fails):
+    async def fake_stream_role(role, messages, temp):
+        calls.append(role)
+        if role != "fast" and primary_fails:
+            raise httpx.ReadTimeout("server up, reply never came")
+        yield "hello "
+        yield "there."
+    return fake_stream_role
+
+
+def test_stream_chat_falls_back_when_the_voice_server_hangs(monkeypatch):
+    monkeypatch.delenv("SKIPPY_VOICE_ROLE", raising=False)
+    calls = []
+    monkeypatch.setattr(skippy_voice, "_stream_role", make_stream_role(calls, primary_fails=True))
+
+    async def collect():
+        return [token async for token in skippy_voice.stream_chat([])]
+
+    assert asyncio.run(collect()) == ["hello ", "there."]
+    assert calls == ["voice", "fast"]
+
+
+def test_a_mid_stream_failure_does_not_restart_the_reply(monkeypatch):
+    # Tokens already yielded are already being spoken; a fallback here would
+    # say the reply twice. The failure surfaces instead.
+    monkeypatch.delenv("SKIPPY_VOICE_ROLE", raising=False)
+
+    async def dies_after_a_token(role, messages, temp):
+        yield "First half of the reply, "
+        raise skippy_voice.skippy_llm.ModelError("died mid-stream")
+
+    monkeypatch.setattr(skippy_voice, "_stream_role", dies_after_a_token)
+
+    async def collect():
+        tokens = []
+        with pytest.raises(skippy_voice.skippy_llm.ModelError):
+            async for token in skippy_voice.stream_chat([]):
+                tokens.append(token)
+        return tokens
+
+    assert asyncio.run(collect()) == ["First half of the reply, "]
 
 
 # --- auth ---
@@ -421,6 +493,33 @@ def test_heavy_answers_arrive_as_a_spoken_announcement(monkeypatch):
     asyncio.run(flow())
     assert len(announced) == 1
     assert "Forty-two." in announced[0]
+
+
+def test_announcements_wait_out_the_transcription_window(monkeypatch):
+    # From utterance close to responder creation, the endpointer is idle and
+    # no responder task exists — the only thing telling _announce the room is
+    # not actually quiet is the turn flag.
+    session, _, _, _ = make_session(monkeypatch)
+    assert session._quiet()
+    session._turn_active = True
+    assert not session._quiet()
+    session._turn_active = False
+    assert session._quiet()
+
+
+def test_the_turn_flag_covers_stt_and_clears_after(monkeypatch):
+    session, _, _, _ = make_session(monkeypatch)
+    seen = {}
+
+    class SpyingSTT:
+        def transcribe(self, wav_path):
+            seen["active_during_stt"] = session._turn_active
+            return ""  # empty transcript: the turn ends without a responder
+
+    monkeypatch.setattr(skippy_voice, "get_stt", SpyingSTT)
+    asyncio.run(session._on_utterance(b"\x00" * FRAME_BYTES))
+    assert seen["active_during_stt"] is True
+    assert session._turn_active is False
 
 
 def test_memory_search_admits_when_it_finds_nothing(monkeypatch):

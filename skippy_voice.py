@@ -68,6 +68,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 import time
 import wave
 from collections import deque
@@ -537,27 +538,39 @@ async def _iterate_in_thread(factory: Callable[[], Iterator[bytes]]) -> AsyncIte
     The synthesis generators hold the GIL-releasing MLX work; running them
     inline would stall the websocket's heartbeat exactly the way the old
     whole-clause synthesize did, just in smaller pieces.
+
+    The stop event is the barge-in path's reach into the worker: when the
+    consumer is cancelled mid-sentence, the producer must not keep
+    synthesizing the rest of it into a queue nobody will drain — that work
+    runs on the same GPU that is about to transcribe the interruption. The
+    check sits between chunks, so at worst the chunk in flight completes.
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     done = object()
+    stop = threading.Event()
 
     def produce() -> None:
         try:
             for item in factory():
+                if stop.is_set():
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, item)
             loop.call_soon_threadsafe(queue.put_nowait, done)
         except BaseException as exc:  # surfaces on the consumer side
             loop.call_soon_threadsafe(queue.put_nowait, exc)
 
     loop.run_in_executor(None, produce)
-    while True:
-        item = await queue.get()
-        if item is done:
-            return
-        if isinstance(item, BaseException):
-            raise item
-        yield item
+    try:
+        while True:
+            item = await queue.get()
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
 
 
 def build_tts():
@@ -600,20 +613,27 @@ async def stream_chat(
     registry, same local/cloud policy, different transport.
 
     The default role is "voice" (a chat-tuned model on its own port). If that
-    server is not running, the stream falls back to "fast" once, loudly: a
-    degraded brainstorm beats a dead microphone, but it must not be silent.
+    server cannot produce a reply — refused connection, timeout, or an error
+    status — the stream falls back to "fast" once, loudly: a degraded
+    brainstorm beats a dead microphone, and a hung server must not behave
+    worse than a dead one. The one case that does not fall back is a failure
+    after tokens have already flowed: those tokens are already being spoken,
+    and restarting the reply on another model would say it twice.
     """
     wanted = role or _env("SKIPPY_VOICE_ROLE", "voice")
+    emitted = False
     try:
         async for token in _stream_role(wanted, messages, temp):
+            emitted = True
             yield token
         return
-    except httpx.ConnectError:
-        if wanted == "fast":
+    except (httpx.HTTPError, skippy_llm.ModelError) as exc:
+        if wanted == "fast" or emitted:
             raise
         logger.warning(
-            "Voice role '%s' is unreachable; falling back to 'fast'. Start its "
-            "server (or set SKIPPY_VOICE_ROLE) for the intended brain.", wanted,
+            "Voice role '%s' failed before its first token (%s); falling back "
+            "to 'fast'. Start its server (or set SKIPPY_VOICE_ROLE) for the "
+            "intended brain.", wanted, exc,
         )
     async for token in _stream_role("fast", messages, temp):
         yield token
@@ -889,6 +909,13 @@ class VoiceSession:
         self.duplex = True
         self._responder: Optional[asyncio.Task] = None
         self._speaking = False
+        # True from the moment an utterance closes until its responder task
+        # exists. During that window (mostly STT) the endpointer reads idle
+        # and _responding() is False, so without this flag an announcement
+        # would call the room quiet, start talking, and then have its
+        # _responder slot overwritten by the turn's own task — leaving it
+        # speaking over the reply with no way to barge in on it.
+        self._turn_active = False
         # Action lane state. The client id is unique per session so two open
         # voice clients (the Mac and the phone) each get their own task slot
         # and their own completion announcements.
@@ -933,35 +960,42 @@ class VoiceSession:
     # -- one turn ---------------------------------------------------------
 
     async def _on_utterance(self, pcm: bytes) -> None:
-        await self._cancel_response()
-        await self._send_json({"type": "state", "state": "thinking"})
-        heard_at = time.monotonic()
-
-        def transcribe() -> str:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                path = tmp.name
-            try:
-                write_wav(path, pcm)
-                return get_stt().transcribe(path)
-            finally:
-                os.unlink(path)
-
+        self._turn_active = True
         try:
-            text = await asyncio.to_thread(transcribe)
-        except Exception as exc:
-            logger.exception("STT failed")
-            await self._send_json({"type": "error", "message": f"Transcription failed: {exc}"})
-            await self._send_json({"type": "state", "state": "listening"})
-            return
+            await self._cancel_response()
+            await self._send_json({"type": "state", "state": "thinking"})
+            heard_at = time.monotonic()
 
-        stt_ms = int(1000 * (time.monotonic() - heard_at))
-        if not text or len(text.strip(" .")) < 2:
-            await self._send_json({"type": "state", "state": "listening"})
-            return
+            def transcribe() -> str:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    path = tmp.name
+                try:
+                    write_wav(path, pcm)
+                    return get_stt().transcribe(path)
+                finally:
+                    os.unlink(path)
 
-        await self._send_json({"type": "transcript", "text": text})
-        self.history.append({"role": "user", "content": text})
-        self._responder = asyncio.create_task(self._respond(heard_at, stt_ms))
+            try:
+                text = await asyncio.to_thread(transcribe)
+            except Exception as exc:
+                logger.exception("STT failed")
+                await self._send_json({"type": "error", "message": f"Transcription failed: {exc}"})
+                await self._send_json({"type": "state", "state": "listening"})
+                return
+
+            stt_ms = int(1000 * (time.monotonic() - heard_at))
+            if not text or len(text.strip(" .")) < 2:
+                await self._send_json({"type": "state", "state": "listening"})
+                return
+
+            await self._send_json({"type": "transcript", "text": text})
+            self.history.append({"role": "user", "content": text})
+            self._responder = asyncio.create_task(self._respond(heard_at, stt_ms))
+        finally:
+            # Cleared only after the responder task (if any) is in its slot,
+            # so _quiet() never has a gap between "turn ended" and "reply
+            # visible". Once the task exists, _responding() carries the guard.
+            self._turn_active = False
 
     async def _respond(self, heard_at: float, stt_ms: int) -> None:
         """Stream the model, speak sentence by sentence, report the numbers."""
@@ -1350,13 +1384,26 @@ class VoiceSession:
         """
         self._background.append(asyncio.create_task(self._announce(text)))
 
+    def _quiet(self) -> bool:
+        """True when nothing is speaking, being heard, or between the two.
+
+        The middle condition is the subtle one: from utterance close to
+        responder creation (mostly STT time) the other two read false, and an
+        announcement started in that window would talk over the coming reply.
+        """
+        return (
+            not self._responding()
+            and not getattr(self.endpointer, "in_speech", False)
+            and not self._turn_active
+        )
+
     async def _announce(self, text: str) -> None:
         # Wait for a quiet moment: never talk over a reply in flight or over
-        # the user mid-sentence. If quiet never comes, drop it — the result
-        # is still in history-adjacent state (task summary, memory), and an
-        # announcement an hour late is worse than none.
+        # the user mid-sentence. If quiet never comes within five minutes,
+        # drop it — the result is still in history-adjacent state (task
+        # summary, memory), and a stale announcement is worse than none.
         for _ in range(600):
-            if not self._responding() and not getattr(self.endpointer, "in_speech", False):
+            if self._quiet():
                 break
             await asyncio.sleep(0.5)
         else:
