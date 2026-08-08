@@ -1,5 +1,32 @@
 # Speaker echo: what we know (2026-08-05)
 
+**RESOLVED 2026-08-08.** The parked branch was cherry-picked back onto main
+and finished; verified working live on the phone's loudspeaker. What the
+resumed session added on top of the branch:
+
+- **The Splashtop finding.** Background Music was gone by the time work
+  resumed; the Mac's default *input* device was Splashtop's virtual mic, and
+  the built-in mic did not appear in the device list at all. The "VP captures
+  pure digital silence" result was very likely the VP unit aggregating a
+  microphone that does not physically exist. Apple VP on the Mac deserves a
+  retrial with a real default input device before being written off.
+- **A dead-mic watchdog on the phone.** iOS VP reproduced the documented
+  failure exactly (session connected, engines warm, zero utterances): it
+  starts cleanly and captures silence, so an error-path fallback never fires.
+  The client now checks peak capture RMS 2.5s after engine start and restarts
+  on the raw path when it reads flat zero.
+- **The gate had a second bug.** The hub streams audio faster than real time
+  and flips to "listening" once the reply is *sent*, seconds before the
+  speaker finishes playing it. Both clients keyed the mute-gate to the
+  server's state, reopened the mic mid-reply, and Skippy answered his own
+  echo. The gate now counts scheduled buffers and holds until the last one
+  has physically played, plus 300ms of room decay.
+
+Everything below is the original 2026-08-05 state of knowledge, kept for the
+record.
+
+---
+
 Parked work. The full diff lives on the `voice-echo-wip` branch; main was
 rolled back to the last known-good build at the user's request.
 
