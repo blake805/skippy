@@ -92,9 +92,9 @@ final class VoiceClient: ObservableObject {
 
     private func startAudio() {
         let session = AVAudioSession.sharedInstance()
-        switch session.recordPermission {
+        switch AVAudioApplication.shared.recordPermission {
         case .undetermined:
-            session.requestRecordPermission { [weak self] ok in
+            AVAudioApplication.requestRecordPermission { [weak self] ok in
                 if ok { Task { @MainActor in self?.startAudio() } }
             }
             return
