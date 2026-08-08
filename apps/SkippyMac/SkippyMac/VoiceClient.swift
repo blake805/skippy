@@ -37,6 +37,19 @@ final class VoiceClient: ObservableObject {
     /// during playback. On AirPods the earbuds cancel echo themselves and
     /// voice barge-in stays fully live.
     private var echoGate = true
+    /// Playback the speaker has not finished yet. The server's "listening"
+    /// state means it has *sent* the whole reply — audio goes out faster than
+    /// real time, so seconds of it are still queued locally when that
+    /// arrives. Gating the mic on the server's state alone reopened it
+    /// mid-reply, and Skippy transcribed his own tail and answered himself.
+    private var pendingPlayback = 0
+    /// A short grace after the last buffer drains: the room is still ringing.
+    private var playbackTailUntil = Date.distantPast
+
+    /// True while Skippy can plausibly be heard out of this device.
+    private var outputAudible: Bool {
+        state == "speaking" || pendingPlayback > 0 || Date() < playbackTailUntil
+    }
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -145,8 +158,10 @@ final class VoiceClient: ObservableObject {
                 // The echo gate: on speakers, what the mic hears while Skippy
                 // talks is mostly Skippy. Nothing is sent, so nothing can trip
                 // the hub's barge-in. Interrupt by button, or by voice on
-                // Bluetooth headphones where the earbuds cancel echo.
-                if self.echoGate && self.state == "speaking" { return }
+                // Bluetooth headphones where the earbuds cancel echo. Keyed
+                // to local playback, not the server's state: the server says
+                // "listening" seconds before the speaker finishes.
+                if self.echoGate && self.outputAudible { return }
                 self.sendMic(buffer)
             }
         }
@@ -251,6 +266,10 @@ final class VoiceClient: ObservableObject {
         case "audio_cancel":
             player.stop()
             player.play()
+            // The queue is gone; the gate must not stay latched on buffers
+            // that will never play. Late completion handlers no-op safely.
+            pendingPlayback = 0
+            playbackTailUntil = .distantPast
         case "metrics":
             metrics = VoiceMetrics(
                 sttMs: msg["stt_ms"] as? Int ?? 0,
@@ -296,7 +315,18 @@ final class VoiceClient: ObservableObject {
             return buffer
         }
         guard error == nil, floatBuf.frameLength > 0 else { return }
-        player.scheduleBuffer(floatBuf, completionHandler: nil)
+        pendingPlayback += 1
+        player.scheduleBuffer(floatBuf, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            Task { @MainActor in self?.bufferPlayed() }
+        }
         if !player.isPlaying { player.play() }
+    }
+
+    private func bufferPlayed() {
+        guard pendingPlayback > 0 else { return }  // cleared by audio_cancel
+        pendingPlayback -= 1
+        if pendingPlayback == 0 {
+            playbackTailUntil = Date().addingTimeInterval(0.3)
+        }
     }
 }

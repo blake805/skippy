@@ -50,6 +50,19 @@ final class VoiceClient: ObservableObject {
     private var vpPeak: Float = 0
     private var vpWatchdog: Task<Void, Never>?
     private var vpDeadThisSession = false
+    /// Playback the speaker has not finished yet. The server's "listening"
+    /// state means it has *sent* the whole reply — audio goes out faster than
+    /// real time, so seconds of it are still queued locally when that
+    /// arrives. Gating the mic on the server's state alone reopened it
+    /// mid-reply, and Skippy transcribed his own tail and answered himself.
+    private var pendingPlayback = 0
+    /// A short grace after the last buffer drains: the room is still ringing.
+    private var playbackTailUntil = Date.distantPast
+
+    /// True while Skippy can plausibly be heard out of this device.
+    private var outputAudible: Bool {
+        state == "speaking" || pendingPlayback > 0 || Date() < playbackTailUntil
+    }
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -182,8 +195,8 @@ final class VoiceClient: ObservableObject {
                 if self.pushToTalk && !self.transmitting { return }
                 // No echo canceller and playing through the loudspeaker: what
                 // the mic hears while Skippy talks is mostly Skippy. Send
-                // nothing, so nothing can cut him off.
-                if !self.vpActive, self.state == "speaking", Self.onLoudspeaker() { return }
+                // nothing — until the *speaker* is done, not the server.
+                if !self.vpActive, self.outputAudible, Self.onLoudspeaker() { return }
                 self.sendMic(buffer)
             }
         }
@@ -306,6 +319,10 @@ final class VoiceClient: ObservableObject {
         case "audio_cancel":
             player.stop()
             player.play()
+            // The queue is gone; the gate must not stay latched on buffers
+            // that will never play. Late completion handlers no-op safely.
+            pendingPlayback = 0
+            playbackTailUntil = .distantPast
         case "metrics":
             metrics = VoiceMetrics(
                 sttMs: msg["stt_ms"] as? Int ?? 0,
@@ -351,7 +368,18 @@ final class VoiceClient: ObservableObject {
             return buffer
         }
         guard error == nil, floatBuf.frameLength > 0 else { return }
-        player.scheduleBuffer(floatBuf, completionHandler: nil)
+        pendingPlayback += 1
+        player.scheduleBuffer(floatBuf, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            Task { @MainActor in self?.bufferPlayed() }
+        }
         if !player.isPlaying { player.play() }
+    }
+
+    private func bufferPlayed() {
+        guard pendingPlayback > 0 else { return }  // cleared by audio_cancel
+        pendingPlayback -= 1
+        if pendingPlayback == 0 {
+            playbackTailUntil = Date().addingTimeInterval(0.3)
+        }
     }
 }
