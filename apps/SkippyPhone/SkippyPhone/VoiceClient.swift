@@ -42,6 +42,14 @@ final class VoiceClient: ObservableObject {
     /// while Skippy speaks on the loudspeaker, so his own voice cannot trip
     /// the hub's barge-in.
     private var vpActive = false
+    /// The VP unit's real failure mode is not an error: it starts cleanly and
+    /// then delivers pure digital silence (measured live, 2026-08-08 — the
+    /// session connected, engines warmed, and not one utterance reached STT).
+    /// So a watchdog listens to the first seconds of capture; flat zeros mean
+    /// the canceller ate the mic, and the session restarts on the raw path.
+    private var vpPeak: Float = 0
+    private var vpWatchdog: Task<Void, Never>?
+    private var vpDeadThisSession = false
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -122,8 +130,9 @@ final class VoiceClient: ObservableObject {
             // suppression, gain control. The `.voiceChat` session mode does
             // not grant this to a raw AVAudioEngine — without the explicit
             // opt-in the speaker's audio loops into the mic and Skippy's own
-            // voice trips the hub's barge-in mid-sentence.
-            try startEngine(voiceProcessing: true)
+            // voice trips the hub's barge-in mid-sentence. Skipped for the
+            // rest of the session once the watchdog has caught it silent.
+            try startEngine(voiceProcessing: !vpDeadThisSession)
         } catch {
             // The VP unit failed to initialize or capture. Voice must not die
             // with it: fall back to the raw mic, where the hub's
@@ -192,6 +201,25 @@ final class VoiceClient: ObservableObject {
         vpActive = input.isVoiceProcessingEnabled
         started = true
         state = "listening"
+        startDeadMicWatchdog()
+    }
+
+    /// Catch the voice-processing unit capturing digital silence and fall
+    /// back to the raw mic. Even a quiet room's ambient noise lands orders
+    /// of magnitude above the threshold; only a dead capture path reads as
+    /// flat zero for two and a half seconds.
+    private func startDeadMicWatchdog() {
+        vpWatchdog?.cancel()
+        vpPeak = 0
+        guard vpActive else { return }
+        vpWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard let self, !Task.isCancelled, self.started, self.vpActive else { return }
+            if self.vpPeak < 0.00001 {
+                self.vpDeadThisSession = true
+                try? self.startEngine(voiceProcessing: false)
+            }
+        }
     }
 
     private static func onLoudspeaker() -> Bool {
@@ -200,6 +228,7 @@ final class VoiceClient: ObservableObject {
     }
 
     private func stopAudio() {
+        vpWatchdog?.cancel()
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
         engine.stop()
@@ -218,6 +247,7 @@ final class VoiceClient: ObservableObject {
             sum += sample * sample
         }
         let rms = (sum / Float(buffer.frameLength)).squareRoot()
+        vpPeak = max(vpPeak, rms)
         // Speech RMS on an iPhone mic sits around 0.02–0.2; scale into 0…1.
         let scaled = min(rms * 6, 1)
         level = scaled > level ? scaled : level * 0.82
