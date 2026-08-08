@@ -1,6 +1,10 @@
 #!/bin/zsh
 # Launches the Skippy hub with the production environment. Used by launchd
 # (com.skippy.hub) when the hub needs to run outside the SkippyServer app.
+#
+# Secrets live outside the repo (this file is tracked). Currently that carries
+# the reasoner API key and SKIPPY_ALLOW_CLOUD for the consult tool.
+[ -f "$HOME/.skippy_secrets" ] && source "$HOME/.skippy_secrets"
 export SKIPPY_WORKSPACE_ROOTS="/Users/blakeweinberg/skippy"
 export SKIPPY_BIND_HOST="0.0.0.0"
 export SKIPPY_VOICE_TOKEN="o7R1hWgJFNEGio2oz8nDyhKjlYVuhrQdsnmVhV5s"

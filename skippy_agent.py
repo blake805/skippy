@@ -27,13 +27,14 @@ import skippy_brief
 import skippy_device
 import skippy_dispatch
 import skippy_exec
+import skippy_fs
 import skippy_llm
 import skippy_memory
 import skippy_paths
 import skippy_re
 import skippy_research
 import tool_schemas
-from skippy_sandbox import Sandbox, ToolResult, cap_text
+from skippy_sandbox import Sandbox, SandboxError, ToolResult, cap_text
 
 logger = logging.getLogger("skippy_agent")
 
@@ -63,6 +64,24 @@ SUBAGENT_LIMIT = 4
 # thing and cite it" is a question for the scoreboard rather than for taste, so the
 # default stays honest and the knob exists to measure it.
 SUBAGENT_ROLE = os.environ.get("SKIPPY_SUBAGENT_ROLE", "").strip()
+
+# How many times a run may put a question to the reasoner (the `consult` tool). Half
+# the investigate limit, on purpose: a consult can cost real money per call when the
+# role is hosted, and the failure mode being guarded is a loop that learns "when
+# stuck, consult" and turns every hesitation into an escalation. Two is enough for a
+# genuinely hard task to ask its big question and one follow-up.
+CONSULT_LIMIT = 2
+# The reasoner sees only what the consult sends, so attached files arrive whole — but
+# a bound has to exist, and this one is deliberately generous (a consult is rare and
+# its context is its whole value). cap_text keeps head and tail when it trims.
+CONSULT_CONTEXT_CHARS = 120_000
+
+# Which registry role answers a consult, by mode. RE consults resolve to a role that
+# is expected to live on this machine; the enforcement (refusing an off-machine
+# reasoner_re unless SKIPPY_RE_ALLOW_CLOUD is set on top of the global gate) lives in
+# `_consult`, because the loop is the only place that knows which mode is asking.
+CONSULT_ROLES = {"re": "reasoner_re"}
+DEFAULT_CONSULT_ROLE = "reasoner"
 
 # Above this, an observation goes through the compressor first. The heavy role
 # prefills at ~200 tok/s, so 8000 characters of raw tool output costs about ten
@@ -264,6 +283,7 @@ class AgentLoop:
         # Things the user has said since the run started, waiting for a step boundary.
         self._steering: List[str] = []
         self._investigations = 0
+        self._consults = 0
         self._recent_calls: List[str] = []
         self._folds = 0
         self._commands_since_finding = 0
@@ -464,7 +484,32 @@ class AgentLoop:
             "investigate": tool_schemas.investigation_tools,
         }
         offered = by_mode.get(self.mode, tool_schemas.workspace_tools)()
+        if not self._consult_available():
+            # Withheld rather than offered-and-refused: a tool that can only say no
+            # teaches the model to spend a step finding that out, and its absence is
+            # also what makes the consult A/B a pure configuration split.
+            offered = [t for t in offered if t["function"]["name"] != "consult"]
         return offered + [FINISH_SCHEMA]
+
+    def _consult_role(self) -> str:
+        return CONSULT_ROLES.get(self.mode, DEFAULT_CONSULT_ROLE)
+
+    def _consult_available(self) -> bool:
+        """Whether this run's consult could actually be answered under current policy.
+
+        Mirrors the checks `_consult` enforces, so the tool is only on the menu when
+        calling it could succeed: a reasoner with weights configured, and — when it
+        is off-machine — both the global cloud gate and, for RE, the separate
+        RE gate open.
+        """
+        target = skippy_llm.MODELS.get(self._consult_role())
+        if target is None or not target.model:
+            return False
+        if target.is_local:
+            return True
+        if not skippy_llm.cloud_allowed():
+            return False
+        return self.mode != "re" or skippy_llm.re_cloud_allowed()
 
     # -- the loop ---------------------------------------------------------
 
@@ -847,6 +892,11 @@ class AgentLoop:
             # is: what it spends is steps, and the loop is what owns the budget. It also
             # avoids dispatch having to import the loop that it is itself called from.
             result = await self._investigate(args)
+        elif name == "consult":
+            # Also loop-handled: it spends a capped per-run budget (and possibly
+            # money), and the where-may-this-question-go policy depends on the mode,
+            # which only the loop knows.
+            result = await self._consult(args)
         else:
             result = await skippy_dispatch.dispatch(
                 name, args, self.sandbox, journal_dir=self.journal_dir,
@@ -1088,6 +1138,131 @@ class AgentLoop:
             f"{head} ({outcome.steps} step(s)).",
             outcome.summary,
             {"question": question, "status": outcome.status, "steps": outcome.steps},
+        )
+
+    async def _consult(self, args: dict) -> ToolResult:
+        """Put one question to the mode's reasoner, and return its answer whole.
+
+        Not a sub-run: `_investigate` spawns a child loop because the child needs
+        tools to read with, and a consult has no tools at all. The parent packages
+        the question and the files it names, the reasoner thinks once, and the
+        answer comes back as a single observation. What transfers from investigate
+        is the discipline around the call — a per-run cap, honest failure (a consult
+        that errored is a failed ToolResult, never something that reads like an
+        answer), and being handled by the loop because the loop owns budgets.
+
+        This is also where the RE containment policy is enforced, not just
+        configured: an RE run refuses an off-machine reasoner unless
+        SKIPPY_RE_ALLOW_CLOUD is set on top of the global cloud gate, so pointing
+        SKIPPY_REASONER_RE_URL at a hosted API by mistake fails loudly instead of
+        quietly shipping a disassembly listing off the machine.
+        """
+        question = str(args.get("question") or "").strip()
+        if not question:
+            return ToolResult(False, "consult needs a 'question'.")
+        if self._consults >= CONSULT_LIMIT:
+            return ToolResult(
+                False,
+                f"You have used this run's {CONSULT_LIMIT} consults. Decide with what "
+                "you have, or finish and say what is still unsettled.",
+            )
+
+        role = self._consult_role()
+        target = skippy_llm.MODELS.get(role)
+        if target is None or not target.model:
+            # Normally unreachable (the tool is withheld when unconfigured), but the
+            # message names the variable because the person reading it can act on it.
+            return ToolResult(
+                False,
+                f"No consulting model is configured for this mode. Set "
+                f"SKIPPY_{role.upper()}_MODEL (and _URL) to enable consults.",
+            )
+        if not target.is_local and self.mode == "re" and not skippy_llm.re_cloud_allowed():
+            return ToolResult(
+                False,
+                f"Role '{role}' points off-machine at {target.url}, and RE material "
+                f"never leaves this machine unless {skippy_llm.RE_ALLOW_CLOUD_ENV}=1 "
+                "is set on top of the cloud gate. Point it at a local server, or "
+                "proceed without a consult.",
+            )
+
+        # The loop reads the files rather than having the model paste code into the
+        # call: tool-call arguments carrying source are the payload shape that used
+        # to crash the parser, and file contents in an argument would also sit in
+        # this transcript forever. `paths` may arrive as a bare string — the parser
+        # fallback, or the model naming one file — and one file is a fine consult.
+        paths = args.get("paths") or []
+        if isinstance(paths, str):
+            try:
+                loaded = json.loads(paths)
+                paths = loaded if isinstance(loaded, list) else [paths]
+            except (json.JSONDecodeError, ValueError):
+                paths = [paths]
+
+        excerpts: List[str] = []
+        attached: List[str] = []
+        for path in paths:
+            # Refused whole rather than sent partial: a reasoner answering without a
+            # file the question turns on produces confident advice about code it
+            # never saw, and nothing downstream can tell.
+            try:
+                read = skippy_fs.read_file(self.sandbox, str(path))
+            except SandboxError as exc:
+                return ToolResult(False, f"Could not attach {path}: {exc}")
+            if not read.ok:
+                return ToolResult(
+                    False,
+                    f"Could not attach {path}: {read.summary} Fix the path or drop "
+                    "it, then consult again.",
+                )
+            display = read.data.get("path", str(path))
+            attached.append(display)
+            excerpts.append(f"--- {display} ---\n{read.content}")
+
+        body = question
+        if excerpts:
+            body = (
+                "Files the question turns on:\n\n"
+                + cap_text("\n\n".join(excerpts), CONSULT_CONTEXT_CHARS)
+                + f"\n\nQuestion:\n{question}"
+            )
+
+        self._consults += 1
+        try:
+            # temp=None on purpose: Fable 5's API rejects any request that names
+            # `temperature` (measured live), and a local thinking server's own
+            # default sampling is tuned for its traces. The reasoner samples its way.
+            answer = await skippy_llm.query_text(
+                [
+                    {"role": "system", "content": prompts.CONSULT_SYSTEM},
+                    {"role": "user", "content": body},
+                ],
+                role=role,
+                temp=None,
+            )
+        except skippy_llm.ModelError as exc:
+            # Includes CloudNotAllowed from the global gate. Reported as a failure
+            # for the same reason a dead endpoint raises instead of returning prose:
+            # nothing that comes back from this branch may read like an answer.
+            return ToolResult(
+                False,
+                f"The consult failed: {exc} Treat this as no answer — decide with "
+                "what you have, or finish and say what is blocked.",
+            )
+
+        if not answer.strip():
+            return ToolResult(
+                False,
+                f"The consult returned nothing. Treat this as no answer; "
+                f"{CONSULT_LIMIT - self._consults} consult(s) remain this run.",
+            )
+        return ToolResult(
+            True,
+            f"Consulted {target.model} ({len(attached)} file(s) attached). Its "
+            "answer follows — advice from a model that saw only what you sent, "
+            "so weigh it against the code.",
+            answer,
+            {"question": question, "role": role, "model": target.model, "paths": attached},
         )
 
     def _record_research_artifacts(self, call: dict, result: ToolResult) -> str:

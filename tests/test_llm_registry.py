@@ -39,7 +39,9 @@ def reply(content="", tool_calls=None, status=200):
 # --- registry resolution ---
 
 def test_default_roles_are_local_and_match_cached_weights():
-    assert set(skippy_llm.MODELS) == {"fast", "heavy", "compressor", "voice"}
+    assert set(skippy_llm.MODELS) == {
+        "fast", "heavy", "compressor", "voice", "reasoner", "reasoner_re",
+    }
     for role in ("fast", "heavy", "compressor", "voice"):
         assert skippy_llm.endpoint(role).is_local
 
@@ -49,6 +51,33 @@ def test_default_roles_are_local_and_match_cached_weights():
     # answering out loud was stilted and loop-prone.
     assert "Instruct-2507" in skippy_llm.endpoint("voice").model
     assert "Coder" not in skippy_llm.endpoint("voice").model
+
+
+def test_the_cloud_reasoner_default_fails_closed():
+    """The one default that points off-machine. It must be unreachable by accident:
+    without SKIPPY_ALLOW_CLOUD, resolving it raises rather than resolving."""
+    target = skippy_llm.MODELS["reasoner"]
+    assert not target.is_local
+    with pytest.raises(skippy_llm.CloudNotAllowed):
+        skippy_llm.endpoint("reasoner")
+
+
+def test_the_re_reasoner_defaults_local_with_no_aspirational_weights():
+    """Local port, empty model: no local thinking model has been chosen and measured,
+    and per ADR 0007 a repo id that may not be in cache is worse than an honest blank.
+    The consult tool refuses with instructions while this is unset."""
+    target = skippy_llm.MODELS["reasoner_re"]
+    assert target.is_local
+    assert target.model == ""
+
+
+def test_re_cloud_consent_is_a_separate_gate(monkeypatch):
+    """SKIPPY_ALLOW_CLOUD alone must not open the RE door."""
+    assert not skippy_llm.re_cloud_allowed()
+    monkeypatch.setenv("SKIPPY_ALLOW_CLOUD", "1")
+    assert not skippy_llm.re_cloud_allowed()
+    monkeypatch.setenv("SKIPPY_RE_ALLOW_CLOUD", "1")
+    assert skippy_llm.re_cloud_allowed()
 
 
 def test_compressor_shares_the_fast_server_but_not_the_32k_model():
@@ -257,6 +286,27 @@ async def test_an_http_error_retry_keeps_the_requested_temperature():
 
     assert message["content"] == "ok"
     assert temps == [0.1, 0.1], temps
+
+
+async def test_temp_none_sends_no_temperature_at_all():
+    """Some hosted reasoning models (Fable 5, measured live) reject a request that
+    names `temperature` even at a benign value. None must mean silence, not 0.2 —
+    and the disconnect-retry perturbation must not resurrect the parameter."""
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        if len(payloads) < 2:
+            raise httpx.RemoteProtocolError("Server disconnected", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with mock_client(handler) as client:
+        message = await skippy_llm.query_message(
+            [{"role": "user", "content": "x"}], temp=None, client=client
+        )
+
+    assert message["content"] == "ok"
+    assert all("temperature" not in p for p in payloads), payloads
 
 
 async def test_repetition_penalty_widens_the_context_window():

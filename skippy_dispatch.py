@@ -119,9 +119,10 @@ _ASYNC_TOOLS = {
 }
 
 # Handled by the loop itself, not here, but named so that dispatch can give a
-# coherent error if it ever arrives out of place. `investigate` spawns a run, and what
-# that spends is steps — which the loop owns and the dispatcher knows nothing about.
-CONTROL_TOOLS = ("finish", "investigate")
+# coherent error if it ever arrives out of place. `investigate` spawns a run and
+# `consult` spends a per-run budget and mode-dependent routing policy — all things
+# the loop owns and the dispatcher knows nothing about.
+CONTROL_TOOLS = ("finish", "investigate", "consult")
 
 TOOL_NAMES = tuple(sorted(set(_SYNC_TOOLS) | set(_ASYNC_TOOLS) | set(CONTROL_TOOLS)))
 

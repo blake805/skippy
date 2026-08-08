@@ -313,6 +313,44 @@ _SCHEMAS = {
             "required": ["question"],
         },
     },
+    "consult": {
+        "description": (
+            "Puts one hard question to a stronger reasoning model and gets back its "
+            "thinking as a single answer. It sees nothing but what you send: a "
+            "self-contained question, plus the files you name in 'paths', which are "
+            "attached in full. Use it at a genuine decision point after your own "
+            "attempts have not settled it — a design choice with trade-offs you can "
+            "see but cannot rank, a bug that survived two different fixes, behaviour "
+            "you cannot explain from the code in front of you. It is not a reader: "
+            "for 'where is X handled', use investigate or grep, which are far "
+            "cheaper. The answer is advice from something that cannot see your "
+            "workspace or run anything — weigh it against the code, do not follow "
+            "it blindly. Each consult is expensive, so bring it a decision, not a "
+            "status update."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "The question, self-contained: what you are trying to do, "
+                        "what you have tried, what happened, and what you want "
+                        "decided. The reasoner cannot see this conversation."
+                    ),
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Files to attach, by path. Send the few files the question "
+                        "actually turns on; the reasoner reads nothing else."
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+    },
     "note_claim": {
         "description": (
             "Records one thing the pages you read support, with the sources behind it. A "
@@ -1264,6 +1302,13 @@ FILESYSTEM_TOOLS = ("list_dir", "read_file", "grep", "glob_files")
 # costs is steps and the loop is what owns budgets — and deliberately absent from the
 # sub-run's own toolset, so an investigation cannot start one.
 SUBAGENT_TOOLS = ("investigate",)
+# Asking a stronger model. Also loop-handled (it spends money and a capped budget, and
+# in RE mode the loop enforces where the question is allowed to go), and also absent
+# from the investigate child's toolset for the same recursion-bounding reason. Offered
+# by both coding and RE modes here; the loop withholds it at runtime when the mode's
+# reasoner is not actually reachable under current policy, because a tool that always
+# refuses only teaches the model to waste a step finding that out.
+CONSULT_TOOLS = ("consult",)
 WRITE_TOOLS = ("apply_patch",)
 EXEC_TOOLS = ("run_command",)
 # Version control, coding mode only: an RE session does not change the artifact,
@@ -1304,8 +1349,8 @@ def workspace_tools() -> list:
     """Read, write and verify. What an agent needs to actually finish a coding task."""
     return [
         _wrap(name)
-        for name in FILESYSTEM_TOOLS + SUBAGENT_TOOLS + WRITE_TOOLS + EXEC_TOOLS
-        + GIT_TOOLS + MEMORY_TOOLS + WORK_ITEM_TOOLS
+        for name in FILESYSTEM_TOOLS + SUBAGENT_TOOLS + CONSULT_TOOLS + WRITE_TOOLS
+        + EXEC_TOOLS + GIT_TOOLS + MEMORY_TOOLS + WORK_ITEM_TOOLS
     ]
 
 
@@ -1325,8 +1370,8 @@ def re_tools() -> list:
     diff. Device writes are separately gated by human approval."""
     return [
         _wrap(name)
-        for name in FILESYSTEM_TOOLS + EXEC_TOOLS + NOTES_TOOLS + DISASSEMBLY_TOOLS
-        + EXTRACTION_TOOLS + MEMORY_TOOLS + DEVICE_TOOLS
+        for name in FILESYSTEM_TOOLS + CONSULT_TOOLS + EXEC_TOOLS + NOTES_TOOLS
+        + DISASSEMBLY_TOOLS + EXTRACTION_TOOLS + MEMORY_TOOLS + DEVICE_TOOLS
     ]
 
 

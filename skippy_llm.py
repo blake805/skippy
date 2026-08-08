@@ -7,6 +7,8 @@ config change rather than a code change:
     heavy       the coding brain that drives the agent loop
     compressor  squeezes oversized tool output before it reaches a context window
     voice       the conversational brain behind /ws/voice
+    reasoner    a frontier model consulted at hard decision points (coding mode)
+    reasoner_re the same job for RE mode, expected to live on this machine
 
 Every endpoint is an OpenAI-compatible ``/v1/chat/completions`` server, so a role
 can point at a local ``mlx_lm.server`` or at a hosted API with no other change.
@@ -48,6 +50,21 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 # forbidden, it is that reaching it is never an accident.
 ALLOW_CLOUD_ENV = "SKIPPY_ALLOW_CLOUD"
 
+# A second, separate gate for RE consults specifically. SKIPPY_ALLOW_CLOUD=1 says
+# "this workspace may escalate to hosted models"; it does not say "the artifact I am
+# reverse-engineering may leave this machine". Those are different decisions — RE
+# payloads carry both a privacy cost and a safety-filter refusal risk that coding
+# escalation does not — so relaxing the second one takes its own deliberate variable.
+RE_ALLOW_CLOUD_ENV = "SKIPPY_RE_ALLOW_CLOUD"
+
+# The cloud consult default. A hosted URL as a default is the one deliberate
+# exception to "defaults are weights in the local cache" (ADR 0007): resolving it
+# without SKIPPY_ALLOW_CLOUD raises CloudNotAllowed, so the default fails closed
+# rather than confusingly. Fable 5 is the current SWE-bench/reasoning leader; treat
+# it as a well-supported default and let the scoreboard arbitrate, not gospel.
+DEFAULT_REASONER_URL = "https://api.anthropic.com/v1/chat/completions"
+DEFAULT_REASONER_MODEL = "claude-fable-5"
+
 
 class ModelError(RuntimeError):
     """An endpoint is unreachable, misconfigured, or returned an unusable body."""
@@ -78,6 +95,17 @@ class ModelEndpoint:
 
 def cloud_allowed() -> bool:
     return os.environ.get(ALLOW_CLOUD_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def re_cloud_allowed() -> bool:
+    """Whether an RE-mode consult may reach an off-machine reasoner.
+
+    Checked *in addition to* the global gate, by the consult path in the agent loop.
+    The default answer is no even when SKIPPY_ALLOW_CLOUD is set, because a workspace
+    that escalates coding questions to a hosted model has not thereby agreed to send
+    firmware and disassembly there too.
+    """
+    return os.environ.get(RE_ALLOW_CLOUD_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env(name: str, default: str) -> str:
@@ -117,6 +145,28 @@ def _build_registry() -> Dict[str, ModelEndpoint]:
         # of a tolerable spoken answer. At the earlier 600 the model regularly
         # produced lectures the persona prompt had already forbidden.
         "voice": build("voice", "SKIPPY_VOICE", 8083, DEFAULT_VOICE_MODEL, 250),
+        # The consult roles (see the `consult` tool in skippy_agent). Coding mode's
+        # reasoner defaults to a hosted frontier model — fails closed behind the
+        # cloud gate until SKIPPY_ALLOW_CLOUD is set. RE mode's defaults to a local
+        # port with NO default weights: no local thinking model has been chosen and
+        # measured yet, and per ADR 0007 an aspirational repo id here would surface
+        # as a confusing runtime failure. The consult tool refuses with instructions
+        # while the model is unset. 16K tokens because a thinking model spends most
+        # of its budget on the trace that precedes the answer.
+        "reasoner": ModelEndpoint(
+            role="reasoner",
+            url=_env("SKIPPY_REASONER_URL", DEFAULT_REASONER_URL),
+            model=_env("SKIPPY_REASONER_MODEL", DEFAULT_REASONER_MODEL),
+            max_tokens=_env_int("SKIPPY_REASONER_MAX_TOKENS", 16384),
+            api_key=os.environ.get("SKIPPY_REASONER_API_KEY", "").strip() or None,
+        ),
+        "reasoner_re": ModelEndpoint(
+            role="reasoner_re",
+            url=_env("SKIPPY_REASONER_RE_URL", "http://127.0.0.1:8082/v1/chat/completions"),
+            model=os.environ.get("SKIPPY_REASONER_RE_MODEL", "").strip(),
+            max_tokens=_env_int("SKIPPY_REASONER_RE_MAX_TOKENS", 16384),
+            api_key=os.environ.get("SKIPPY_REASONER_RE_API_KEY", "").strip() or None,
+        ),
     }
 
 
@@ -224,7 +274,7 @@ def _normalize_tool_calls(message: dict) -> List[dict]:
 async def query_message(
     messages: Sequence[dict],
     role: str = "fast",
-    temp: float = 0.2,
+    temp: Optional[float] = 0.2,
     tools: Optional[List[dict]] = None,
     stop: Optional[List[str]] = None,
     max_tokens: Optional[int] = None,
@@ -248,9 +298,14 @@ async def query_message(
     payload = {
         "model": target.model,
         "messages": list(messages),
-        "temperature": temp,
         "max_tokens": max_tokens or target.max_tokens,
     }
+    # None means "do not send the parameter at all", not "send a default". Some
+    # hosted reasoning models (Claude Fable 5, measured live) reject a request that
+    # names `temperature` even at a benign value, so a caller has to be able to stay
+    # silent about it and take the server's own sampling.
+    if temp is not None:
+        payload["temperature"] = temp
     if stop:
         payload["stop"] = stop
     if tools:
@@ -292,7 +347,7 @@ async def query_message(
                 "%s endpoint attempt %d/%d failed: %s", role, attempt + 1, attempts, last_error
             )
             if attempt + 1 < attempts:
-                if disconnected:
+                if disconnected and temp is not None:
                     # Warm the sampler, but only for the disconnect case: mlx_lm's
                     # Qwen3-Coder tool parser crashes its own handler thread on a tool
                     # call it cannot parse, which reaches us as a bare disconnect, and

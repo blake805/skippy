@@ -60,11 +60,21 @@ def test_ping(client):
 def test_health_reports_every_role_and_the_cloud_flag(client):
     body = client.get("/health").json()
     assert body["cloud_allowed"] is False
-    assert set(body["roles"]) == {"fast", "heavy", "compressor", "voice"}
-    for role in body["roles"].values():
+    assert set(body["roles"]) == {
+        "fast", "heavy", "compressor", "voice", "reasoner", "reasoner_re",
+    }
+    for name in ("fast", "heavy", "compressor", "voice"):
+        role = body["roles"][name]
         assert role["local"] is True
         assert role["model"]
         assert role["url"]
+    # The consult roles are the deliberate exceptions, and /health is where an
+    # operator checks them: the coding reasoner defaults off-machine (unreachable
+    # until the cloud gate opens), and the RE reasoner is local with no weights
+    # named until one is chosen and measured.
+    assert body["roles"]["reasoner"]["local"] is False
+    assert body["roles"]["reasoner_re"]["local"] is True
+    assert body["roles"]["reasoner_re"]["model"] == ""
 
 
 def test_health_reports_a_missing_workspace_config_instead_of_failing(client, monkeypatch):
