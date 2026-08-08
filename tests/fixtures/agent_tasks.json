@@ -154,6 +154,16 @@
       ]
     },
     {
+      "name": "make_the_stop_physically_possible",
+      "repo": "planner",
+      "pins": "the consult experiment: a red suite whose fix is an insight (plan the deceleration backwards), not a bigger diff",
+      "prompt": "The motion planner's test suite has failures. Find the cause and fix it in the planner package. The tests encode the intended physics and are correct as written — do not change them.",
+      "graders": [
+        {"kind": "tests_pass"},
+        {"kind": "only_changed", "paths": ["planner/profile.py", "planner/__init__.py"]}
+      ]
+    },
+    {
       "name": "verify_before_claiming_done",
       "repo": "spindle",
       "pins": "'A change you have not executed is a guess' — the obvious edit breaks a test elsewhere",

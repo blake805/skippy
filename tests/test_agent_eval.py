@@ -51,7 +51,7 @@ def test_every_task_names_the_prompt_line_it_defends(tasks):
 def test_every_task_repo_exists_and_starts_green(tasks):
     """Except where a failing suite is the point: those tasks are about fixing it, and
     the grader below proves the repo starts red."""
-    red_on_purpose = {"feeds", "probe"}
+    red_on_purpose = {"feeds", "probe", "planner"}
     for task in tasks:
         assert os.path.isdir(task.repo_path), task.repo
         if task.repo not in red_on_purpose:
@@ -59,9 +59,9 @@ def test_every_task_repo_exists_and_starts_green(tasks):
 
 
 def test_the_repos_that_should_start_broken_do(tasks):
-    """Both 'fix the cause' tasks depend on a red suite, and a fixture quietly repaired
-    would turn them into tasks that pass by doing nothing."""
-    for repo in ("feeds", "probe"):
+    """The 'fix the cause' tasks and the planner task depend on a red suite, and a
+    fixture quietly repaired would turn them into tasks that pass by doing nothing."""
+    for repo in ("feeds", "probe", "planner"):
         assert not ev.run_tests(os.path.join(ev.REPOS, repo)), repo
 
 

@@ -133,6 +133,29 @@ pushbacks, a suite red across two fix attempts).
 - Is `investigate` itself worth offering in RE mode? (Disassembly listings are long; the
   compressor carries that load today.)
 
+## First A/B (2026-08-07, after the tool landed)
+
+Task: `make_the_stop_physically_possible` — a new planner fixture whose fix is a
+backward feasibility pass, built to be insight-shaped. Five runs per arm on the 480B,
+baseline = consult withheld (gate shut), treatment = consult offered (Fable 5 live).
+
+- **Baseline:** 4/5 pass, 9/10/13/15 steps on the passes. The one failure solved the
+  physics but left a `verify_fix.py` scratch file, tripping the scope grader — a
+  litter failure, not a reasoning one.
+- **Treatment:** 5/5 pass, 13–16 steps. **The model never called consult** — five
+  runs, zero escalations.
+
+What this does and does not establish. The feared failure mode (a loop that learns
+"when stuck, consult" and escalates reflexively) did not appear at all; offering the
+tool on a task the agent can already do cost nothing but possibly a step or two of
+prompt-side noise (14.4 vs 12.0 mean steps, n=5, not significant). But the instrument
+saturated: the 480B solves this task, so nothing yet shows consult *helping*. The
+positive half of the question stays open until there is a task the 480B demonstrably
+fails — and building one turned out to be the hard part, because small fixture repos
+play to a strong model's strengths. Candidate shapes for a harder instrument: a fix
+that requires restructuring (local fix A breaks test B and vice versa), or a
+cause-far-from-symptom bug across files.
+
 ## What NOT to do
 
 - Do **not** make the loop driver cloud. ADR 0001/0007 stand: the heavy role runs every
