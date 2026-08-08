@@ -3,11 +3,12 @@
 # (com.skippy.hub) when the hub needs to run outside the SkippyServer app.
 #
 # Secrets live outside the repo (this file is tracked). Currently that carries
-# the reasoner API key and SKIPPY_ALLOW_CLOUD for the consult tool.
+# the reasoner API key and SKIPPY_ALLOW_CLOUD for the consult tool, and the
+# voice token — which lived in this file for a while, so treat the value in git
+# history as burned and rotate it when convenient.
 [ -f "$HOME/.skippy_secrets" ] && source "$HOME/.skippy_secrets"
 export SKIPPY_WORKSPACE_ROOTS="/Users/blakeweinberg/skippy"
 export SKIPPY_BIND_HOST="0.0.0.0"
-export SKIPPY_VOICE_TOKEN="o7R1hWgJFNEGio2oz8nDyhKjlYVuhrQdsnmVhV5s"
 export SKIPPY_VOICE_STT="mlx:mlx-community/parakeet-tdt-0.6b-v3"
 export SKIPPY_VOICE_TTS="mlx:mlx-community/chatterbox-turbo-fp16"
 export SKIPPY_VOICE_TTS_REF="/Users/blakeweinberg/skippy/voice_ref_studio.wav"
