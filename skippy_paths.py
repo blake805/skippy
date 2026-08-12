@@ -10,6 +10,7 @@ concept from `workspaces_root()`, which is only a default place to look for them
 The sandbox in `skippy_sandbox.py` is what actually constrains access.
 """
 
+import json
 import os
 
 DEFAULT_MEMORY_ROOT = "/Volumes/skippy_memory"
@@ -97,17 +98,61 @@ def briefs_root(ensure: bool = True) -> str:
     return path
 
 
+DEFAULT_WORKSPACE_ROOTS_FILE = "~/.skippy/workspace_roots.json"
+
+
+def workspace_roots_file() -> str:
+    """Where hub-managed roots live: machine-local, because they are paths on
+    this machine. `SKIPPY_WORKSPACE_ROOTS_FILE` overrides it for tests."""
+    override = os.environ.get("SKIPPY_WORKSPACE_ROOTS_FILE", "").strip()
+    return os.path.abspath(os.path.expanduser(override or DEFAULT_WORKSPACE_ROOTS_FILE))
+
+
+def _file_workspace_roots() -> list:
+    """Roots added at runtime (the app's "new workspace"), tolerant of a missing
+    or corrupt file for the same reason every memory read is."""
+    try:
+        with open(workspace_roots_file(), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    roots = data.get("roots") if isinstance(data, dict) else None
+    if not isinstance(roots, list):
+        return []
+    return [os.path.abspath(os.path.expanduser(str(r))) for r in roots if str(r).strip()]
+
+
+def add_workspace_root(path: str) -> None:
+    """Persist one more root. Read-merge-write through a tmp file, same atomic
+    pattern as the memory store's `_write_json`."""
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    roots = _file_workspace_roots()
+    if path in roots:
+        return
+    roots.append(path)
+    target = workspace_roots_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump({"roots": roots}, handle, indent=2)
+    os.replace(tmp, target)
+
+
 def configured_workspace_roots() -> list:
-    """The repos the agent may touch, from `SKIPPY_WORKSPACE_ROOTS` (os.pathsep).
+    """The repos the agent may touch: `SKIPPY_WORKSPACE_ROOTS` (os.pathsep)
+    merged with the hub-managed roots file.
 
     Empty by default. An agent with no roots can reach nothing, which is the
-    right failure mode for a misconfiguration.
+    right failure mode for a misconfiguration. Re-read on every call — that is
+    what lets a workspace created from the app exist without a hub restart.
     """
     raw = os.environ.get("SKIPPY_WORKSPACE_ROOTS", "").strip()
-    if not raw:
-        return []
-    return [
+    roots = [
         os.path.abspath(os.path.expanduser(part))
         for part in raw.split(os.pathsep)
         if part.strip()
-    ]
+    ] if raw else []
+    for extra in _file_workspace_roots():
+        if extra not in roots:
+            roots.append(extra)
+    return roots

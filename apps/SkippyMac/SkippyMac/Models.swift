@@ -183,12 +183,49 @@ struct MemorySession: Identifiable, Equatable {
     let mode: String
 }
 
+/// One project in the hub's memory store, for the chat header's picker.
+struct ProjectSummary: Identifiable, Equatable {
+    let projectId: String
+    let workspaceRoots: [String]
+    let sessions: Int
+    let updated: String
+
+    var id: String { projectId }
+
+    init(from raw: [String: Any]) {
+        projectId = raw["project_id"] as? String ?? ""
+        workspaceRoots = raw["workspace_roots"] as? [String] ?? []
+        sessions = raw["sessions"] as? Int ?? 0
+        updated = raw["updated"] as? String ?? ""
+    }
+}
+
+/// One past conversation's headline. Tapping it reopens the transcript.
+struct ChatSummary: Identifiable, Equatable {
+    let chatId: String
+    let title: String
+    let mode: String
+    let updated: String
+    let turns: Int
+
+    var id: String { chatId }
+
+    init(from raw: [String: Any]) {
+        chatId = raw["chat_id"] as? String ?? ""
+        title = raw["title"] as? String ?? ""
+        mode = raw["mode"] as? String ?? "chat"
+        updated = raw["updated"] as? String ?? ""
+        turns = raw["turns"] as? Int ?? 0
+    }
+}
+
 /// What the hub knows about this project, shaped for the context rail.
 struct MemorySnapshot: Equatable {
     let projectId: String
     let conventions: [String: String]
     let decisions: [MemoryDecision]
     let sessions: [MemorySession]
+    let chats: [ChatSummary]
     let error: String?
 
     /// Parse the hub's `{"type": "memory", ...}` payload. Tolerant of missing
@@ -220,10 +257,11 @@ struct MemorySnapshot: Equatable {
                 mode: raw["mode"] as? String ?? ""
             )
         }
+        chats = (payload["chats"] as? [[String: Any]] ?? []).map { ChatSummary(from: $0) }
     }
 
     var isEmpty: Bool {
-        conventions.isEmpty && decisions.isEmpty && sessions.isEmpty
+        conventions.isEmpty && decisions.isEmpty && sessions.isEmpty && chats.isEmpty
     }
 }
 

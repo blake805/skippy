@@ -43,6 +43,7 @@ struct ChatView: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 260)
             .tint(Theme.accent(for: app.mode))
+            projectPicker
             if app.mode == .re {
                 TextField("RE target (binary / pack key)", text: $app.reTarget)
                     .textFieldStyle(.roundedBorder)
@@ -55,6 +56,14 @@ struct ChatView: View {
                 Button("Cancel") { app.cancelRun() }
                     .buttonStyle(.bordered)
             }
+            Button {
+                app.factory.startNewChat()
+            } label: {
+                Image(systemName: "square.and.pencil")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("New chat — keeps the old one in the rail")
             Button("Clear") { app.factory.clear() }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -69,6 +78,32 @@ struct ChatView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    /// Which project's memory this conversation opens with, and where its
+    /// transcript files. The options come from the hub — a typed name would
+    /// silently create a fresh project.
+    private var projectPicker: some View {
+        Picker("Project", selection: Binding(
+            get: {
+                app.factory.selectedProject.isEmpty
+                    ? app.factory.defaultProjectId
+                    : app.factory.selectedProject
+            },
+            set: { app.factory.selectProject($0) }
+        )) {
+            if !app.factory.defaultProjectId.isEmpty {
+                Text("\(app.factory.defaultProjectId) (default)")
+                    .tag(app.factory.defaultProjectId)
+            }
+            ForEach(app.factory.projects.filter { $0.projectId != app.factory.defaultProjectId }) { project in
+                Text(project.projectId).tag(project.projectId)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: 200)
+        .help("Which project's memory and chat history this conversation uses.")
+        .onAppear { app.factory.requestProjects() }
     }
 
     /// Which host RE device I/O goes through: local hardware by default, or a
@@ -410,6 +445,16 @@ struct ContextRail: View {
                         }
                     }
                 }
+                if !memory.chats.isEmpty {
+                    railSection("Chats") {
+                        ForEach(memory.chats) { chat in
+                            ChatRow(chat: chat, current: chat.chatId == app.factory.chatId) {
+                                app.factory.openChat(chat.chatId)
+                                app.mode = .chat
+                            }
+                        }
+                    }
+                }
                 if !memory.decisions.isEmpty {
                     railSection("Decisions") {
                         ForEach(memory.decisions.reversed()) { decision in
@@ -436,6 +481,52 @@ struct ContextRail: View {
                 .foregroundStyle(.tertiary)
             content()
         }
+    }
+}
+
+/// One past conversation. Tapping it reopens the transcript in the chat lane.
+private struct ChatRow: View {
+    let chat: ChatSummary
+    let current: Bool
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(chat.updated.prefix(16).replacingOccurrences(of: "T", with: " "))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    if current {
+                        StatusPill(text: "open", color: .green)
+                    }
+                    if chat.mode != "chat" && !chat.mode.isEmpty {
+                        StatusPill(text: chat.mode, color: .secondary)
+                    }
+                }
+                Text(chat.title.isEmpty ? chat.chatId : chat.title)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Text("\(chat.turns) turns")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(current ? Color.green.opacity(0.4) : .clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Reopen this conversation and continue it")
     }
 }
 

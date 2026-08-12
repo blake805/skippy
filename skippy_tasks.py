@@ -125,7 +125,19 @@ class TaskRunner:
             out["elapsed"] = round(time.time() - out["started"], 1)
         return out
 
-    def memory_snapshot(self) -> dict:
+    def _open_memory(self, project_id: str = ""):
+        """This client's project memory: the picked project, or the roots' default.
+
+        An explicit pick opens by id alone — passing the current workspace roots
+        would append them into that project's meta and quietly re-scope it.
+        """
+        import skippy_memory
+
+        if project_id:
+            return skippy_memory.open_project(project_id=project_id)
+        return skippy_memory.open_project(workspace_roots=self.roots_provider() or [])
+
+    def memory_snapshot(self, project_id: str = "") -> dict:
         """Project memory shaped for a UI panel, not for a prompt.
 
         The opening-context string is written for the model; a client rendering a
@@ -133,11 +145,8 @@ class TaskRunner:
         come back as data — a hub without its NAS should show an empty rail with a
         reason, not drop the socket.
         """
-        import skippy_memory
-
-        roots = self.roots_provider() or []
         try:
-            memory = skippy_memory.open_project(workspace_roots=roots)
+            memory = self._open_memory(project_id)
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -169,7 +178,49 @@ class TaskRunner:
             "conventions": memory.meta.get("conventions") or {},
             "decisions": decisions,
             "sessions": sessions,
+            # Transcript headlines ride along so the rail's chat list refreshes on
+            # the same request it already makes; an older client ignores the field.
+            "chats": memory.chats(),
         }
+
+    def projects_snapshot(self) -> dict:
+        """Every project in the memory store, plus which one the roots default to.
+
+        The pickers offer these ids rather than free text, because an unknown id
+        silently creates a fresh project directory.
+        """
+        import skippy_memory
+
+        roots = self.roots_provider() or []
+        try:
+            projects = skippy_memory.list_projects()
+        except Exception as exc:
+            return {"error": str(exc)}
+        return {
+            "default": skippy_memory.project_id_for(roots),
+            "projects": projects,
+        }
+
+    def chat_open_snapshot(self, project_id: str, chat_id: str) -> dict:
+        """One full transcript, for a client resuming a past chat."""
+        try:
+            memory = self._open_memory(project_id)
+        except Exception as exc:
+            return {"error": str(exc)}
+        record = memory.load_chat(chat_id)
+        if record is None:
+            return {"error": f"No chat '{chat_id}' in project '{memory.project_id}'."}
+        return {"project_id": memory.project_id, "chat": record}
+
+    def _record_chat_turns(self, project_id: str, chat_id: str, turns: list, mode: str) -> None:
+        """File this exchange under its transcript. Failure costs persistence only."""
+        if not chat_id:
+            return
+        try:
+            memory = self._open_memory(project_id)
+            memory.append_chat(chat_id, turns, mode=mode)
+        except Exception:
+            logger.warning("Chat %r was not persisted.", chat_id, exc_info=True)
 
     # -- RE dashboard -----------------------------------------------------
 
@@ -453,6 +504,44 @@ class TaskRunner:
         out.update(result.data or {})
         return out
 
+    async def workspace_new_action(self, request: dict) -> dict:
+        """Create a new workspace root: a folder under `workspaces_root()`, a git
+        repo, and an entry in the hub-managed roots file.
+
+        The roots provider re-reads that file per call, so the new workspace is
+        usable — sandbox, repo panel, project picker — without a hub restart.
+        """
+        import subprocess
+
+        import skippy_memory
+
+        name = str(request.get("name") or "").strip()
+        if not name or name != os.path.basename(name) or name.startswith(".") or name in ("..",):
+            return {"error": "A workspace needs a plain folder name."}
+
+        base = skippy_paths.workspaces_root()
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            return {"error": f"'{name}' already exists under {base}."}
+
+        def create() -> dict:
+            os.makedirs(path)
+            result = subprocess.run(
+                ["git", "init", "-q", path], capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return {"error": f"git init failed: {result.stderr.strip() or 'unknown error'}"}
+            skippy_paths.add_workspace_root(path)
+            # Open the project now so it appears in the picker immediately rather
+            # than after its first run.
+            project = skippy_memory.open_project(workspace_roots=[path])
+            return {"ok": True, "name": name, "path": path, "project_id": project.project_id}
+
+        try:
+            return await asyncio.to_thread(create)
+        except Exception as exc:
+            return {"error": f"Could not create the workspace: {exc}"}
+
     async def github_action(self, request: dict) -> dict:
         """The GitHub connection itself: status, set_token, repos.
 
@@ -628,19 +717,26 @@ class TaskRunner:
         history = request.get("history")
         if not isinstance(history, list):
             history = None
+        # Which project's memory this run opens with, and which transcript it
+        # appends to. Both optional: an older client sends neither and gets the
+        # roots-derived project and no persistence, exactly as before.
+        project = str(request.get("project") or "").strip()
+        chat_id = str(request.get("chat_id") or "").strip()
 
         self._meta[client_id] = {
             "task": task_text[:300],
             "mode": mode,
             "started": time.time(),
         }
+        if project:
+            self._meta[client_id]["project"] = project
 
         if mode == "chat":
             # No sandbox and no workspace requirement: a conversation must work
             # even when the roots are misconfigured, because talking to Skippy
             # is how you would find that out.
             self._tasks[client_id] = asyncio.create_task(
-                self._run_chat(client_id, task_text, history)
+                self._run_chat(client_id, task_text, history, project, chat_id)
             )
             self._loops[client_id] = _ChatRun(lambda: self._tasks.get(client_id))
             return
@@ -667,15 +763,19 @@ class TaskRunner:
         # other file") continues the thread instead of starting cold. AgentLoop
         # validates the contents; here we only require it to be a list.
         self._tasks[client_id] = asyncio.create_task(
-            self._run(client_id, task_text, sandbox, mode, target, history)
+            self._run(client_id, task_text, sandbox, mode, target, history, project, chat_id)
         )
 
     async def _run(
         self, client_id: str, task: str, sandbox: Sandbox, mode: str, target: str,
-        history: Optional[list] = None,
+        history: Optional[list] = None, project: str = "", chat_id: str = "",
     ) -> None:
         async def emit(event: dict) -> None:
             await self.send(client_id, event)
+
+        # Filled when there is an exchange worth persisting; written just before
+        # `done` so a client's refresh-on-done sees it, without delaying the reply.
+        transcript_turns: Optional[list] = None
 
         devices = None
         if mode == "re":
@@ -686,10 +786,19 @@ class TaskRunner:
         # Code edits are approved in the app on the same socket that started the
         # run. None when SKIPPY_CODE_APPROVAL=off, which restores silent writes.
         approver = skippy_cursor.build_code_approver(self.hub, client_id)
+        # A picked project scopes which memory the run opens with and records to.
+        # None lets the loop derive one from the sandbox roots, exactly as before.
+        memory = None
+        if project:
+            try:
+                memory = self._open_memory(project)
+            except Exception:
+                logger.warning("Project %r unavailable; the loop will use its default.",
+                               project, exc_info=True)
         loop = skippy_agent.AgentLoop(
             task, sandbox, emit=emit, mode=mode, target=target,
             journal_dir=skippy_paths.patch_journal_root(), cursor=self.cursor,
-            history=history, devices=devices, approver=approver,
+            history=history, devices=devices, approver=approver, memory=memory,
         )
         self._loops[client_id] = loop
         try:
@@ -697,9 +806,15 @@ class TaskRunner:
             # A research run's product is the answer, not the model's account of having
             # looked things up. Reporting the summary there would hand back "I searched
             # and read three pages" and leave the answer on disk.
-            await self.send(client_id, {
-                "type": "chat", "content": outcome.answer or outcome.summary,
-            })
+            reply = outcome.answer or outcome.summary
+            await self.send(client_id, {"type": "chat", "content": reply})
+            # The exchange lands in the transcript so the conversation around a run
+            # is resumable like any chat; the step-by-step record is the session's.
+            if reply:
+                transcript_turns = [
+                    {"role": "user", "content": task},
+                    {"role": "assistant", "content": reply},
+                ]
         except Exception as exc:
             # A crash in the runtime is the operator's problem, but the person waiting
             # deserves to hear that it stopped rather than watch nothing arrive.
@@ -712,17 +827,19 @@ class TaskRunner:
             self._loops.pop(client_id, None)
             self._tasks.pop(client_id, None)
             self._meta.pop(client_id, None)
+            # Persist before `done` so the client's refresh-on-done sees the
+            # new transcript. A failed write still costs persistence only.
+            if transcript_turns and chat_id:
+                await asyncio.to_thread(
+                    self._record_chat_turns, project, chat_id, transcript_turns, mode,
+                )
             await self.send(client_id, {"type": "done"})
 
-    def _chat_messages(self, text: str, history: Optional[list]) -> List[dict]:
+    def _chat_messages(self, text: str, history: Optional[list], project: str = "") -> List[dict]:
         """System persona, project memory when reachable, prior turns, the message."""
         system = prompts.CHAT_SYSTEM
         try:
-            import skippy_memory
-
-            memory = skippy_memory.open_project(
-                workspace_roots=self.roots_provider() or []
-            )
+            memory = self._open_memory(project)
             context = memory.opening_context()
             if context:
                 system += f"\n\n{context}"
@@ -748,15 +865,20 @@ class TaskRunner:
             self._conversations[client_id] = existing
         return existing
 
-    async def _run_chat(self, client_id: str, text: str, history: Optional[list]) -> None:
+    async def _run_chat(
+        self, client_id: str, text: str, history: Optional[list],
+        project: str = "", chat_id: str = "",
+    ) -> None:
         """One conversational turn: no tools, no sandbox, one reply.
 
         Plus, since the research capability exists, a check on the way in and a check on
         the way out — neither of which the reply waits for. See skippy_gate: the turn is
         answered now, and anything worth verifying arrives afterwards as its own message.
         """
+        # Written just before `done` — see _run for why.
+        transcript_turns: Optional[list] = None
         try:
-            messages = self._chat_messages(text, history)
+            messages = self._chat_messages(text, history, project)
             decision = await skippy_gate.pre_answer(text, history or [])
             if decision and self._start_check(client_id, decision):
                 # A note rather than a canned line, so the acknowledgment sounds like
@@ -776,6 +898,11 @@ class TaskRunner:
                 "type": "chat",
                 "content": reply or "I have nothing to say to that, which is a first.",
             })
+            if reply:
+                transcript_turns = [
+                    {"role": "user", "content": text},
+                    {"role": "assistant", "content": reply},
+                ]
             # Behind the delivered reply, so its cost is not latency anyone waits
             # through. Skipped when the pre-answer gate already started a check: asking
             # the model to grade an answer it just hedged on purpose would start a
@@ -794,6 +921,12 @@ class TaskRunner:
             self._loops.pop(client_id, None)
             self._tasks.pop(client_id, None)
             self._meta.pop(client_id, None)
+            # Persist before `done` so the client's refresh-on-done sees the
+            # new transcript. A failed write still costs persistence only.
+            if transcript_turns and chat_id:
+                await asyncio.to_thread(
+                    self._record_chat_turns, project, chat_id, transcript_turns, "chat",
+                )
             await self.send(client_id, {"type": "done"})
 
     # -- autonomous checking ----------------------------------------------

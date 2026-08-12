@@ -32,6 +32,13 @@ final class AppModel: ObservableObject {
             self?.objectWillChange.send()
         }.store(in: &cancellables)
 
+        // SwiftUI does not observe nested ObservableObjects. ChatView and
+        // MemoryView read factory state through this model, so factory's
+        // changes must be republished.
+        factory.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+
         connectAll()
     }
 
@@ -54,5 +61,13 @@ final class AppModel: ObservableObject {
         page = .voice
         voice.connect()
         voice.ensureListening()
+    }
+
+    /// Reopen a past chat from the Memory tab and jump to Work so the
+    /// transcript is visible.
+    func openPastChat(_ chatId: String) {
+        mode = .chat
+        page = .work
+        factory.openChat(chatId)
     }
 }

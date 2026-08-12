@@ -67,6 +67,15 @@ MAX_WORK_ITEM_BODY_CHARS = 4_000
 # Larger than a decision body: a research answer carries its own citations inline, and
 # cutting it mid-answer would leave statements standing without the sources behind them.
 MAX_RESEARCH_BODY_CHARS = 8_000
+# A chat transcript is a resume handle, not an archive. Old turns beyond the cap are
+# dropped oldest-first: the model itself only ever sees the last ~40 turns, so keeping
+# hundreds more would preserve text no session will read while growing a file every
+# turn has to rewrite.
+MAX_CHAT_TURNS = 200
+MAX_CHAT_TURN_CHARS = 16_000
+MAX_CHAT_TITLE_CHARS = 80
+
+_CHAT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 # How many past sessions to consider. Older ones stay on disk and are still
 # greppable by hand; they are just not worth the context they would cost.
 RECENT_SESSIONS = 8
@@ -160,11 +169,13 @@ class ProjectMemory:
         self.decisions_dir = os.path.join(self.dir, "decisions")
         self.work_items_dir = os.path.join(self.dir, "work_items")
         self.research_dir = os.path.join(self.dir, "research")
+        self.chats_dir = os.path.join(self.dir, "chats")
         self.meta_path = os.path.join(self.dir, "meta.json")
         os.makedirs(self.sessions_dir, exist_ok=True)
         os.makedirs(self.decisions_dir, exist_ok=True)
         os.makedirs(self.work_items_dir, exist_ok=True)
         os.makedirs(self.research_dir, exist_ok=True)
+        os.makedirs(self.chats_dir, exist_ok=True)
 
         self.roots = [str(r) for r in (workspace_roots or [])]
         self.meta = _read_json(self.meta_path, None) or {
@@ -265,6 +276,113 @@ class ProjectMemory:
         except OSError:
             return []
         return [_read_json(os.path.join(self.sessions_dir, n), {}) for n in names[:limit]]
+
+    # -- chat transcripts ---------------------------------------------------
+    #
+    # Sessions above are summaries: what a run did, for the next run's opening
+    # context. A transcript is the conversation itself, so a client can reopen a
+    # past chat and continue it. The `chat_id` is minted by the client (any
+    # filename-safe token; the apps use UUIDs) — the hub only files turns under
+    # it. Storage degrades, never blocks: a failed write costs the chat its
+    # persistence, not the turn, matching the rule for sessions.
+
+    def _chat_path(self, chat_id: str) -> str:
+        chat_id = str(chat_id or "").strip()
+        if not _CHAT_ID.match(chat_id):
+            raise MemoryError_(f"Unsafe chat id: {chat_id!r}")
+        return os.path.join(self.chats_dir, f"{chat_id}.json")
+
+    def append_chat(self, chat_id: str, turns: Sequence[dict], mode: str = "chat") -> Optional[dict]:
+        """File one or more turns under a chat, creating the transcript on first use.
+
+        Returns the record, or None when it could not be written — which the caller
+        treats as "this chat is not persisted right now", nothing more. Turns are
+        whatever the wire history carries: {"role", "content"} dicts.
+        """
+        try:
+            path = self._chat_path(chat_id)
+        except MemoryError_:
+            logger.warning("Refusing to persist a chat under unsafe id %r.", chat_id)
+            return None
+
+        cleaned = []
+        for turn in turns:
+            role = str((turn or {}).get("role") or "").strip()
+            content = str((turn or {}).get("content") or "").strip()
+            if role not in ("user", "assistant") or not content:
+                continue
+            cleaned.append({
+                "role": role,
+                "content": cap_text(content, MAX_CHAT_TURN_CHARS),
+                "at": _now(),
+            })
+        if not cleaned:
+            return None
+
+        try:
+            record = _read_json(path, None) or {
+                "chat_id": str(chat_id).strip(),
+                "project_id": self.project_id,
+                "created": _now(),
+                "mode": mode,
+                "title": "",
+                "turns": [],
+            }
+            record["turns"].extend(cleaned)
+            if len(record["turns"]) > MAX_CHAT_TURNS:
+                record["turns"] = record["turns"][-MAX_CHAT_TURNS:]
+            if not record.get("title"):
+                first_user = next(
+                    (t["content"] for t in record["turns"] if t.get("role") == "user"), ""
+                )
+                record["title"] = " ".join(first_user.split())[:MAX_CHAT_TITLE_CHARS]
+            record["updated"] = _now()
+            record["mode"] = mode or record.get("mode") or "chat"
+            _write_json(path, record)
+            return record
+        except OSError as exc:
+            # The NAS being unmounted costs the chat its persistence, not the turn.
+            logger.warning("Could not persist chat %r: %s", chat_id, exc)
+            return None
+
+    def chats(self, limit: int = 30) -> List[dict]:
+        """Transcript headlines, most recently touched first."""
+        try:
+            names = [n for n in os.listdir(self.chats_dir) if n.endswith(".json")]
+        except OSError:
+            return []
+        found = []
+        for name in names:
+            path = os.path.join(self.chats_dir, name)
+            record = _read_json(path, None)
+            if not isinstance(record, dict) or not record.get("chat_id"):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0.0
+            turns = record.get("turns") or []
+            found.append(({
+                "chat_id": record["chat_id"],
+                "title": record.get("title", ""),
+                "mode": record.get("mode", "chat"),
+                "created": record.get("created", ""),
+                "updated": record.get("updated", ""),
+                "turns": len(turns),
+            }, mtime))
+        # The stamp has second resolution; the mtime breaks ties between chats
+        # touched inside the same second.
+        found.sort(key=lambda pair: (pair[0].get("updated") or "", pair[1]), reverse=True)
+        return [item for item, _ in found[:limit]]
+
+    def load_chat(self, chat_id: str) -> Optional[dict]:
+        """The full transcript, or None when there is no such chat."""
+        try:
+            path = self._chat_path(chat_id)
+        except MemoryError_:
+            return None
+        record = _read_json(path, None)
+        return record if isinstance(record, dict) and record.get("chat_id") else None
 
     # -- decisions --------------------------------------------------------
 

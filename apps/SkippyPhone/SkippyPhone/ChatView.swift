@@ -32,6 +32,13 @@ struct ChatView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
+                Button {
+                    app.factory.startNewChat()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
                 Button("Clear") { app.factory.clear() }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -42,6 +49,7 @@ struct ChatView: View {
                 }
             }
             .pickerStyle(.segmented)
+            projectPicker
             if app.mode == .re {
                 TextField("RE target (binary / pack key)", text: $app.reTarget)
                     .textFieldStyle(.roundedBorder)
@@ -49,6 +57,30 @@ struct ChatView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// Which project's memory this conversation opens with, and where its
+    /// transcript files. Options come from the hub — a typed name would
+    /// silently create a fresh project.
+    private var projectPicker: some View {
+        Picker("Project", selection: Binding(
+            get: {
+                app.factory.selectedProject.isEmpty
+                    ? app.factory.defaultProjectId
+                    : app.factory.selectedProject
+            },
+            set: { app.factory.selectProject($0) }
+        )) {
+            if !app.factory.defaultProjectId.isEmpty {
+                Text("\(app.factory.defaultProjectId) (default)")
+                    .tag(app.factory.defaultProjectId)
+            }
+            ForEach(app.factory.projects.filter { $0.projectId != app.factory.defaultProjectId }) { project in
+                Text(project.projectId).tag(project.projectId)
+            }
+        }
+        .pickerStyle(.menu)
+        .onAppear { app.factory.requestProjects() }
     }
 
     private var timeline: some View {

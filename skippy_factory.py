@@ -350,8 +350,37 @@ async def factory_endpoint(
             if data.get("action") == "memory":
                 # Off-thread: the snapshot stats decision paths on what may be a
                 # slow NAS mount, and this loop is the socket's only reader.
-                payload = await asyncio.to_thread(runner.memory_snapshot)
+                payload = await asyncio.to_thread(
+                    runner.memory_snapshot, str(data.get("project") or "")
+                )
                 payload["type"] = "memory"
+                await websocket.send_json(payload)
+                continue
+
+            # The project picker's data: every project in the memory store, and
+            # which one the configured roots default to.
+            if data.get("action") == "projects":
+                payload = await asyncio.to_thread(runner.projects_snapshot)
+                payload["type"] = "projects"
+                await websocket.send_json(payload)
+                continue
+
+            # One full chat transcript, for resuming a past conversation.
+            if data.get("action") == "chat_open":
+                payload = await asyncio.to_thread(
+                    runner.chat_open_snapshot,
+                    str(data.get("project") or ""),
+                    str(data.get("chat_id") or ""),
+                )
+                payload["type"] = "chat_open"
+                await websocket.send_json(payload)
+                continue
+
+            # A new workspace root, created on the human's explicit click — the
+            # same posture as git_new, one level up.
+            if data.get("action") == "workspace_new":
+                payload = await runner.workspace_new_action(data)
+                payload["type"] = "workspace_new"
                 await websocket.send_json(payload)
                 continue
 

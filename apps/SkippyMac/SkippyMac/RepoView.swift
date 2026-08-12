@@ -24,6 +24,7 @@ private struct RepoList: View {
     @ObservedObject var factory: FactoryClient
     @State private var showNewRepo = false
     @State private var showClone = false
+    @State private var showNewWorkspace = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -38,6 +39,13 @@ private struct RepoList: View {
                 },
                 trailing: {
                     HStack(spacing: 4) {
+                        Button {
+                            showNewWorkspace = true
+                        } label: {
+                            Image(systemName: "folder.badge.plus")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("New workspace — a new project root with its own memory and chats")
                         Button {
                             showNewRepo = true
                         } label: {
@@ -84,6 +92,49 @@ private struct RepoList: View {
         .sheet(isPresented: $showClone) {
             CloneSheet(factory: factory)
         }
+        .sheet(isPresented: $showNewWorkspace) {
+            NewWorkspaceSheet(factory: factory)
+        }
+    }
+}
+
+/// Create a whole new workspace root: a folder under the hub's workspaces
+/// directory, a git repo inside it, and an entry in the hub's roots — no
+/// restart. It becomes a project of its own, pickable in the chat header.
+private struct NewWorkspaceSheet: View {
+    @ObservedObject var factory: FactoryClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+
+    private var trimmed: String { name.trimmingCharacters(in: .whitespaces) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("New workspace")
+                .font(.headline)
+            TextField("folder name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { create() }
+            Text("Creates a folder under the hub's workspaces directory, runs git init, and adds it to Skippy's workspace roots. It gets its own project memory and chat history.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Create") { create() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(trimmed.isEmpty || factory.gitSyncing)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+
+    private func create() {
+        guard !trimmed.isEmpty else { return }
+        factory.workspaceNew(name: trimmed)
+        dismiss()
     }
 }
 

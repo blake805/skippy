@@ -47,6 +47,8 @@ def isolated_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SKIPPY_MEMORY_ROOT", str(memory))
     monkeypatch.setenv("SKIPPY_WORKSPACES_ROOT", str(tmp_path / "skippy_workspaces"))
     monkeypatch.setenv("SKIPPY_CHROMA_PATH", str(memory / "chroma_db"))
+    # The hub-managed roots file is machine state; a test must see its own.
+    monkeypatch.setenv("SKIPPY_WORKSPACE_ROOTS_FILE", str(tmp_path / "workspace_roots.json"))
 
 
 @pytest.fixture(scope="session")

@@ -1,10 +1,11 @@
 import SwiftUI
 
 /// The memory browser: what Skippy already knows about the project, in your
-/// pocket. Conventions, decisions (with superseded and stale badges), and the
-/// session history — the same data as the Mac's context rail, shaped for a
-/// phone's single column.
+/// pocket. Conventions, decisions (with superseded and stale badges), past
+/// chats you can reopen, and the session history — the same data as the Mac's
+/// context rail, shaped for a phone's single column.
 struct MemoryView: View {
+    @EnvironmentObject private var app: AppModel
     @ObservedObject var factory: FactoryClient
 
     var body: some View {
@@ -22,7 +23,7 @@ struct MemoryView: View {
                     EmptyState(
                         icon: "brain",
                         title: "Nothing remembered yet",
-                        message: "Skippy records conventions, decisions, and session history as it works. They will appear here."
+                        message: "Skippy records conventions, decisions, chats, and session history as it works. They will appear here."
                     )
                 }
             }
@@ -48,6 +49,9 @@ struct MemoryView: View {
     private func content(_ memory: MemorySnapshot) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                if !memory.chats.isEmpty {
+                    chats(memory.chats)
+                }
                 if !memory.conventions.isEmpty {
                     conventions(memory.conventions)
                 }
@@ -63,6 +67,47 @@ struct MemoryView: View {
         .refreshable {
             factory.requestMemory()
         }
+    }
+
+    private func chats(_ items: [ChatSummary]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionLabel("Chats", icon: "bubble.left.and.bubble.right")
+            ForEach(items) { chat in
+                Button {
+                    app.openPastChat(chat.chatId)
+                    Haptics.tap()
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(chat.updated.prefix(16).replacingOccurrences(of: "T", with: " "))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            if chat.chatId == factory.chatId {
+                                StatusPill(text: "open", color: .green)
+                            }
+                            if chat.mode != "chat" && !chat.mode.isEmpty {
+                                StatusPill(text: chat.mode, color: .secondary)
+                            }
+                            Spacer()
+                            Text("\(chat.turns)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(chat.title.isEmpty ? chat.chatId : chat.title)
+                            .font(.callout)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                if chat.id != items.last?.id {
+                    Divider()
+                }
+            }
+        }
+        .card()
     }
 
     private func conventions(_ items: [String: String]) -> some View {

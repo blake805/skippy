@@ -12,6 +12,14 @@ final class FactoryClient: ObservableObject {
     @Published var chatItems: [TimelineItem] = []
     /// What the hub knows about this project, for the context rail.
     @Published var memory: MemorySnapshot?
+    /// Every project in the hub's memory store, and which one the configured
+    /// roots default to. "" as a selection means "the default".
+    @Published var projects: [ProjectSummary] = []
+    @Published var defaultProjectId: String = ""
+    @Published var selectedProject: String = ""
+    /// The transcript this conversation appends to on the hub. Rotated by
+    /// "New chat" / Clear, replaced when a past chat is reopened.
+    @Published private(set) var chatId: String = UUID().uuidString
     /// RE note packs (list view) and the findings of the open pack.
     @Published var rePacks: [REPackSummary] = []
     @Published var reFindings: [REFinding] = []
@@ -78,12 +86,54 @@ final class FactoryClient: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.socket.sendJSON(["type": "hello", "client": "SkippyMac"])
             self?.socket.sendJSON(["action": "status"])
-            self?.socket.sendJSON(["action": "memory"])
+            self?.requestMemory()
+            self?.requestProjects()
         }
     }
 
     func requestMemory() {
-        socket.sendJSON(["action": "memory"])
+        var payload: [String: Any] = ["action": "memory"]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
+        socket.sendJSON(payload)
+    }
+
+    func requestProjects() {
+        socket.sendJSON(["action": "projects"])
+    }
+
+    /// Point the chat at another project's memory and chat list. Transcripts
+    /// are project-scoped, so the conversation starts over rather than
+    /// appending this project's turns to the previous one's transcript.
+    func selectProject(_ projectId: String) {
+        let chosen = projectId == defaultProjectId ? "" : projectId
+        guard chosen != selectedProject else { return }
+        selectedProject = chosen
+        startNewChat()
+        memory = nil
+        requestMemory()
+    }
+
+    /// Leave the current conversation where it is and open a fresh transcript.
+    func startNewChat() {
+        chatItems.removeAll()
+        history.removeAll()
+        chatId = UUID().uuidString
+    }
+
+    /// Reopen a past conversation: the hub answers with the full transcript,
+    /// which replaces the chat lane and seeds the history the next turn sends.
+    func openChat(_ chatId: String) {
+        var payload: [String: Any] = ["action": "chat_open", "chat_id": chatId]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
+        socket.sendJSON(payload)
+    }
+
+    /// Create a new workspace root on the hub (folder + git repo). The repo
+    /// panel and the project picker refresh when the answer lands.
+    func workspaceNew(name: String) {
+        gitSyncing = true
+        gitNotice = "Creating workspace \(name)…"
+        socket.sendJSON(["action": "workspace_new", "name": name])
     }
 
     // MARK: - RE dashboard queries
@@ -225,7 +275,9 @@ final class FactoryClient: ObservableObject {
             "text": trimmed,
             "mode": mode.wireMode,
             "history": history,
+            "chat_id": chatId,
         ]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
         if mode == .re, !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             payload["target"] = target.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -247,6 +299,8 @@ final class FactoryClient: ObservableObject {
         activeRunId = nil
         history.removeAll()
         pendingApproval = nil
+        // The cleared conversation is over; the next turn starts a new transcript.
+        chatId = UUID().uuidString
     }
 
     /// Answer the pending approval. For a code edit, `approveAll` tells the hub
@@ -376,6 +430,25 @@ final class FactoryClient: ObservableObject {
             if isRunning { statusLine = "Running…" }
         case "memory":
             memory = MemorySnapshot(payload: msg)
+        case "projects":
+            defaultProjectId = msg["default"] as? String ?? ""
+            projects = (msg["projects"] as? [[String: Any]] ?? []).map { ProjectSummary(from: $0) }
+        case "chat_open":
+            if let error = msg["error"] as? String {
+                chatItems.append(TimelineItem(kind: .error, text: error))
+            } else if let chat = msg["chat"] as? [String: Any] {
+                resumeChat(chat)
+            }
+        case "workspace_new":
+            gitSyncing = false
+            if let error = msg["error"] as? String {
+                gitNotice = error
+            } else {
+                gitNotice = "Created \(msg["name"] as? String ?? "workspace")."
+                refreshGit()
+                requestProjects()
+                requestMemory()
+            }
         case "re_notes":
             if let error = msg["error"] as? String {
                 reNotice = error
@@ -499,6 +572,27 @@ final class FactoryClient: ObservableObject {
         default:
             break
         }
+    }
+
+    /// Replace the conversation with a reopened transcript. The turns become
+    /// bubbles in the chat lane, and the wire history the next send carries, so
+    /// the model continues the thread rather than starting cold.
+    private func resumeChat(_ chat: [String: Any]) {
+        let turns = chat["turns"] as? [[String: Any]] ?? []
+        chatItems = turns.map { turn in
+            let role = turn["role"] as? String ?? ""
+            let content = turn["content"] as? String ?? ""
+            return TimelineItem(kind: role == "user" ? .user : .reply, text: content)
+        }
+        history = turns.compactMap { turn in
+            guard let role = turn["role"] as? String,
+                  let content = turn["content"] as? String, !content.isEmpty else { return nil }
+            return ["role": role, "content": content]
+        }
+        if history.count > 40 {
+            history.removeFirst(history.count - 40)
+        }
+        chatId = chat["chat_id"] as? String ?? chatId
     }
 
     private func answerDeviceRPC(_ msg: [String: Any], taskId: String) async {

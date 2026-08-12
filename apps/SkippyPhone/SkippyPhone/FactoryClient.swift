@@ -11,6 +11,14 @@ final class FactoryClient: ObservableObject {
     @Published var statusLine: String = "Disconnected"
     /// What the hub knows about this project, for the memory browser.
     @Published var memory: MemorySnapshot?
+    /// Every project in the hub's memory store, and which one the configured
+    /// roots default to. "" as a selection means "the default".
+    @Published var projects: [ProjectSummary] = []
+    @Published var defaultProjectId: String = ""
+    @Published var selectedProject: String = ""
+    /// The transcript this conversation appends to on the hub. Rotated by
+    /// Clear / New chat, replaced when a past chat is reopened.
+    @Published private(set) var chatId: String = UUID().uuidString
 
     private let socket = WebSocketSession()
     private var history: [[String: String]] = []
@@ -39,12 +47,46 @@ final class FactoryClient: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.socket.sendJSON(["type": "hello", "client": "SkippyPhone"])
             self?.socket.sendJSON(["action": "status"])
-            self?.socket.sendJSON(["action": "memory"])
+            self?.requestMemory()
+            self?.requestProjects()
         }
     }
 
     func requestMemory() {
-        socket.sendJSON(["action": "memory"])
+        var payload: [String: Any] = ["action": "memory"]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
+        socket.sendJSON(payload)
+    }
+
+    func requestProjects() {
+        socket.sendJSON(["action": "projects"])
+    }
+
+    /// Point the chat at another project's memory and chat list. Transcripts
+    /// are project-scoped, so the conversation starts over rather than
+    /// appending this project's turns to the previous one's transcript.
+    func selectProject(_ projectId: String) {
+        let chosen = projectId == defaultProjectId ? "" : projectId
+        guard chosen != selectedProject else { return }
+        selectedProject = chosen
+        startNewChat()
+        memory = nil
+        requestMemory()
+    }
+
+    /// Leave the current conversation where it is and open a fresh transcript.
+    func startNewChat() {
+        items.removeAll()
+        history.removeAll()
+        chatId = UUID().uuidString
+    }
+
+    /// Reopen a past conversation: the hub answers with the full transcript,
+    /// which replaces the timeline and seeds the history the next turn sends.
+    func openChat(_ chatId: String) {
+        var payload: [String: Any] = ["action": "chat_open", "chat_id": chatId]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
+        socket.sendJSON(payload)
     }
 
     func disconnect() {
@@ -68,7 +110,9 @@ final class FactoryClient: ObservableObject {
             "text": trimmed,
             "mode": mode.wireMode,
             "history": history,
+            "chat_id": chatId,
         ]
+        if !selectedProject.isEmpty { payload["project"] = selectedProject }
         if mode == .re, !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             payload["target"] = target.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -86,6 +130,7 @@ final class FactoryClient: ObservableObject {
         items.removeAll()
         history.removeAll()
         pendingApproval = nil
+        chatId = UUID().uuidString
     }
 
     /// Answer the pending approval. `approveAll` (code edits only) tells the hub
@@ -166,6 +211,15 @@ final class FactoryClient: ObservableObject {
             if isRunning { statusLine = "Running…" }
         case "memory":
             memory = MemorySnapshot(payload: msg)
+        case "projects":
+            defaultProjectId = msg["default"] as? String ?? ""
+            projects = (msg["projects"] as? [[String: Any]] ?? []).map { ProjectSummary(from: $0) }
+        case "chat_open":
+            if let error = msg["error"] as? String {
+                items.append(TimelineItem(kind: .error, text: error))
+            } else if let chat = msg["chat"] as? [String: Any] {
+                resumeChat(chat)
+            }
         case "code_auth":
             let explanation = msg["explanation"] as? String ?? "Skippy wants to change your files."
             let diff = msg["diff"] as? String ?? ""
@@ -197,6 +251,25 @@ final class FactoryClient: ObservableObject {
         default:
             break
         }
+    }
+
+    /// Replace the conversation with a reopened transcript.
+    private func resumeChat(_ chat: [String: Any]) {
+        let turns = chat["turns"] as? [[String: Any]] ?? []
+        items = turns.map { turn in
+            let role = turn["role"] as? String ?? ""
+            let content = turn["content"] as? String ?? ""
+            return TimelineItem(kind: role == "user" ? .user : .reply, text: content)
+        }
+        history = turns.compactMap { turn in
+            guard let role = turn["role"] as? String,
+                  let content = turn["content"] as? String, !content.isEmpty else { return nil }
+            return ["role": role, "content": content]
+        }
+        if history.count > 40 {
+            history.removeFirst(history.count - 40)
+        }
+        chatId = chat["chat_id"] as? String ?? chatId
     }
 
     private func answerDeviceRPC(_ msg: [String: Any], taskId: String) async {

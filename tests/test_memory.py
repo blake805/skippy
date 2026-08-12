@@ -143,6 +143,89 @@ def test_only_recent_sessions_are_loaded(memory):
     assert len(os.listdir(memory.sessions_dir)) == 20
 
 
+# --- chat transcripts: the resume handle, not the summary ---
+
+def test_a_chat_accumulates_turns_across_appends(memory):
+    memory.append_chat("chat-1", [
+        {"role": "user", "content": "hey skippy"},
+        {"role": "assistant", "content": "hey yourself"},
+    ])
+    memory.append_chat("chat-1", [
+        {"role": "user", "content": "still there?"},
+        {"role": "assistant", "content": "always"},
+    ])
+    record = memory.load_chat("chat-1")
+    assert [t["role"] for t in record["turns"]] == ["user", "assistant", "user", "assistant"]
+    assert record["turns"][-1]["content"] == "always"
+
+
+def test_a_chat_is_titled_by_its_first_user_message(memory):
+    memory.append_chat("chat-1", [
+        {"role": "user", "content": "should the bracket be aluminum or titanium?"},
+        {"role": "assistant", "content": "depends on the load"},
+    ])
+    assert memory.load_chat("chat-1")["title"].startswith("should the bracket")
+
+
+def test_chats_list_most_recently_touched_first(memory):
+    memory.append_chat("older", [{"role": "user", "content": "first conversation"}])
+    memory.append_chat("newer", [{"role": "user", "content": "second conversation"}])
+    memory.append_chat("older", [{"role": "user", "content": "back to the first"}])
+    assert [c["chat_id"] for c in memory.chats()][0] == "older"
+
+
+def test_loading_an_unknown_chat_is_none_not_an_error(memory):
+    assert memory.load_chat("never-existed") is None
+
+
+@pytest.mark.parametrize("bad", ["../escape", "a/b", "", ".", ".hidden"])
+def test_an_unsafe_chat_id_is_refused_without_writing(memory, bad):
+    assert memory.append_chat(bad, [{"role": "user", "content": "x"}]) is None
+    assert memory.chats() == []
+    assert memory.load_chat(bad) is None
+
+
+def test_turns_with_no_content_or_a_strange_role_are_dropped(memory):
+    record = memory.append_chat("chat-1", [
+        {"role": "system", "content": "not a turn"},
+        {"role": "user", "content": "   "},
+        {"role": "user", "content": "the real message"},
+    ])
+    assert [t["content"] for t in record["turns"]] == ["the real message"]
+
+
+def test_a_transcript_is_capped_oldest_first(memory):
+    for n in range(skippy_memory.MAX_CHAT_TURNS + 10):
+        memory.append_chat("long", [{"role": "user", "content": f"turn {n}"}])
+    record = memory.load_chat("long")
+    assert len(record["turns"]) == skippy_memory.MAX_CHAT_TURNS
+    assert record["turns"][-1]["content"] == f"turn {skippy_memory.MAX_CHAT_TURNS + 9}"
+
+
+def test_a_failed_transcript_write_costs_persistence_not_the_turn(memory):
+    """The rule that governs the whole store: an unmounted NAS must never take the
+    conversation down with it."""
+    memory.chats_dir = os.path.join(memory.dir, "meta.json", "impossible")
+    assert memory.append_chat("chat-1", [{"role": "user", "content": "x"}]) is None
+
+
+def test_a_corrupt_transcript_is_skipped_in_the_list(memory):
+    memory.append_chat("good", [{"role": "user", "content": "fine"}])
+    with open(os.path.join(memory.chats_dir, "bad.json"), "w") as handle:
+        handle.write("{ not json")
+    assert [c["chat_id"] for c in memory.chats()] == ["good"]
+
+
+def test_chats_stay_with_their_project(store, tmp_path):
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    a = open_project(root=store, workspace_roots=[str(tmp_path / "one")])
+    b = open_project(root=store, workspace_roots=[str(tmp_path / "two")])
+    a.append_chat("chat-1", [{"role": "user", "content": "in project one"}])
+    assert b.chats() == []
+    assert b.load_chat("chat-1") is None
+
+
 # --- decisions ---
 
 def test_a_decision_needs_reasoning_not_just_a_title(memory):

@@ -7,6 +7,7 @@ dropped connection loses the events rather than the work.
 """
 
 import asyncio
+import os
 
 import pytest
 
@@ -253,6 +254,145 @@ async def test_chat_blocks_a_second_request_like_any_run(runner, socket, routed_
         await runner.start("phone", {"text": "again", "mode": "Chat"})
         assert any("still working" in text for text in socket.chats())
     await settle(runner)
+
+
+# --- chat transcripts and project selection on the wire ---
+
+@pytest.mark.asyncio
+async def test_a_chat_with_a_chat_id_is_persisted_and_resumable(runner, socket, routed_llm, repo):
+    routed_llm.load([fl.text("Aluminum, for the weight.")])
+    await runner.start("phone", {
+        "text": "which metal for the bracket?", "mode": "Chat", "chat_id": "abc-123",
+    })
+    await settle(runner)
+
+    snapshot = runner.chat_open_snapshot("", "abc-123")
+    turns = snapshot["chat"]["turns"]
+    assert [t["role"] for t in turns] == ["user", "assistant"]
+    assert "which metal" in turns[0]["content"]
+    assert "Aluminum" in turns[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_chat_without_a_chat_id_is_not_persisted(runner, socket, routed_llm):
+    """An older client sends no chat_id and gets exactly the old behavior."""
+    routed_llm.load([fl.text("Hello.")])
+    await runner.start("phone", {"text": "hi", "mode": "Chat"})
+    await settle(runner)
+    assert runner.memory_snapshot()["chats"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unsafe_chat_id_costs_persistence_not_the_reply(runner, socket, routed_llm):
+    routed_llm.load([fl.text("Still answering.")])
+    await runner.start("phone", {"text": "hi", "mode": "Chat", "chat_id": "../escape"})
+    await settle(runner)
+    assert any("Still answering" in text for text in socket.chats())
+    assert runner.memory_snapshot()["chats"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_agent_run_lands_in_the_transcript_too(runner, socket, routed_llm):
+    """The conversation around a run resumes like any chat; the step-by-step
+    record stays in the session summary."""
+    routed_llm.load([finish("Added the feature.")])
+    await runner.start("phone", {"text": "add a feature", "mode": "Agent", "chat_id": "run-chat"})
+    await settle(runner)
+
+    turns = runner.chat_open_snapshot("", "run-chat")["chat"]["turns"]
+    assert "add a feature" in turns[0]["content"]
+    assert "Added the feature" in turns[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_picked_project_scopes_the_chat_and_its_transcript(runner, socket, routed_llm):
+    """The picker's contract: memory in, transcript out, both under the chosen id."""
+    import skippy_memory
+
+    skippy_memory.open_project(project_id="other-project").learn_convention(
+        "test command", "make check-other"
+    )
+    routed_llm.load([fl.text("Noted.")])
+    await runner.start("phone", {
+        "text": "hi", "mode": "Chat", "project": "other-project", "chat_id": "c1",
+    })
+    await settle(runner)
+
+    # The picked project's memory reached the prompt...
+    seen = " ".join(m.get("content") or "" for m in routed_llm.last_messages())
+    assert "make check-other" in seen
+    # ...and the transcript landed under it, not under the roots' default.
+    assert runner.chat_open_snapshot("other-project", "c1")["chat"]["turns"]
+    assert runner.memory_snapshot()["chats"] == []
+
+
+@pytest.mark.asyncio
+async def test_picking_a_project_does_not_rescope_its_roots(runner, routed_llm, repo):
+    """Opening a picked project must not append the current workspace roots into
+    its meta — that would quietly merge two projects' identities."""
+    import skippy_memory
+
+    skippy_memory.open_project(project_id="other-project")
+    routed_llm.load([fl.text("ok")])
+    await runner.start("phone", {"text": "hi", "mode": "Chat", "project": "other-project"})
+    await settle(runner)
+
+    reopened = skippy_memory.open_project(project_id="other-project")
+    assert str(repo) not in reopened.meta["workspace_roots"]
+
+
+def test_the_memory_snapshot_carries_the_chat_list(runner):
+    memory = runner._open_memory()
+    memory.append_chat("c1", [{"role": "user", "content": "a conversation"}])
+    snapshot = runner.memory_snapshot()
+    assert snapshot["chats"][0]["chat_id"] == "c1"
+    assert snapshot["chats"][0]["title"] == "a conversation"
+
+
+def test_opening_a_missing_chat_names_the_problem(runner):
+    result = runner.chat_open_snapshot("", "no-such-chat")
+    assert "no-such-chat" in result["error"]
+
+
+def test_the_projects_snapshot_lists_the_store_and_the_default(runner, repo):
+    import skippy_memory
+
+    skippy_memory.open_project(workspace_roots=[str(repo)])
+    skippy_memory.open_project(project_id="another")
+    snapshot = runner.projects_snapshot()
+    ids = {p["project_id"] for p in snapshot["projects"]}
+    assert snapshot["default"] == skippy_memory.project_id_for([str(repo)])
+    assert snapshot["default"] in ids and "another" in ids
+
+
+# --- creating a workspace ---
+
+@pytest.mark.asyncio
+async def test_workspace_new_creates_a_repo_and_a_root_without_a_restart(runner):
+    import skippy_paths
+
+    result = await runner.workspace_new_action({"name": "gadget"})
+    assert result["ok"] is True
+    assert os.path.isdir(os.path.join(result["path"], ".git"))
+    # The provider re-reads the roots file per call: no restart needed.
+    assert result["path"] in skippy_paths.configured_workspace_roots()
+    # And the project is already in the picker.
+    ids = {p["project_id"] for p in runner.projects_snapshot()["projects"]}
+    assert result["project_id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_workspace_new_refuses_a_name_that_already_exists(runner):
+    await runner.workspace_new_action({"name": "gadget"})
+    result = await runner.workspace_new_action({"name": "gadget"})
+    assert "already exists" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["", "  ", "a/b", "..", ".hidden", "/abs"])
+async def test_workspace_new_refuses_an_unsafe_name(runner, bad):
+    result = await runner.workspace_new_action({"name": bad})
+    assert "error" in result
 
 
 # --- no workspace ---

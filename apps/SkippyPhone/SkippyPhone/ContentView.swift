@@ -19,6 +19,7 @@ struct ContentView: View {
                 .tabItem { Label(SidebarPage.voice.rawValue, systemImage: SidebarPage.voice.systemImage) }
                 .tag(SidebarPage.voice)
             MemoryView(factory: app.factory)
+                .environmentObject(app)
                 .tabItem { Label(SidebarPage.memory.rawValue, systemImage: SidebarPage.memory.systemImage) }
                 .tag(SidebarPage.memory)
             SettingsView()
